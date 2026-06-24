@@ -1,8 +1,8 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout is Phase 0 of `docs/backend-tdd-plan.md`: project tooling, CI conventions, placeholder
-binaries, and the first deterministic clock package.
+checkout has completed Phase 1 of `docs/backend-tdd-plan.md`: project tooling, CI conventions,
+placeholder binaries, deterministic clock support, and the pure reading domain core.
 
 ## Structure
 
@@ -12,6 +12,9 @@ binaries, and the first deterministic clock package.
   until CLI subcommands are implemented.
 - `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
   used by concurrent tests.
+- `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit status
+  transitions, terminal-state checks, URL idempotency key normalization, source classification,
+  and read-time stale annotation.
 - `docs/backend-tdd-plan.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -36,6 +39,7 @@ The project targets Go 1.26.
 - Prefer black-box test packages such as `clock_test` unless an unexported helper is the right
   boundary.
 - Keep default tests deterministic: no wall-clock, RNG, network, Docker, or live services.
+- Keep `internal/reading` dependency-free outside the Go standard library.
 - Use injected ports for time, IDs, stores, vectors, fetchers, extractors, embedders,
   summarizers, notifiers, and blobs.
 - Put fakes next to their ports and make them safe for concurrent test use when workers may
