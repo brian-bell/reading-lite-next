@@ -1,3 +1,4 @@
+// Package reading defines the pure domain core for submitted readings.
 package reading
 
 import (

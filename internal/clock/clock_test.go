@@ -33,7 +33,7 @@ func TestFakeClock_SetMovesNow(t *testing.T) {
 	}
 }
 
-func TestFakeClock_ConcurrentUse(t *testing.T) {
+func TestFakeClock_ConcurrentUse(_ *testing.T) {
 	c := clock.NewFake(time.Unix(1000, 0))
 
 	var wg sync.WaitGroup

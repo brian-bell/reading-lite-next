@@ -1,3 +1,4 @@
+// Package clock defines time ports and deterministic test clocks.
 package clock
 
 import (
