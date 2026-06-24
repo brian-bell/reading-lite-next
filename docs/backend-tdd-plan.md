@@ -180,7 +180,9 @@ reading-lite/
 
 ## 2. Tooling, conventions, and CI (set up before Phase 1)
 
-- **Go 1.22+**. `go mod init github.com/bbell/reading-lite`.
+- **Go 1.26**. Track the latest supported 1.26 patch release; initialize with
+  `go mod init github.com/bbell/reading-lite`, `go 1.26`, and optionally
+  `toolchain go1.26.x` when pinning the local/CI toolchain is useful.
 - **Test style**: table-driven subtests (`t.Run`), `t.Parallel()` where there's no shared
   state. Black-box test packages (`package reading_test`) by default so tests exercise the
   public surface; switch to white-box only when testing an unexported helper is genuinely
