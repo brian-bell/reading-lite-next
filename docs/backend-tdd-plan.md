@@ -87,9 +87,11 @@ Postgres serves each query by index:
   status index — cheap, no full listing.
 
 Data layer: **sqlc** generates type-safe Go from hand-written SQL (`pgx/v5` + `pgxpool`);
-`pgvector` columns map via `pgvector-go`. Migrations are embedded (`embed.FS`) and applied with
-goose on deploy. The `Store`/`VectorIndex` interfaces are unchanged — only the adapter behind
-them changes, so pipeline/dispatcher/HTTP code and their tests are untouched.
+`pgvector` columns map via `pgvector-go`. Migrations are embedded (`embed.FS`) and applied by
+the store migration runner, which records applied versions in `schema_migrations` and uses a
+Postgres advisory lock so repeated or parallel runs are safe. The `Store`/`VectorIndex`
+interfaces are unchanged — only the adapter behind them changes, so pipeline/dispatcher/HTTP
+code and their tests are untouched.
 
 ### 1.4 Async model: in-process dispatcher
 
@@ -197,8 +199,8 @@ reading-lite/
   included). `go test -race ./...` must pass — the worker pool is concurrent.
 - **Lint**: `gofmt -l` clean, `go vet ./...`, `golangci-lint` (errcheck, staticcheck,
   govet, revive).
-- **Key deps**: `pgx/v5`+`pgxpool`, `sqlc` (codegen) + `pgvector-go`, `goose` (embedded
-  migrations), `testcontainers-go` (ephemeral Postgres for integration tests), `go-cmp`.
+- **Key deps**: `pgx/v5`+`pgxpool`, `sqlc` (codegen) + `pgvector-go`,
+  `testcontainers-go` (ephemeral Postgres for integration tests), `go-cmp`.
 - **CI**: `go build ./... && go vet ./... && go test -race -cover ./...` on every push, plus a
   `go test -tags integration ./...` job (Postgres service / testcontainers); matrix on
   linux/amd64 (deploy target). Lint as a separate required job.
@@ -322,10 +324,10 @@ corpus). Two implementations behind one `Store` interface: `store.Memory` (fast 
 test run; also a zero-infra dev backend) and `store.Postgres` (sqlc + pgx). One **conformance
 suite** proves both behave identically.
 
-### 4.1 Schema (migration `0001_init.sql`, embedded, goose)
+### 4.1 Schema (migration `0001_init.sql`, embedded)
 
 ```sql
-create extension if not exists vector;
+create extension if not exists vector with schema public;
 
 create table readings (
   id text primary key,
@@ -364,8 +366,10 @@ create index reading_vectors_ann_idx on reading_vectors using hnsw (embedding ve
 Hand-write SQL in `query.sql`; sqlc generates typed Go (`pgx/v5`, `pgvector-go`). The
 non-obvious ones:
 - **search**: `… where ($q='' or search @@ websearch_to_tsquery('english',$q)) and ($tags='{}'
-  or tags @> $tags) and ($status='' or status=$status) and (created_at,id) < ($cur_ts,$cur_id)
-  order by created_at desc, id desc limit $n` + a companion `count` for `total`.
+  or tags @> $tags) and ($status='' or status=$status) …` with generated newest/oldest/title
+  query variants. When `q` is present, keyset cursors include rank first and then the secondary
+  sort key, so paginated ranked results cannot skip or duplicate rows. A companion `count`
+  returns `total`.
 - **idempotent insert**: `insert … on conflict (url_key) do nothing returning id` (empty result
   ⇒ already exists ⇒ adapter returns `ErrConflict`).
 - **sweep**: `select id, process_attempts from readings where status='pending' or
@@ -875,7 +879,7 @@ into `diagnostics_json` (already populated in Phase 5); `/api/healthz` returns b
 Postgres ping + an R2 reachability check. Optional `/metrics` (Prometheus) counters: ingests,
 processed, failures by reason, requeues, retry-exhaustions, dispatch queue depth.
 
-**Lifecycle**: `cmd/reader-api/main.go` runs goose migrations, wires
+**Lifecycle**: `cmd/reader-api/main.go` runs embedded store migrations, wires
 config→pgxpool→adapters→store→dispatcher→server, runs the startup recovery sweep (§1.4), starts
 the worker pool and `http.Server`, and on `SIGTERM` does graceful shutdown — stop accepting
 HTTP, drain in-flight pipelines, close the pool. `TestMain_GracefulShutdown` (or a focused
@@ -986,4 +990,3 @@ Each milestone ends with `go test -race ./...` green, lint clean, and the releva
 - `cmd/reader-api` runs migrations, boots from env, serves the API, runs the worker, shuts down gracefully.
 - Secrets never logged; ingest fetch is SSRF- and size-guarded; destructive CLIs gated.
 ```
-

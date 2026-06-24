@@ -1,8 +1,9 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 1 of `docs/backend-tdd-plan.md`: project tooling, CI conventions,
-placeholder binaries, deterministic clock support, and the pure reading domain core.
+checkout has completed Phase 2 of `docs/backend-tdd-plan.md`: project tooling, CI conventions,
+placeholder binaries, deterministic clock support, the pure reading domain core, and the
+readings metadata store behind a shared conformance suite.
 
 ## Structure
 
@@ -15,6 +16,9 @@ placeholder binaries, deterministic clock support, and the pure reading domain c
 - `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit status
   transitions, terminal-state checks, URL idempotency key normalization, source classification,
   and read-time stale annotation.
+- `internal/store/` defines the `Store` port, shared query/page DTOs, `store.Memory`, the
+  pgx-backed `store.Postgres` adapter, embedded migrations, SQL query source for sqlc, and
+  `storetest.RunContract` for backend-neutral behavior checks.
 - `docs/backend-tdd-plan.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -26,7 +30,9 @@ The project targets Go 1.26.
 - `make test` runs the default fast test suite with fakes only.
 - `make test-race` runs `go test -race ./...`.
 - `make cover` runs `go test -race -cover ./...`.
-- `make test-integration` runs tests behind the `integration` build tag.
+- `make test-integration` runs tests behind the `integration` build tag. Store integration
+  tests use `DATABASE_URL` when set; otherwise they use testcontainers with `pgvector/pgvector`
+  and skip when Docker is unavailable.
 - `make lint` checks `gofmt`, `go vet`, and `golangci-lint`.
 - `make build` runs `go build ./...`.
 - `make run` runs `cmd/reader-api`.
@@ -45,4 +51,6 @@ The project targets Go 1.26.
 - Put fakes next to their ports and make them safe for concurrent test use when workers may
   read them.
 - Keep integration tests behind `//go:build integration`.
+- Add store behavior to `internal/store/storetest` first, then make `store.Memory` and
+  `store.Postgres` satisfy the same contract.
 - Use table-driven subtests and `t.Parallel()` when there is no shared mutable state.
