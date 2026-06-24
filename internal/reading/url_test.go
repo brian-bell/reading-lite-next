@@ -89,6 +89,16 @@ func TestURLKey(t *testing.T) {
 			input: "https://youtu.be/ID",
 			want:  "https://www.youtube.com/watch?v=ID",
 		},
+		{
+			name:  "accept full youtube id character classes and strip t",
+			input: "https://m.youtube.com/watch?v=ab_C-9&t=5",
+			want:  "https://www.youtube.com/watch?v=ab_C-9",
+		},
+		{
+			name:  "explicit root slash canonical",
+			input: "https://example.com/",
+			want:  "https://example.com/",
+		},
 	}
 
 	for _, tc := range cases {
@@ -195,6 +205,8 @@ func TestURLKey_RejectsUnsupportedInputs(t *testing.T) {
 		"https://youtu.be/a%20b",
 		"https://youtu.be/a/b",
 		"https://youtu.be/a%2Fb",
+		"https://youtu.be/a.b",
+		"https://www.youtube.com/watch?v=",
 	}
 
 	for _, input := range cases {
