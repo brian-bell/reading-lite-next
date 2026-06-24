@@ -1,5 +1,12 @@
 create extension if not exists vector with schema public;
 
+-- array_to_string is only marked STABLE (its output can depend on settings for
+-- some element types), which disqualifies it from a generated column. For text[]
+-- the join is genuinely immutable, so wrap it in an immutable function.
+create or replace function immutable_array_to_string(arr text[], sep text)
+  returns text language sql immutable parallel safe
+  as $$ select array_to_string(arr, sep) $$;
+
 create table readings (
   id text primary key,
   url text not null,
@@ -24,7 +31,7 @@ create table readings (
   search tsvector generated always as (
     to_tsvector('english',
       coalesce(title,'') || ' ' || coalesce(author,'') || ' ' ||
-      coalesce(summary,'') || ' ' || array_to_string(tags,' '))
+      coalesce(summary,'') || ' ' || immutable_array_to_string(tags,' '))
   ) stored,
   created_at timestamptz not null,
   started_at timestamptz,

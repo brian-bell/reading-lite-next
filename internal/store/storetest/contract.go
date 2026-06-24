@@ -106,7 +106,7 @@ func RunContract(t *testing.T, newStore Factory) {
 
 		ctx := context.Background()
 		s := newStore(t)
-		seed(t, ctx, s,
+		seed(ctx, t, s,
 			withText(sampleReading("high", "https://example.com/high", at(3), reading.Ready), "Kubernetes Kubernetes", "Rae", "Kubernetes operators for Go services"),
 			withText(sampleReading("low", "https://example.com/low", at(2), reading.Ready), "Personal infrastructure", "Sol", "Keeping kubernetes small"),
 			withText(sampleReading("miss", "https://example.com/miss", at(1), reading.Ready), "SQLite notes", "Max", "Single-node storage"),
@@ -143,7 +143,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		c := sampleReading("c", "https://example.com/c", at(1), reading.Ready)
 		c.Title = "Database notes"
 		c.Tags = []string{"db"}
-		seed(t, ctx, s, a, b, c)
+		seed(ctx, t, s, a, b, c)
 
 		page, err := s.Search(ctx, store.Query{Tags: []string{"go", "db"}, Sort: store.SortNewest, Limit: 10})
 		if err != nil {
@@ -173,7 +173,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		bravo.Title = "Bravo"
 		charlie := sampleReading("charlie", "https://example.com/charlie", at(2), reading.Ready)
 		charlie.Title = "Charlie"
-		seed(t, ctx, s, alpha, bravo, charlie)
+		seed(ctx, t, s, alpha, bravo, charlie)
 
 		page, err := s.Search(ctx, store.Query{Status: reading.Ready, Sort: store.SortNewest, Limit: 10})
 		if err != nil {
@@ -306,7 +306,7 @@ func RunContract(t *testing.T, newStore Factory) {
 				rankLowNew := withText(sampleReading("rank-low-new", "https://example.com/rank-low-new", at(4), reading.Ready), "Bravo Kubernetes", "", "")
 				rankHighNew := withText(sampleReading("rank-high-new", "https://example.com/rank-high-new", at(3), reading.Ready), "Alpha Kubernetes Kubernetes", "", "")
 				rankLowOld := withText(sampleReading("rank-low-old", "https://example.com/rank-low-old", at(2), reading.Ready), "Charlie Kubernetes", "", "")
-				seed(t, ctx, s, rankHighOld, rankLowNew, rankHighNew, rankLowOld)
+				seed(ctx, t, s, rankHighOld, rankLowNew, rankHighNew, rankLowOld)
 
 				var all []string
 				var cursor store.Cursor
@@ -334,7 +334,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		ctx := context.Background()
 		s := newStore(t)
 		r := sampleReading("r1", "https://example.com/one", at(1), reading.Pending)
-		seed(t, ctx, s, r)
+		seed(ctx, t, s, r)
 
 		startedAt := at(2)
 		attempts := 2
@@ -377,7 +377,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		ctx := context.Background()
 		s := newStore(t)
 		r := sampleReading("r1", "https://example.com/one", at(1), reading.Pending)
-		seed(t, ctx, s, r)
+		seed(ctx, t, s, r)
 
 		if err := s.UpdateStatus(ctx, r.ID, reading.Failed, store.StatusFields{Now: at(2), Error: stringPtr("temporary failure")}); err != nil {
 			t.Fatalf("UpdateStatus failed with error: %v", err)
@@ -412,7 +412,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		r := sampleReading("r1", "https://example.com/one", at(1), reading.Ready)
 		r.Title = "Tag replacement"
 		r.Tags = []string{"old"}
-		seed(t, ctx, s, r)
+		seed(ctx, t, s, r)
 
 		if err := s.ReplaceTags(ctx, r.ID, []string{"go", "db"}); err != nil {
 			t.Fatalf("ReplaceTags first: %v", err)
@@ -449,7 +449,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		runningStale.StartedAt = ptr(at(4))
 		ready := sampleReading("ready", "https://example.com/ready", at(4), reading.Ready)
 		failed := sampleReading("failed", "https://example.com/failed", at(5), reading.Failed)
-		seed(t, ctx, s, pending, runningFresh, runningStale, ready, failed)
+		seed(ctx, t, s, pending, runningFresh, runningStale, ready, failed)
 
 		got, err := s.ListNonTerminal(ctx, at(5))
 		if err != nil {
@@ -471,7 +471,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		ctx := context.Background()
 		s := newStore(t)
 		r := sampleReading("r1", "https://example.com/one", at(1), reading.Ready)
-		seed(t, ctx, s, r)
+		seed(ctx, t, s, r)
 
 		if err := s.Delete(ctx, r.ID); err != nil {
 			t.Fatalf("Delete existing: %v", err)
@@ -520,7 +520,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		r := sampleReading("r1", "https://example.com/one", at(1), reading.Running)
 		r.StartedAt = &startedAt
 		r.Tags = []string{"go"}
-		seed(t, ctx, s, r)
+		seed(ctx, t, s, r)
 
 		got, err := s.GetByID(ctx, r.ID)
 		if err != nil {
@@ -554,7 +554,7 @@ func assertOrder(t *testing.T, s store.Store, sort store.SortMode, want []string
 	}
 }
 
-func seed(t *testing.T, ctx context.Context, s store.Store, readings ...reading.Reading) {
+func seed(ctx context.Context, t *testing.T, s store.Store, readings ...reading.Reading) {
 	t.Helper()
 
 	for _, r := range readings {
