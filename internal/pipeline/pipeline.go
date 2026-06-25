@@ -66,8 +66,10 @@ type Pipeline struct {
 
 // RedditGuidance is the operator-facing message recorded when a Reddit URL is
 // submitted. Reddit blocks automated fetching, so the reading fails permanently
-// with instructions to import the content another way.
-const RedditGuidance = "reddit cannot be fetched automatically; export the post or comment and import it as markdown"
+// with instructions to import the content another way. The canonical string
+// lives with the extraction source special-casing ([extract.RedditGuidance]);
+// the pipeline reuses it so there is one source of truth.
+const RedditGuidance = extract.RedditGuidance
 
 // SimilarItem is one hydrated similar reading snapshotted into similar_json.
 type SimilarItem struct {

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Running Postgres for a Personal Service | Ada's Notes</title>
+  <meta property="og:site_name" content="Ada's Notes">
+  <meta name="author" content="Ada Lovelace">
+</head>
+<body>
+  <header class="site-header">
+    <nav>
+      <a href="/">Home</a>
+      <a href="/archive">Archive</a>
+      <a href="/about">About</a>
+    </nav>
+  </header>
+  <aside class="sidebar">
+    <h3>Subscribe</h3>
+    <p>Get every post by email. No spam, unsubscribe anytime.</p>
+    <button>Sign up</button>
+  </aside>
+  <article>
+    <h1>Running Postgres for a Personal Service</h1>
+    <p class="byline">By <a rel="author" href="/authors/ada">Ada Lovelace</a></p>
+    <p>For a personal reading service, a single managed Postgres instance is almost
+    always the right call. It gives you transactional metadata, full-text search,
+    and—via the <code>pgvector</code> extension—similarity search, all behind one
+    connection string.</p>
+    <p>The temptation is to reach for a dedicated vector database the moment you
+    want semantic search. Resist it. Keeping the embeddings in the same database as
+    the rows they rank means similarity lives transactionally beside its metadata,
+    and you have one fewer service to operate, secure, and pay for.</p>
+    <h2>Why one database wins</h2>
+    <ul>
+      <li>Backups and restores cover everything at once.</li>
+      <li>A join can rank similar readings without a network hop.</li>
+      <li>Scaling to zero on a hosted plan keeps the bill near nothing.</li>
+    </ul>
+    <p>When the corpus eventually outgrows a single node, the ports in front of the
+    store let you swap the backend without touching the pipeline. Until then, one
+    database is the simplest thing that works.</p>
+  </article>
+  <footer>
+    <p>&copy; 2026 Ada Lovelace. All rights reserved.</p>
+  </footer>
+</body>
+</html>
