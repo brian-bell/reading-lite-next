@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–3)
+# reading-lite — Manual Verification Plan (Phases 0–4)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -16,18 +16,23 @@
 > unavailable, or honors `DATABASE_URL`). The Phase 3 dispatcher lifecycle and its
 > error classifier (C9) are automated too — driven inline through the public
 > `dispatch.Dispatcher` surface with a fake clock and a fake delayer, so they need
-> no goroutines, timers, or Docker. Tool- and Docker-dependent steps skip when
-> unavailable. What stays manual: the coverage judgment call in B3/B4 and reviewing
-> the placeholder binaries. `make test-integration` remains a separate, dedicated
-> path for the store↔Postgres integration suite. Each automated test names the plan
-> section it covers.
+> no goroutines, timers, or Docker. The Phase 4 external-service ports & fakes (C10)
+> are automated as well: compile-time port conformance, the VectorIndex contract
+> against `vector.Memory` (`TestAcceptance_VectorIndexContract`), and a port-fidelity
+> check that each scriptable fake returns scripted results, errors on demand, and
+> records its calls (`TestPorts_FakesAreScriptableAndRecordCalls`). Tool- and
+> Docker-dependent steps skip when unavailable. What stays manual: the coverage
+> judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
+> remains a separate, dedicated path for the store↔Postgres integration suite. Each
+> automated test names the plan section it covers.
 
 ## 0. Scope
 
 ### In scope (what exists today)
 
 The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core),
-**Phase 2** (readings metadata store), and **Phase 3** (in-process dispatcher):
+**Phase 2** (readings metadata store), **Phase 3** (in-process dispatcher), and
+**Phase 4** (external-service ports & in-memory fakes):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -46,16 +51,23 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 | Retry decision + error classifier (pure) | `internal/dispatch/dispatch.go` | 3 |
 | Injectable delay seam (real + fake) | `internal/dispatch/delayer.go` | 3 |
 | Worker pool, claim guard, recovery sweep | `internal/dispatch/dispatcher.go` | 3 |
+| Fetcher / Extractor / Embedder ports + fakes | `internal/fetch/fetch.go`, `internal/extract/extract.go`, `internal/embed/embed.go` | 4 |
+| Summarizer / Notifier ports + fakes | `internal/summarize/summarize.go`, `internal/notify/notify.go` | 4 |
+| Blobs port + in-memory backend | `internal/blobs/blobs.go` | 4 |
+| VectorIndex port (`Index`) + cosine `Memory` + conformance suite | `internal/vector/vector.go`, `internal/vector/vectortest/contract.go` | 4 |
 
 ### Out of scope (do not expect these to work yet)
 
 The Phase 3 dispatcher lives in `internal/dispatch/` and is fully verified — by its own
 race-tested package tests and now by the C9 blackbox checks in this harness — but it is
 **not yet wired into the binaries**: nothing calls `Submit`/`Run`/`Sweep` from `main` yet,
-because its `Handler` is the Phase 5 pipeline, which does not exist. The remaining Phases
-4–12 are **not** implemented: the pipeline, external-service ports
-(`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`), the HTTP API, the
-operator CLI subcommands, config loading, and observability. `reader-api` and
+because its `Handler` is the Phase 5 pipeline, which does not exist. The Phase 4 ports
+(`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`) now exist with in-memory
+fakes (C10), but only the fakes — every `Fake`/`Memory` backend is in scope; **no real
+adapter** (HTTP fetch, OpenAI, Anthropic, Resend, R2, pgvector) is implemented yet, and the
+ports are not yet wired into a pipeline. The remaining Phases 5–12 are **not** implemented:
+the pipeline, the real HTTP/SDK adapters (Phase 6), extraction internals (Phase 7), the HTTP
+API, the operator CLI subcommands, config loading, and observability. `reader-api` and
 `readerctl` are intentionally empty `main(){}` placeholders. Verifying "the service
 runs and ingests a URL" is **premature** and not part of this plan.
 
@@ -436,6 +448,62 @@ seam. Read it against TDD plan §5 and confirm each spec bullet maps to a named 
 > `TestE2E_RecoveryAfterRestart` in PLAN §16) belong to Phase 9 and are **not** in scope
 > here — they need the pipeline + HTTP surface. C9 proves the dispatcher in isolation.
 
+### C10. Phase 4 — external-service ports & fakes (`internal/{fetch,extract,embed,summarize,notify,blobs,vector}`)
+
+Phase 4 defines every external port as a small interface and provides a faithful
+in-memory fake for each, so the Phase 5 pipeline can be built and tested with zero
+I/O. Read each package against TDD plan §6 and confirm the interface shape, the fake
+fidelity, and (for the two backends that carry real behavior) the conformance.
+
+- [ ] `go test -race ./internal/fetch/ ./internal/extract/ ./internal/embed/
+  ./internal/summarize/ ./internal/notify/ ./internal/blobs/ ./internal/vector/...`
+  passes clean (each package has a 20-goroutine concurrency test).
+- [ ] **Port shapes match §6.** Every method takes `context.Context`. Confirm:
+  `fetch.Fetcher.Get → Resource{Body,ContentType,FinalURL,Status}`;
+  `extract.Extractor.Extract(fetch.Resource) → Article{Title,Author,Site,Lang,Markdown,Mode,WordCount}`
+  with `Mode ∈ {readability, raw_dom, raw_only}`; `embed.Embedder.Embed → []float32` of
+  `embed.Dim == 1536`; `summarize.Summarizer.Summarize(SummaryInput) → Summary{Title,Summary,Tags,JSON}`;
+  `notify.Notifier.Notify(Email{From,To,Subject,HTML})`; `blobs.Blobs` Put/Get/Delete;
+  `vector.Index` Upsert/Query/Delete with `Match{ID,Score}`.
+- [ ] **Fakes are faithful doubles.** Each scriptable fake (`fetch`/`extract`/`embed`/
+  `summarize`/`notify`) returns a scripted result, can be scripted to error, records its
+  call count + inputs behind a mutex, and returns defensive copies (mutating a returned
+  slice must not corrupt the script — every package has a "StoresCopies"/aliasing test).
+  `notify.Fake` distinguishes attempted `Calls()` from successfully `Sent()` emails (a
+  failed send is not recorded as sent), matching the "notify failure never fails a reading"
+  policy. Every method honors `ctx.Err()` first.
+- [ ] **`blobs.Memory` round-trips** Put→Get with content type, returns `ErrNotFound` on a
+  missing key, overwrites on re-Put, and treats Delete of an absent key as a no-op
+  (S3 semantics). Stored bytes are cloned in and out.
+- [ ] **`vector.Memory` is a real cosine index.** Read `cosine` (dot / product-of-magnitudes
+  with a zero-magnitude guard) and confirm `Query` ranks by descending score with a
+  deterministic id tie-break, excludes `excludeID` (the zero value `""` excludes nothing),
+  bounds `topK` (0 → empty, negative → empty, `> count` → all), and rejects non-`Dim`
+  vectors with `ErrDimension` on both `Upsert` and `Query`.
+- [ ] **Shared conformance suite.** `vectortest.RunContract` holds `QueryRanksByCosine`,
+  `ExcludesSelf`, `DeleteRemoves` (the §6 cases) plus `UpsertReplaces`, `TopKBounds`,
+  `EmptyIndexReturnsNoMatches`, and `RejectsWrongDimension`. It takes a `Factory`, so the
+  Phase 6 pgvector adapter will reuse it verbatim under `-tags integration` — the same
+  fake↔Postgres parity mechanism `storetest` uses.
+- [ ] **No real SDK imports yet (§6 "done when").** `grep -rn "net/http\|openai\|anthropic\|
+  resend\|aws-sdk\|pgx" internal/fetch internal/extract internal/embed internal/summarize
+  internal/notify internal/blobs internal/vector` prints **nothing** — the real adapters are
+  Phase 6.
+- [ ] **Naming note / deviation from PLAN.md:** the VectorIndex port interface is named
+  `vector.Index`, not `vector.VectorIndex` as written in §6, because `revive`'s exported
+  rule flags `vector.VectorIndex` as a type-name stutter and the lint gate (A4) must stay
+  clean. The doc comment on `Index` preserves the "VectorIndex port" traceability. This is
+  the only Phase 4 deviation from the plan's literal names.
+- [ ] **Automated (B/§make verify):** compile-time `var _ Port = (*Fake)(nil)` assertions
+  for all seven ports, `TestAcceptance_VectorIndexContract` (the suite against `vector.Memory`),
+  and `TestPorts_FakesAreScriptableAndRecordCalls` (port-fidelity through the public surface)
+  are part of `make verify`.
+
+> Note: only the fakes/in-memory backends are in scope here. The real adapters — `fetch.HTTP`,
+> `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
+> the integration arm of `vectortest.RunContract` belong to Phase 6 and are **not** in scope.
+> Wiring these ports into a pipeline is Phase 5. Do not flag their absence as a gap.
+
 ---
 
 ## 5. Section D — Conventions & constraints audit (`CLAUDE.md`)
@@ -489,8 +557,9 @@ Record these so a reviewer doesn't waste time or raise false bugs:
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
    dispatcher (`internal/dispatch`) is complete and verified (C9) but is **not yet
    wired into them**: nothing calls `Submit`/`Run`/`Sweep` from `main`, because its
-   `Handler` is the Phase 5 pipeline, which does not exist. No HTTP, pipeline,
-   adapters, config, or CLI subcommands exist yet (Phases 4–12).
+   `Handler` is the Phase 5 pipeline, which does not exist. The Phase 4 ports + fakes
+   (C10) exist but are not yet wired into anything either. No pipeline, real HTTP/SDK
+   adapters, HTTP API, config, or CLI subcommands exist yet (Phases 5–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
@@ -556,6 +625,10 @@ skipped/blocked (write why).
   lifecycle via narrow `Store`; rate-limit keeps attempt; retry-exhaustion → retryable
   `failed` (reprocessable); claim held across retries; `Sweep` recovers non-terminal at
   stored attempt, non-lossy; `FakeDelayer` seam; harness lifecycle+classifier green
+- [ ] C10 ports & fakes: interfaces match §6; fakes scriptable + record calls + defensive
+  copies + ctx-checked, race-clean; `blobs.Memory` round-trip + `ErrNotFound`; `vector.Memory`
+  cosine ranking/exclude/topK/dim via `vectortest.RunContract`; no real SDK imports;
+  `vector.Index` rename noted; harness conformance + `TestPorts_*` green
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);

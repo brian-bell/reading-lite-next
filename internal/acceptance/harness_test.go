@@ -36,11 +36,19 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bbell/reading-lite/internal/blobs"
 	"github.com/bbell/reading-lite/internal/clock"
 	"github.com/bbell/reading-lite/internal/dispatch"
+	"github.com/bbell/reading-lite/internal/embed"
+	"github.com/bbell/reading-lite/internal/extract"
+	"github.com/bbell/reading-lite/internal/fetch"
+	"github.com/bbell/reading-lite/internal/notify"
 	"github.com/bbell/reading-lite/internal/reading"
 	"github.com/bbell/reading-lite/internal/store"
 	"github.com/bbell/reading-lite/internal/store/storetest"
+	"github.com/bbell/reading-lite/internal/summarize"
+	"github.com/bbell/reading-lite/internal/vector"
+	"github.com/bbell/reading-lite/internal/vector/vectortest"
 )
 
 // --- Compile-time port conformance (Section C: ports have the expected shape) ---
@@ -53,6 +61,15 @@ var (
 	_ dispatch.Store   = (*store.Memory)(nil) // the memory backend satisfies the dispatcher's narrow Store port
 	_ dispatch.Delayer = (*dispatch.FakeDelayer)(nil)
 	_ dispatch.Delayer = dispatch.RealDelayer{}
+
+	// Phase 4 external-service ports: each in-memory fake/backend satisfies its port.
+	_ blobs.Blobs          = (*blobs.Memory)(nil)
+	_ embed.Embedder       = (*embed.Fake)(nil)
+	_ fetch.Fetcher        = (*fetch.Fake)(nil)
+	_ extract.Extractor    = (*extract.Fake)(nil)
+	_ summarize.Summarizer = (*summarize.Fake)(nil)
+	_ notify.Notifier      = (*notify.Fake)(nil)
+	_ vector.Index         = (*vector.Memory)(nil)
 )
 
 // ---------------------------------------------------------------------------
@@ -164,6 +181,101 @@ func TestAcceptance_StoreContract(t *testing.T) {
 			storetest.RunContract(t, be.factory(t))
 		})
 	}
+}
+
+// TestAcceptance_VectorIndexContract runs the shared VectorIndex conformance suite
+// against the in-memory cosine index (Phase 4). The pgvector adapter (vector.Postgres,
+// Phase 6) will reuse the identical vectortest.RunContract under -tags integration, so
+// the fake's ranking and the production adapter's cannot diverge.
+func TestAcceptance_VectorIndexContract(t *testing.T) {
+	vectortest.RunContract(t, func(t *testing.T) vector.Index {
+		t.Helper()
+		return vector.NewMemory()
+	})
+}
+
+// TestPorts_FakesAreScriptableAndRecordCalls verifies, through each port's public
+// surface, that the Phase 4 in-memory fakes are faithful doubles: they return a
+// scripted result, can be scripted to error, and record their call count — the
+// contract the pipeline (Phase 5) depends on to drive every Process branch with no
+// real network. The vector and blob backends carry real behavior and are proven by
+// their own contract/round-trip tests (TestAcceptance_VectorIndexContract and the
+// blobs package suite), so this focuses on the five scriptable stubs.
+func TestPorts_FakesAreScriptableAndRecordCalls(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("scripted failure")
+
+	t.Run("fetch", func(t *testing.T) {
+		f := &fetch.Fake{Resource: fetch.Resource{Status: 200, Body: []byte("body")}}
+		if got, err := f.Get(ctx, "https://example.com"); err != nil || got.Status != 200 || string(got.Body) != "body" {
+			t.Fatalf("Get = %+v/%v, want status 200 body \"body\"", got, err)
+		}
+		f.Err = boom
+		if _, err := f.Get(ctx, "https://example.com"); !errors.Is(err, boom) {
+			t.Fatalf("scripted error = %v, want boom", err)
+		}
+		if f.Calls() != 2 || len(f.URLs()) != 2 {
+			t.Fatalf("Calls/URLs = %d/%d, want 2/2", f.Calls(), len(f.URLs()))
+		}
+	})
+
+	t.Run("extract", func(t *testing.T) {
+		f := &extract.Fake{Article: extract.Article{Title: "T", Mode: extract.ModeReadability}}
+		if got, err := f.Extract(ctx, fetch.Resource{}); err != nil || got.Mode != extract.ModeReadability {
+			t.Fatalf("Extract = %+v/%v, want mode readability", got, err)
+		}
+		f.Err = boom
+		if _, err := f.Extract(ctx, fetch.Resource{}); !errors.Is(err, boom) {
+			t.Fatalf("scripted error = %v, want boom", err)
+		}
+		if f.Calls() != 2 {
+			t.Fatalf("Calls = %d, want 2", f.Calls())
+		}
+	})
+
+	t.Run("embed", func(t *testing.T) {
+		f := &embed.Fake{}
+		if got, err := f.Embed(ctx, "hi"); err != nil || len(got) != embed.Dim {
+			t.Fatalf("Embed len = %d/%v, want %d", len(got), err, embed.Dim)
+		}
+		f.Err = boom
+		if _, err := f.Embed(ctx, "hi"); !errors.Is(err, boom) {
+			t.Fatalf("scripted error = %v, want boom", err)
+		}
+		if f.Calls() != 2 {
+			t.Fatalf("Calls = %d, want 2", f.Calls())
+		}
+	})
+
+	t.Run("summarize", func(t *testing.T) {
+		f := &summarize.Fake{Summary: summarize.Summary{Title: "T", Tags: []string{"go"}}}
+		if got, err := f.Summarize(ctx, summarize.SummaryInput{}); err != nil || got.Title != "T" {
+			t.Fatalf("Summarize = %+v/%v, want title T", got, err)
+		}
+		f.Err = boom
+		if _, err := f.Summarize(ctx, summarize.SummaryInput{}); !errors.Is(err, boom) {
+			t.Fatalf("scripted error = %v, want boom", err)
+		}
+		if f.Calls() != 2 {
+			t.Fatalf("Calls = %d, want 2", f.Calls())
+		}
+	})
+
+	t.Run("notify", func(t *testing.T) {
+		f := &notify.Fake{}
+		if err := f.Notify(ctx, notify.Email{To: "me@example.com"}); err != nil {
+			t.Fatalf("Notify = %v, want nil", err)
+		}
+		f.Err = boom
+		if err := f.Notify(ctx, notify.Email{To: "me@example.com"}); !errors.Is(err, boom) {
+			t.Fatalf("scripted error = %v, want boom", err)
+		}
+		// A failed send is attempted but not recorded as sent — matching the pipeline's
+		// "notify failure never fails a reading" policy.
+		if f.Calls() != 2 || len(f.Sent()) != 1 {
+			t.Fatalf("Calls/Sent = %d/%d, want 2/1", f.Calls(), len(f.Sent()))
+		}
+	})
 }
 
 // TestAcceptance_ReadingMetadataLifecycle exercises the phases 0-2 slice end to
