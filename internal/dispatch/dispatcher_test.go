@@ -640,6 +640,54 @@ func TestDispatch_DuplicateIdNotProcessedConcurrently(t *testing.T) {
 	}
 }
 
+func TestDispatch_BufferedDuplicateRunsOnce(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	started := make(chan struct{}, 4)
+	proceed := make(chan struct{})
+	h := &recordingHandler{fn: func(int, string) dispatch.Result {
+		started <- struct{}{}
+		<-proceed
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Workers: 1, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(done)
+	}()
+
+	// The same id is submitted twice before it is drained. Ownership is held from
+	// the first enqueue, so the second submit is dropped — otherwise the buffered
+	// duplicate would reprocess after the first run released the id and could
+	// overwrite its terminal status.
+	d.Submit("r1")
+	d.Submit("r1")
+
+	<-started      // the single run is in flight, holding the id
+	close(proceed) // let it finish -> ready -> release
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+
+	if got := h.count(); got != 1 {
+		t.Fatalf("handler ran %d times for a buffered duplicate submit, want 1", got)
+	}
+	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
+		t.Fatalf("status = %q, want ready", got.Status)
+	}
+}
+
 func TestDispatch_RecoverySweepReenqueuesNonTerminal(t *testing.T) {
 	t.Parallel()
 

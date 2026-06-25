@@ -60,12 +60,13 @@ type Dispatcher struct {
 	inflight   map[string]bool
 }
 
-// claim takes single-process ownership of a reading id for the duration of one
-// handle. It returns false when another worker is already processing the id, so a
-// duplicate dispatch (a live Submit racing a re-dispatch or a recovery sweep)
-// cannot run the pipeline twice and overwrite the winner's terminal status with a
-// losing attempt's. This single-instance guard matches the process topology; a
-// multi-instance deployment would need a store-level claim instead.
+// claim takes single-process ownership of a reading id. Ownership is held from the
+// moment the id is enqueued until its work reaches a terminal outcome — across the
+// time it sits queued AND across every retry/requeue in between — so a duplicate
+// dispatch (a second Submit, or a sweep re-enqueuing an id that is already queued
+// or in flight) is dropped instead of running the pipeline a second time and
+// overwriting the winner's terminal status. This single-instance guard matches the
+// process topology; a multi-instance deployment would need a store-level claim.
 func (d *Dispatcher) claim(id string) bool {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
@@ -97,21 +98,26 @@ func (d *Dispatcher) ensureCh() {
 	})
 }
 
-// Submit enqueues id for processing at attempt 0. It is non-blocking: if the
-// channel is full the item is dropped (see enqueue) rather than blocking ingest.
+// Submit enqueues id for processing at attempt 0. It is non-blocking: a duplicate
+// (already queued or in flight) or a full channel is dropped rather than blocking
+// ingest; the reading stays pending and is recovered by the startup Sweep,
+// backstopped meanwhile by read-time stale annotation plus on-demand reprocess
+// (PLAN.md §1.4).
 func (d *Dispatcher) Submit(id string) {
-	d.enqueue(item{id: id})
+	if !d.claim(id) {
+		return // already queued or in flight: drop the duplicate
+	}
+	d.queueClaimed(item{id: id})
 }
 
-// enqueue is the lossy path used by live ingest (Submit) and re-dispatch: a full
-// channel drops the item rather than blocking. A dropped reading stays pending and
-// is recovered by the startup Sweep (see enqueueRecovered), backstopped meanwhile
-// by read-time stale annotation plus on-demand reprocess (PLAN.md §1.4).
-func (d *Dispatcher) enqueue(it item) {
+// queueClaimed dispatches an item whose id is already claimed — the live path for
+// Submit and for re-dispatch. On a full-channel drop it releases the claim, since
+// the item will not run; the recovery Sweep re-dispatches the still-pending reading.
+func (d *Dispatcher) queueClaimed(it item) {
 	if d.Inline {
-		// A re-dispatch is a fresh unit of work, decoupled from any originating
-		// request context; the async worker pool (Run) scopes work to the run
-		// context instead, and inline is the test/handler seam.
+		// Re-dispatch is decoupled from any originating request context; the async
+		// worker pool (Run) scopes work to the run context instead, and inline is
+		// the test/handler seam.
 		d.handle(context.Background(), it)
 		return
 	}
@@ -120,14 +126,15 @@ func (d *Dispatcher) enqueue(it item) {
 	select {
 	case d.ch <- it:
 	default:
-		// Buffer full: drop. The default buffer is sized so drops are a rare
-		// overload backstop on the live path, not a normal occurrence.
+		// Buffer full: drop and relinquish ownership. The default buffer is sized
+		// so this is a rare overload backstop, not a normal occurrence.
+		d.release(it.id)
 	}
 }
 
 // enqueueRecovered is the non-lossy path used by Sweep: recovery must not drop, so
-// it blocks until a worker accepts the item or ctx is cancelled. Callers therefore
-// run the worker pool concurrently (or pass a bounded ctx) to avoid blocking.
+// it claims the id and blocks until a worker accepts it or ctx is cancelled.
+// Callers run the worker pool concurrently (or pass a bounded ctx) to avoid blocking.
 func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	// Honor cancellation deterministically: a select with both a ready send and a
 	// ready ctx.Done picks at random, so check the context first — otherwise a
@@ -135,6 +142,9 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	// fits in the buffer. The inline path runs under the sweep context too.
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !d.claim(it.id) {
+		return nil // already queued or in flight: not an error, just a no-op
 	}
 	if d.Inline {
 		d.handle(ctx, it)
@@ -144,6 +154,7 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	d.ensureCh()
 	select {
 	case <-ctx.Done():
+		d.release(it.id)
 		return ctx.Err()
 	case d.ch <- it:
 		return nil
@@ -183,9 +194,11 @@ func (d *Dispatcher) Run(ctx context.Context) {
 					return
 				case it := <-d.ch:
 					// Re-check in case cancellation raced with the receive: leave
-					// this id for the sweep rather than starting new work.
+					// this id for the sweep rather than starting new work, and
+					// relinquish ownership so the sweep can re-dispatch it.
 					select {
 					case <-ctx.Done():
+						d.release(it.id)
 						return
 					default:
 					}
@@ -199,19 +212,14 @@ func (d *Dispatcher) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// handle runs one item end to end: mark the reading running (mirroring the
-// attempt onto process_attempts), run Handler, then apply decide and persist the
-// outcome — ready on success, pending plus a scheduled re-dispatch on retry or
-// rate limit, failed when the retry budget is spent or the error is permanent.
-// It is the only method that touches the Store and the Delayer.
+// handle runs one already-claimed item end to end: mark the reading running
+// (mirroring the attempt onto process_attempts), run Handler, then apply decide and
+// persist the outcome — ready on success, pending plus a scheduled re-dispatch on
+// retry or rate limit, failed when the retry budget is spent or the error is
+// permanent. It releases ownership on a terminal outcome but RETAINS it across a
+// re-dispatch, so the id stays owned for its whole retry chain. It is the only
+// method that touches the Store and the Delayer.
 func (d *Dispatcher) handle(ctx context.Context, it item) {
-	if !d.claim(it.id) {
-		// Another worker already owns this id; drop the duplicate rather than
-		// processing it concurrently. The owner persists the terminal outcome.
-		return
-	}
-	defer d.release(it.id)
-
 	now := d.Clock.Now()
 	attempt := it.attempt
 	if err := d.Store.UpdateStatus(ctx, it.id, reading.Running, store.StatusFields{
@@ -220,6 +228,9 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 		ProcessAttempts: &attempt,
 		ClearError:      true,
 	}); err != nil {
+		// Could not even start; relinquish ownership (the reading is unchanged) so
+		// the recovery sweep can re-dispatch it.
+		d.release(it.id)
 		return
 	}
 
@@ -238,10 +249,12 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 	switch {
 	case act.MarkFailed:
 		d.markFailed(ctx, it.id, attempt, res)
+		d.release(it.id)
 	case act.Redispatch:
-		d.redispatch(ctx, it.id, act)
+		d.redispatch(ctx, it.id, act) // keeps ownership across the delay
 	default:
 		d.markReady(ctx, it.id)
+		d.release(it.id)
 	}
 }
 
@@ -291,7 +304,9 @@ func (d *Dispatcher) redispatch(ctx context.Context, id string, act Action) {
 		ProcessAttempts: &next,
 	})
 	d.Delay.After(act.Delay, func() {
-		d.enqueue(item{id: id, attempt: act.NextAttempt})
+		// Ownership is retained from the first enqueue through every retry, so the
+		// continuation requeues WITHOUT re-claiming.
+		d.queueClaimed(item{id: id, attempt: next})
 	})
 }
 
