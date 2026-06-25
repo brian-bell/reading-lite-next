@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"os"
@@ -36,6 +37,7 @@ import (
 	"unicode"
 
 	"github.com/bbell/reading-lite/internal/clock"
+	"github.com/bbell/reading-lite/internal/dispatch"
 	"github.com/bbell/reading-lite/internal/reading"
 	"github.com/bbell/reading-lite/internal/store"
 	"github.com/bbell/reading-lite/internal/store/storetest"
@@ -44,10 +46,13 @@ import (
 // --- Compile-time port conformance (Section C: ports have the expected shape) ---
 
 var (
-	_ store.Store = (*store.Memory)(nil)
-	_ store.Store = (*store.Postgres)(nil)
-	_ clock.Clock = clock.System{}
-	_ clock.Clock = (*clock.Fake)(nil)
+	_ store.Store      = (*store.Memory)(nil)
+	_ store.Store      = (*store.Postgres)(nil)
+	_ clock.Clock      = clock.System{}
+	_ clock.Clock      = (*clock.Fake)(nil)
+	_ dispatch.Store   = (*store.Memory)(nil) // the memory backend satisfies the dispatcher's narrow Store port
+	_ dispatch.Delayer = (*dispatch.FakeDelayer)(nil)
+	_ dispatch.Delayer = dispatch.RealDelayer{}
 )
 
 // ---------------------------------------------------------------------------
@@ -298,6 +303,214 @@ func TestAcceptance_ClockDeterminism(t *testing.T) {
 	}
 }
 
+// TestAcceptance_DispatcherLifecycle exercises the Phase 3 in-process dispatcher
+// through its exported surface (PLAN.md §5): a submitted reading runs to ready, a
+// rate limit re-dispatches without consuming an attempt, a spent retry budget
+// fails retryably (and stays reprocessable), and the startup recovery sweep
+// re-dispatches only the readings a crash would have stranded — each resuming at
+// its stored attempt count. It runs inline with a FakeDelayer so every retry,
+// backoff, and requeue path is deterministic: no goroutines, timers, or sleeps.
+func TestAcceptance_DispatcherLifecycle(t *testing.T) {
+	t.Run("SubmitProcessesToReady", func(t *testing.T) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+		seedDispatchReading(t, st, "r1", reading.Pending, 0, clk.Now(), nil)
+
+		var calls int
+		d := &dispatch.Dispatcher{
+			Handler: func(context.Context, string) dispatch.Result {
+				calls++
+				return dispatch.Result{Outcome: dispatch.Done}
+			},
+			Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true,
+		}
+
+		d.Submit("r1")
+
+		if calls != 1 {
+			t.Fatalf("handler calls = %d, want 1", calls)
+		}
+		if got := mustGetReading(t, st, "r1"); got.Status != reading.Ready {
+			t.Fatalf("status = %q, want ready", got.Status)
+		}
+	})
+
+	t.Run("RateLimitRequeueKeepsAttempt", func(t *testing.T) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+		seedDispatchReading(t, st, "r1", reading.Pending, 0, clk.Now(), nil)
+
+		delay := &dispatch.FakeDelayer{}
+		var call int
+		d := &dispatch.Dispatcher{
+			Handler: func(context.Context, string) dispatch.Result {
+				call++
+				if call == 1 {
+					return dispatch.Result{Outcome: dispatch.Requeue, After: 30 * time.Second}
+				}
+				return dispatch.Result{Outcome: dispatch.Done}
+			},
+			Store: st, Clock: clk, Delay: delay, Max: 3, Inline: true,
+		}
+
+		d.Submit("r1")
+
+		// The rate limit schedules a re-dispatch after the upstream's delay and leaves
+		// the reading pending without spending an attempt.
+		if got := delay.Durations(); len(got) != 1 || got[0] != 30*time.Second {
+			t.Fatalf("scheduled delays = %v, want [30s]", got)
+		}
+		if got := mustGetReading(t, st, "r1"); got.Status != reading.Pending || got.ProcessAttempts != 0 {
+			t.Fatalf("after requeue = %q/attempts %d, want pending/0", got.Status, got.ProcessAttempts)
+		}
+
+		delay.FireAll()
+
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Ready {
+			t.Fatalf("status after redispatch = %q, want ready", got.Status)
+		}
+		if got.ProcessAttempts != 0 {
+			t.Fatalf("process_attempts = %d, want 0 (a rate limit must not consume an attempt)", got.ProcessAttempts)
+		}
+	})
+
+	t.Run("RetryExhaustionFailsRetryable", func(t *testing.T) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+		seedDispatchReading(t, st, "r1", reading.Pending, 0, clk.Now(), nil)
+
+		delay := &dispatch.FakeDelayer{}
+		var calls int
+		// Max=2: attempt 0 retries after backoff, attempt 1 spends the budget -> failed.
+		d := &dispatch.Dispatcher{
+			Handler: func(context.Context, string) dispatch.Result {
+				calls++
+				return dispatch.Result{Outcome: dispatch.Retry, Err: errors.New("upstream 503")}
+			},
+			Store: st, Clock: clk, Delay: delay, Max: 2, Inline: true,
+		}
+
+		d.Submit("r1")
+		delay.FireAll()
+
+		if calls != 2 {
+			t.Fatalf("handler calls = %d, want 2", calls)
+		}
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Failed {
+			t.Fatalf("status = %q, want failed", got.Status)
+		}
+		if !strings.Contains(got.Error, "exhausted") {
+			t.Fatalf("error = %q, want it to name the spent retry budget", got.Error)
+		}
+		if delay.PendingLen() != 0 {
+			t.Fatalf("pending delays = %d, want 0 (no schedule once the budget is spent)", delay.PendingLen())
+		}
+
+		// A retry-exhausted reading stays reprocessable: a fresh dispatch runs it again.
+		calls = 0
+		d2 := &dispatch.Dispatcher{
+			Handler: func(context.Context, string) dispatch.Result {
+				calls++
+				return dispatch.Result{Outcome: dispatch.Done}
+			},
+			Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 2, Inline: true,
+		}
+		d2.Submit("r1")
+		if reprocessed := mustGetReading(t, st, "r1"); calls != 1 || reprocessed.Status != reading.Ready {
+			t.Fatalf("reprocess after failure: calls=%d status=%q, want 1/ready", calls, reprocessed.Status)
+		}
+	})
+
+	t.Run("RecoverySweepReenqueuesNonTerminal", func(t *testing.T) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+
+		staleStart := clk.Now().Add(-31 * time.Minute)
+		freshStart := clk.Now().Add(-5 * time.Minute)
+		seedDispatchReading(t, st, "r-pending", reading.Pending, 0, clk.Now(), nil)
+		seedDispatchReading(t, st, "r-running-stale", reading.Running, 0, staleStart, &staleStart)
+		seedDispatchReading(t, st, "r-running-fresh", reading.Running, 0, freshStart, &freshStart)
+		seedDispatchReading(t, st, "r-ready", reading.Ready, 0, clk.Now(), nil)
+		seedDispatchReading(t, st, "r-failed", reading.Failed, 0, clk.Now(), nil)
+
+		// Inline Sweep runs each recovered handler synchronously in one goroutine, so a
+		// plain slice records the swept ids without a lock.
+		var swept []string
+		d := &dispatch.Dispatcher{
+			Handler: func(_ context.Context, id string) dispatch.Result {
+				swept = append(swept, id)
+				return dispatch.Result{Outcome: dispatch.Done}
+			},
+			Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, RunningTTL: 30 * time.Minute, Inline: true,
+		}
+
+		if err := d.Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+
+		slices.Sort(swept)
+		if want := []string{"r-pending", "r-running-stale"}; !slices.Equal(swept, want) {
+			t.Fatalf("swept ids = %v, want %v (only pending + stale running)", swept, want)
+		}
+	})
+
+	t.Run("SweepResumesAtStoredAttempt", func(t *testing.T) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+		seedDispatchReading(t, st, "r1", reading.Pending, 2, clk.Now(), nil) // process_attempts already 2
+
+		delay := &dispatch.FakeDelayer{}
+		d := &dispatch.Dispatcher{
+			Handler: func(context.Context, string) dispatch.Result {
+				return dispatch.Result{Outcome: dispatch.Retry}
+			},
+			Store: st, Clock: clk, Delay: delay, Max: 3, Inline: true,
+		}
+
+		// Resuming at attempt 2 with Max=3 spends the last of the budget on this one
+		// run, so a single sweep fails it; a fresh attempt-0 start would re-dispatch
+		// instead. That is how MAX_ATTEMPTS is honored across a restart.
+		if err := d.Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Failed {
+			t.Fatalf("status = %q, want failed (Max honored across restart)", got.Status)
+		}
+		if got.ProcessAttempts != 2 {
+			t.Fatalf("process_attempts = %d, want 2", got.ProcessAttempts)
+		}
+		if delay.Total() != 0 {
+			t.Fatalf("delays scheduled = %d, want 0 (the resumed run exhausts immediately)", delay.Total())
+		}
+	})
+}
+
+// TestAcceptance_DispatcherClassifiesErrors pins the shared error classifier
+// (PLAN.md §5.1) that the dispatcher and the pipeline both use: a rate limit
+// requeues carrying its delay, a permanent error fails, nil is success, and
+// anything else is a transient retry. Wrapped and direct errors classify alike.
+func TestAcceptance_DispatcherClassifiesErrors(t *testing.T) {
+	if got := dispatch.Classify(nil); got.Outcome != dispatch.Done {
+		t.Fatalf("Classify(nil) = %v, want Done", got.Outcome)
+	}
+
+	rl := dispatch.Classify(fmt.Errorf("embed: %w", &dispatch.RateLimitError{RetryAfter: 30 * time.Second}))
+	if rl.Outcome != dispatch.Requeue || rl.After != 30*time.Second {
+		t.Fatalf("Classify(rate limit) = %v/%v, want Requeue/30s", rl.Outcome, rl.After)
+	}
+
+	if got := dispatch.Classify(fmt.Errorf("reddit: %w", dispatch.ErrPermanent)); got.Outcome != dispatch.Fail {
+		t.Fatalf("Classify(permanent) = %v, want Fail", got.Outcome)
+	}
+
+	if got := dispatch.Classify(errors.New("connection reset")); got.Outcome != dispatch.Retry {
+		t.Fatalf("Classify(transient) = %v, want Retry", got.Outcome)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Section D — conventions audit (source inspection)
 // ---------------------------------------------------------------------------
@@ -425,6 +638,30 @@ func TestConventions_DockerStaysOutOfDefaultBuild(t *testing.T) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// seedDispatchReading persists a reading in a chosen lifecycle state so the
+// dispatcher acceptance tests can drive Submit/Sweep against real store state.
+func seedDispatchReading(t *testing.T, s store.Store, id string, status reading.Status, attempts int, created time.Time, startedAt *time.Time) {
+	t.Helper()
+	r := reading.Reading{
+		ID: id, URL: "https://example.com/" + id, URLKey: "key-" + id,
+		Status: status, SourceKind: reading.SourceWeb,
+		ProcessAttempts: attempts, StartedAt: startedAt,
+		CreatedAt: created, UpdatedAt: created,
+	}
+	if err := s.SaveReading(context.Background(), r); err != nil {
+		t.Fatalf("seed %q: %v", id, err)
+	}
+}
+
+func mustGetReading(t *testing.T, s store.Store, id string) reading.Reading {
+	t.Helper()
+	r, err := s.GetByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetByID(%q): %v", id, err)
+	}
+	return r
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
