@@ -2,13 +2,16 @@ GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 SQLC ?= $(shell command -v sqlc 2>/dev/null || printf '%s/bin/sqlc' "$$($(GO) env GOPATH)")
 
-.PHONY: test test-integration test-race lint cover sqlc migrate build run
+.PHONY: test test-integration test-race verify lint cover sqlc migrate build run
 
 test:
 	$(GO) test ./...
 
 test-integration:
 	$(GO) test -tags integration ./...
+
+verify:
+	$(GO) test -tags verify ./internal/acceptance/...
 
 test-race:
 	$(GO) test -race ./...
