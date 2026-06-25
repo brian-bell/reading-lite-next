@@ -1,13 +1,15 @@
 # reading-lite
 
 `reading-lite` is a Go backend for a personal reading service. The backend is being built
-test-first from `docs/backend-tdd-plan.md`.
+test-first from `docs/PLAN.md`.
 
-Current status: Phase 2 has added the readings metadata store port. The repository contains the
+Current status: Phase 3 has added the in-process dispatcher. The repository contains the
 Go module, Makefile targets, GitHub Actions CI, lint configuration, placeholder `reader-api` and
 `readerctl` binaries, the deterministic `internal/clock` package, `internal/reading` for the
-pure domain core, and `internal/store` for the shared Store interface, concurrency-safe memory
-fake, Postgres adapter, embedded migration, SQL query file, and conformance suite.
+pure domain core, `internal/store` for the shared Store interface, concurrency-safe memory
+fake, Postgres adapter, embedded migration, SQL query file, and conformance suite, and
+`internal/dispatch` for the worker pool, retry/backoff and rate-limit decision logic, and the
+crash-recovery sweep.
 
 ## Requirements
 

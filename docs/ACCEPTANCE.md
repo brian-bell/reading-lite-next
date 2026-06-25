@@ -2,7 +2,7 @@
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
-> `docs/backend-tdd-plan.md` (the implementation contract) and `CLAUDE.md` (the
+> `docs/PLAN.md` (the implementation contract) and `CLAUDE.md` (the
 > project conventions). Every step lists **what to do**, **what to expect**, and
 > **why it matters**. A consolidated checklist is at the end.
 >
@@ -43,8 +43,11 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 
 ### Out of scope (do not expect these to work yet)
 
-Phases 3–12 are **not** implemented: the dispatcher, pipeline, external-service ports
-(`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`), the HTTP API, the
+Phase 3's in-process dispatcher is implemented in `internal/dispatch/` (worker pool,
+retry/backoff and rate-limit decision logic, crash-recovery sweep) and verified by its own
+race-tested package tests — **not** by this Phase 0–2 harness, and not yet wired into the
+binaries. The remaining Phases 4–12 are **not** implemented: the pipeline, external-service
+ports (`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`), the HTTP API, the
 operator CLI subcommands, config loading, and observability. `reader-api` and
 `readerctl` are intentionally empty `main(){}` placeholders. Verifying "the service
 runs and ingests a URL" is **premature** and not part of this plan.
@@ -382,8 +385,9 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    bypasses Docker entirely.
 2. **`internal/reading` coverage is 88.6%**, just under the 90% domain target. Decide
    (via B4) whether the uncovered lines are meaningful.
-3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. No HTTP,
-   dispatcher, pipeline, adapters, config, or CLI subcommands exist yet (Phases 3–12).
+3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
+   dispatcher (`internal/dispatch`) exists but is not yet wired into them; no HTTP,
+   pipeline, adapters, config, or CLI subcommands exist yet (Phases 4–12).
 4. **Toolchain `PATH` is configured in `~/.bashrc`** — interactive shells resolve
    the tools directly; only minimal non-interactive shells need the manual export
    in §1.
@@ -447,7 +451,7 @@ skipped/blocked (write why).
 
 ### E — Sign-off
 - [ ] Limitations in §6 acknowledged
-- [ ] Any deviation from `docs/backend-tdd-plan.md` recorded with rationale
+- [ ] Any deviation from `docs/PLAN.md` recorded with rationale
 - [ ] Overall verdict: Phases 0–2 **accept / reject** (record in §8 sign-off log)
 
 ---
@@ -464,7 +468,8 @@ state that was verified (PR/commit + CI) so the sign-off is reproducible later.
 | 2026-06-24 | Phases 0–2 — tooling, domain core (`reading`, `clock`), store (`Memory` + `Postgres`) | Brian Bell | PR #1 (`verification-harness`); CI build/integration/lint green; `make verify` green; `go test -race ./...` clean; `internal/reading` 97.4%; store contract proven against Memory + testcontainers Postgres | ✅ Accepted |
 
 Notes:
-- Scope is **Phases 0–2 only**; Phases 3–12 (dispatcher, pipeline, external-service
-  ports, HTTP API, CLI, hardening) are not yet built and are out of scope for this
-  sign-off (§0).
-- No deviations from `docs/backend-tdd-plan.md` were found.
+- Scope is **Phases 0–2 only**; the Phase 3 dispatcher and Phases 4–12 (pipeline,
+  external-service ports, HTTP API, CLI, hardening) are out of scope for this sign-off
+  (§0). The Phase 3 dispatcher has since landed in `internal/dispatch` and is verified
+  by its own package tests, pending its own acceptance sign-off.
+- No deviations from `docs/PLAN.md` were found.
