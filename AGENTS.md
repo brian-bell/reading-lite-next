@@ -1,9 +1,10 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 2 of `docs/backend-tdd-plan.md`: project tooling, CI conventions,
-placeholder binaries, deterministic clock support, the pure reading domain core, and the
-readings metadata store behind a shared conformance suite.
+checkout has completed Phase 3 of `docs/PLAN.md`: project tooling, CI conventions,
+placeholder binaries, deterministic clock support, the pure reading domain core, the
+readings metadata store behind a shared conformance suite, and the in-process dispatcher
+with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep.
 
 ## Structure
 
@@ -19,7 +20,13 @@ readings metadata store behind a shared conformance suite.
 - `internal/store/` defines the `Store` port, shared query/page DTOs, `store.Memory`, the
   pgx-backed `store.Postgres` adapter, embedded migrations, SQL query source for sqlc, and
   `storetest.RunContract` for backend-neutral behavior checks.
-- `docs/backend-tdd-plan.md` is the implementation contract for the backend phases.
+- `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
+  and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
+  injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
+  drains an in-memory channel and persists each run's lifecycle outcome, and a startup
+  `Sweep` that re-dispatches readings left non-terminal by a crash, resuming each at its
+  stored attempt count.
+- `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
 
@@ -59,4 +66,7 @@ The project targets Go 1.26.
 - Keep integration tests behind `//go:build integration`.
 - Add store behavior to `internal/store/storetest` first, then make `store.Memory` and
   `store.Postgres` satisfy the same contract.
+- Keep retry/backoff logic in pure functions (`dispatch.decide`, `dispatch.Classify`) and run
+  delays through the injected `dispatch.Delayer` seam so retry, backoff, rate-limit, and
+  recovery semantics test deterministically without real goroutines, timers, or sleeps.
 - Use table-driven subtests and `t.Parallel()` when there is no shared mutable state.

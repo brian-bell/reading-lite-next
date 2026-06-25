@@ -175,7 +175,7 @@ reading-lite/
 │   └── clock/             # Clock port + system + fake
 ├── testdata/              # HTML fixtures, recorded API bodies, bookmark exports
 ├── go.mod
-└── docs/backend-tdd-plan.md
+└── docs/PLAN.md
 ```
 
 ---
