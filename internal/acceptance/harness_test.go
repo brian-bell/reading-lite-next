@@ -203,14 +203,17 @@ func TestAcceptance_StoreContract(t *testing.T) {
 }
 
 // TestAcceptance_VectorIndexContract runs the shared VectorIndex conformance suite
-// against the in-memory cosine index (Phase 4). The pgvector adapter (vector.Postgres,
-// Phase 6) will reuse the identical vectortest.RunContract under -tags integration, so
-// the fake's ranking and the production adapter's cannot diverge.
+// against every backend: the in-memory cosine index (always) and the pgvector
+// adapter via testcontainers (skips without Docker). Running both here proves
+// vector.Memory↔vector.Postgres parity inside `make verify` — the same mechanism
+// TestAcceptance_StoreContract uses for the store — so the fake's ranking and the
+// production adapter's cannot diverge.
 func TestAcceptance_VectorIndexContract(t *testing.T) {
-	vectortest.RunContract(t, func(t *testing.T) vector.Index {
-		t.Helper()
-		return vector.NewMemory()
-	})
+	for _, be := range vectorBackends() {
+		t.Run(be.name, func(t *testing.T) {
+			vectortest.RunContract(t, be.factory(t))
+		})
+	}
 }
 
 // TestPorts_FakesAreScriptableAndRecordCalls verifies, through each port's public
@@ -822,6 +825,32 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 
 		if err := notify.NewResend("k", notify.WithBaseURL(srv.URL)).Notify(ctx, notify.Email{To: "x@example.com"}); err == nil {
 			t.Fatal("non-2xx notify = nil error, want an error (the pipeline swallows it, but the adapter must report it)")
+		}
+	})
+
+	t.Run("FetchRateLimitRequeues", func(t *testing.T) {
+		// A fetched 429 must classify as a Requeue (rate limit), not a permanent
+		// Fail — a throttled origin should re-dispatch, not burn the reading.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "15")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+		_, err := fetch.NewHTTP().Get(ctx, srv.URL)
+		if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 15*time.Second {
+			t.Fatalf("Classify(fetch 429) = %v/%v, want Requeue/15s", got.Outcome, got.After)
+		}
+
+		// A bare 429 (no Retry-After) must requeue with a bounded, positive delay,
+		// never zero — a zero delay would spin the dispatcher (requeue consumes no
+		// attempt) on an origin that always rate-limits.
+		bare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer bare.Close()
+		_, err = fetch.NewHTTP().Get(ctx, bare.URL)
+		if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != dispatch.DefaultRateLimitDelay {
+			t.Fatalf("Classify(bare fetch 429) = %v/%v, want Requeue/DefaultRateLimitDelay", got.Outcome, got.After)
 		}
 	})
 

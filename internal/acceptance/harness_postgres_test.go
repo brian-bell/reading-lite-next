@@ -16,6 +16,8 @@ import (
 
 	"github.com/bbell/reading-lite/internal/store"
 	"github.com/bbell/reading-lite/internal/store/storetest"
+	"github.com/bbell/reading-lite/internal/vector"
+	"github.com/bbell/reading-lite/internal/vector/vectortest"
 )
 
 // backend names a store implementation the blackbox acceptance tests run against.
@@ -109,6 +111,14 @@ func postgresDSN(t *testing.T) string {
 // schema so concurrent contract subtests cannot see each other's rows.
 func newPostgresStoreFromDSN(t *testing.T, dsn string) store.Store {
 	t.Helper()
+	return store.NewPostgres(newSchemaPool(t, dsn))
+}
+
+// newSchemaPool creates a fresh, isolated schema (search_path-scoped), applies the
+// store migrations into it, and returns a pool bound to it. Each minted backend
+// gets its own schema so the contract suite's parallel subtests stay isolated.
+func newSchemaPool(t *testing.T, dsn string) *pgxpool.Pool {
+	t.Helper()
 	ctx := context.Background()
 
 	root, err := pgxpool.New(ctx, dsn)
@@ -140,9 +150,71 @@ func newPostgresStoreFromDSN(t *testing.T, dsn string) store.Store {
 	if err := store.ApplyMigrations(ctx, pool); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	return store.NewPostgres(pool)
+	return pool
 }
 
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// vectorBackends is the matrix every vector-contract acceptance test iterates: the
+// in-memory cosine index (always) and the pgvector adapter via testcontainers
+// (skips when Docker/the provider is unavailable). Running both here proves
+// vector.Memory↔vector.Postgres parity inside `make verify`, mirroring the store.
+func vectorBackends() []vectorBackend {
+	return []vectorBackend{
+		{
+			name: "memory",
+			factory: func(*testing.T) vectortest.Factory {
+				return func(*testing.T) vector.Index { return vector.NewMemory() }
+			},
+		},
+		{
+			name:    "postgres",
+			factory: postgresVectorFactory,
+		},
+	}
+}
+
+type vectorBackend struct {
+	name    string
+	factory func(t *testing.T) vectortest.Factory
+}
+
+func postgresVectorFactory(t *testing.T) vectortest.Factory {
+	dsn := postgresDSN(t) // skips the calling (sub)test when Postgres is unavailable
+	return func(t *testing.T) vector.Index {
+		return &seedingVectorIndex{pool: newSchemaPool(t, dsn)}
+	}
+}
+
+// seedingVectorIndex wraps vector.Postgres for the contract run. reading_vectors
+// FK-references readings(id), so a bare-id upsert (which the contract does, lacking
+// a readings row) needs a minimal row seeded first; production always creates the
+// reading before its vector. Query/Delete and dimension rejection delegate
+// unchanged, so the suite still exercises the real adapter's behavior.
+type seedingVectorIndex struct {
+	pool *pgxpool.Pool
+}
+
+func (s *seedingVectorIndex) Upsert(ctx context.Context, id string, vec []float32) error {
+	if len(vec) != vector.Dim {
+		return vector.NewPostgres(s.pool).Upsert(ctx, id, vec) // returns ErrDimension without touching the DB
+	}
+	if _, err := s.pool.Exec(ctx, `
+insert into readings (id, url, url_key, status, source_kind, created_at, updated_at)
+values ($1, $2, $3, 'ready', 'web', now(), now())
+on conflict (id) do nothing`,
+		id, "https://example.com/"+id, "veckey-"+id); err != nil {
+		return fmt.Errorf("seed reading %q: %w", id, err)
+	}
+	return vector.NewPostgres(s.pool).Upsert(ctx, id, vec)
+}
+
+func (s *seedingVectorIndex) Query(ctx context.Context, vec []float32, topK int, excludeID string) ([]vector.Match, error) {
+	return vector.NewPostgres(s.pool).Query(ctx, vec, topK, excludeID)
+}
+
+func (s *seedingVectorIndex) Delete(ctx context.Context, id string) error {
+	return vector.NewPostgres(s.pool).Delete(ctx, id)
 }

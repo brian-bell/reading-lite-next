@@ -43,8 +43,9 @@ wiring are still pending: nothing constructs these adapters from `main` yet.
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
   `extract` consumes a `fetch.Resource`. Each (except `extract`, whose readability adapter is
   Phase 7) now also ships its real adapter: `fetch.HTTP` (UA, timeout, body-size cap,
-  redirect→`FinalURL`, non-http(s) scheme rejection — the private-IP SSRF guard is deferred to
-  Phase 11), `embed.OpenAI` (`/v1/embeddings`, `text-embedding-3-small`), `summarize.Anthropic`
+  redirect→`FinalURL`, non-http(s) scheme rejection, and a 429→`dispatch.RateLimitError`
+  requeue — the private-IP SSRF guard is deferred to Phase 11), `embed.OpenAI`
+  (`/v1/embeddings`, `text-embedding-3-small`), `summarize.Anthropic`
   (Messages API with forced `emit_reading` tool use), and `notify.Resend` (`/emails`). The HTTP
   adapters take a `WithBaseURL` option so a contract test can point them at an `httptest`
   upstream, and classify upstream failures through `internal/httpx`.

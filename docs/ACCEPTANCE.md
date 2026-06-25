@@ -18,9 +18,11 @@
 > `dispatch.Dispatcher` surface with a fake clock and a fake delayer, so they need
 > no goroutines, timers, or Docker. The Phase 4 external-service ports & fakes (C10)
 > are automated as well: compile-time port conformance, the VectorIndex contract
-> against `vector.Memory` (`TestAcceptance_VectorIndexContract`), and a port-fidelity
-> check that each scriptable fake returns scripted results, errors on demand, and
-> records its calls (`TestPorts_FakesAreScriptableAndRecordCalls`). The Phase 5
+> against both `vector.Memory` and a testcontainers pgvector backend
+> (`TestAcceptance_VectorIndexContract`, proving vector parity inside `make verify`
+> just like the store), and a port-fidelity check that each scriptable fake returns
+> scripted results, errors on demand, and records its calls
+> (`TestPorts_FakesAreScriptableAndRecordCalls`). The Phase 5
 > processing pipeline (C11) is automated too: `TestAcceptance_PipelineProcess` drives
 > `Pipeline.Process` through an inline dispatcher against fakes and asserts the
 > web→ready happy path, the Reddit permanent-failure-with-guidance path, and the
@@ -590,10 +592,12 @@ error mapping.
   anything else → a plain transient error (a `Retry`). `RetryAfter` parses delay-seconds and
   HTTP-date forms; absent/past/garbage → 0. Tests: `TestClassifyResponse_*`, `TestRetryAfter`.
 - [ ] **`fetch.HTTP`.** Sets the User-Agent, follows redirects and reports the post-redirect
-  `FinalURL`, returns the status, **caps the body** (`WithMaxBytes` → `ErrBodyTooLarge`, rejected
-  not truncated), honors `WithTimeout` and `ctx` cancellation, and **rejects non-http(s) schemes**
-  (`ErrUnsupportedScheme`) before dialing. The private-IP SSRF guard is deliberately deferred to
-  Phase 11 (TDD plan §13). Tests: `TestHTTP_*`.
+  `FinalURL`, returns the status, **caps the body** (`WithMaxBytes` → `ErrBodyTooLarge` for an
+  over-cap **2xx**, rejected not truncated; a non-2xx keeps its status so the pipeline classifies
+  it), honors `WithTimeout` and `ctx` cancellation, **rejects non-http(s) schemes**
+  (`ErrUnsupportedScheme`) before dialing, and maps a **429 → `dispatch.RateLimitError`** (honoring
+  `Retry-After`) so a throttled origin **requeues** instead of permanently failing. The private-IP
+  SSRF guard is deliberately deferred to Phase 11 (TDD plan §13). Tests: `TestHTTP_*`.
 - [ ] **`embed.OpenAI`.** POSTs `/v1/embeddings` with `Bearer` auth and `model=text-embedding-3-small`,
   parses `data[0].embedding`, and maps 429/4xx/5xx via `httpx`. Tests: `TestOpenAI_*` (request shape,
   rate-limit→`Requeue`, 4xx→`Fail`, 5xx→`Retry`).
@@ -605,19 +609,22 @@ error mapping.
   non-2xx is an error (the pipeline swallows it — no retry classification needed). Tests: `TestResend_*`.
 - [ ] **`vector.Postgres`** (integration). `Upsert`/`Query`/`Delete` over `reading_vectors`, ranking
   by cosine distance (`<=>`) with 1536-dim enforcement and self-exclusion. It satisfies the **same**
-  `vectortest.RunContract` as `vector.Memory`, run under `//go:build integration` against a
-  testcontainers `pgvector/pgvector` Postgres (`internal/vector/postgres_test.go`; a seed wrapper
-  supplies the FK-required `readings` row the bare-id contract upserts omit). **Proven locally** —
-  all 8 contract subtests pass.
+  `vectortest.RunContract` as `vector.Memory`, run two ways: under `//go:build integration`
+  (`internal/vector/postgres_test.go`) and inside `make verify` via the harness's `postgres` vector
+  backend (`TestAcceptance_VectorIndexContract`, skips without Docker). A seed wrapper supplies the
+  FK-required `readings` row the bare-id contract upserts omit. **Proven locally** — all 8 contract
+  subtests pass against real pgvector in both paths.
 - [ ] **`blobs.R2`** (S3-compatible). Path-style `Put`/`Get`/`Delete` against a custom endpoint
   (aws-sdk-go-v2), mapping a missing key to `blobs.ErrNotFound`. The default run does a full
   round-trip + bucket/key/content-type composition assertion against an in-memory `httptest` S3 stub
   (`r2_test.go`); a MinIO container round-trip runs under `//go:build integration`
   (`r2_integration_test.go`). **Proven locally** — both pass.
 - [ ] **Automated (B/§make verify):** `TestAcceptance_RealAdapters` re-proves the HTTP adapters'
-  request shape, the forced-tool path, and `dispatch.Classify` agreement through `httptest`;
-  compile-time `var _ Port = (*Adapter)(nil)` assertions pin every production adapter to its port;
-  and `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
+  request shape, the forced-tool path, and `dispatch.Classify` agreement through `httptest`
+  (including the fetch **429 → Requeue**); compile-time `var _ Port = (*Adapter)(nil)` assertions
+  pin every production adapter to its port; `TestAcceptance_VectorIndexContract` runs the vector
+  contract against **both** `vector.Memory` and a testcontainers pgvector backend; and
+  `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
   `vector.Postgres`/`blobs.R2` integration tests always compile.
 
 > Note: these adapters are not yet wired into `main` (Phase 8/11), and `extract.Readability` is
@@ -756,11 +763,12 @@ skipped/blocked (write why).
   idempotent re-entry summarizes once; status/content split; server-derived blob keys; ≥90%
   coverage; `TestAcceptance_PipelineProcess` green
 - [ ] C12 real adapters: each Phase 6 adapter matches §8 — `fetch.HTTP` (UA/timeout/size-cap/
-  redirect→FinalURL/scheme reject), `embed.OpenAI` + `summarize.Anthropic` (request shape, forced
-  `emit_reading` tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`), `notify.Resend`
-  (shape + non-2xx error), `vector.Postgres` (`vectortest.RunContract` under integration),
-  `blobs.R2` (httptest round-trip + MinIO under integration); compile-time port conformance +
-  `TestAcceptance_RealAdapters` green; SSRF private-IP guard deferred to Phase 11
+  redirect→FinalURL/scheme reject, **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` (request
+  shape, forced `emit_reading` tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`),
+  `notify.Resend` (shape + non-2xx error), `vector.Postgres` (`vectortest.RunContract` under
+  integration **and** the harness's pgvector backend), `blobs.R2` (httptest round-trip + MinIO under
+  integration); compile-time port conformance + `TestAcceptance_RealAdapters` green; SSRF private-IP
+  guard deferred to Phase 11
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
