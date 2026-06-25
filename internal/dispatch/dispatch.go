@@ -58,6 +58,13 @@ type Action struct {
 // without consuming the retry budget on transient errors.
 var ErrPermanent = errors.New("permanent")
 
+// DefaultRateLimitDelay is the requeue delay used when a rate-limited upstream
+// gives no usable Retry-After. A [Requeue] does not consume an attempt, so a
+// zero delay would re-dispatch immediately and spin a worker forever on a source
+// that always rate-limits without a usable header; this bounds it to a gentle
+// retry. It matches the transient-retry backoff ceiling.
+const DefaultRateLimitDelay = backoffCap
+
 // RateLimitError signals the upstream is rate limited and the work should be
 // re-dispatched after RetryAfter without consuming an attempt.
 type RateLimitError struct {

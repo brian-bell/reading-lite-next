@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–5)
+# reading-lite — Manual Verification Plan (Phases 0–6)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -18,17 +18,24 @@
 > `dispatch.Dispatcher` surface with a fake clock and a fake delayer, so they need
 > no goroutines, timers, or Docker. The Phase 4 external-service ports & fakes (C10)
 > are automated as well: compile-time port conformance, the VectorIndex contract
-> against `vector.Memory` (`TestAcceptance_VectorIndexContract`), and a port-fidelity
-> check that each scriptable fake returns scripted results, errors on demand, and
-> records its calls (`TestPorts_FakesAreScriptableAndRecordCalls`). The Phase 5
+> against both `vector.Memory` and a testcontainers pgvector backend
+> (`TestAcceptance_VectorIndexContract`, proving vector parity inside `make verify`
+> just like the store), and a port-fidelity check that each scriptable fake returns
+> scripted results, errors on demand, and records its calls
+> (`TestPorts_FakesAreScriptableAndRecordCalls`). The Phase 5
 > processing pipeline (C11) is automated too: `TestAcceptance_PipelineProcess` drives
 > `Pipeline.Process` through an inline dispatcher against fakes and asserts the
 > web→ready happy path, the Reddit permanent-failure-with-guidance path, and the
-> rate-limit requeue. Tool- and
+> rate-limit requeue. The Phase 6 real adapters (C12) are automated as well:
+> `TestAcceptance_RealAdapters` drives the HTTP adapters (`fetch.HTTP`, `embed.OpenAI`,
+> `summarize.Anthropic`, `notify.Resend`) against `httptest` upstreams — proving request
+> shape, the forced `emit_reading` tool path, and that upstream errors classify through
+> `dispatch.Classify` — and compile-time `var _ Port = (*Adapter)(nil)` assertions pin every
+> production adapter to its port. Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
-> remains a separate, dedicated path for the store↔Postgres integration suite. Each
-> automated test names the plan section it covers.
+> remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
+> `blobs.R2` (MinIO) integration suites. Each automated test names the plan section it covers.
 
 ## 0. Scope
 
@@ -36,8 +43,9 @@
 
 The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core),
 **Phase 2** (readings metadata store), **Phase 3** (in-process dispatcher),
-**Phase 4** (external-service ports & in-memory fakes), and **Phase 5** (the
-processing pipeline, fakes only):
+**Phase 4** (external-service ports & in-memory fakes), **Phase 5** (the
+processing pipeline, fakes only), and **Phase 6** (the real production adapters
+behind the Phase 4 ports, contract-tested via `httptest`/testcontainers):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -61,21 +69,29 @@ processing pipeline, fakes only):
 | Blobs port + in-memory backend | `internal/blobs/blobs.go` | 4 |
 | VectorIndex port (`Index`) + cosine `Memory` + conformance suite | `internal/vector/vector.go`, `internal/vector/vectortest/contract.go` | 4 |
 | Processing pipeline (orchestration) | `internal/pipeline/pipeline.go` | 5 |
+| HTTP fetch adapter (UA/timeout/size-cap/redirect/scheme) | `internal/fetch/http.go` | 6 |
+| OpenAI embeddings adapter | `internal/embed/openai.go` | 6 |
+| Anthropic summarizer (forced `emit_reading` tool use) | `internal/summarize/anthropic.go` | 6 |
+| Resend notification adapter | `internal/notify/resend.go` | 6 |
+| Shared HTTP error classification (`ClassifyResponse`/`RetryAfter`) | `internal/httpx/httpx.go` | 6 |
+| pgvector similarity adapter | `internal/vector/postgres.go` | 6 |
+| R2/S3 blob adapter (aws-sdk-go-v2) | `internal/blobs/r2.go` | 6 |
 
 ### Out of scope (do not expect these to work yet)
 
 The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together and is
-verified by its own race-tested package tests and the C11 blackbox checks here — but it is
-still **not wired into the binaries**: nothing calls `Submit`/`Run`/`Sweep` or constructs a
-`Pipeline` from `main` yet (that lands with the HTTP API and `main` lifecycle in Phases 8/11).
-The Phase 4 ports (`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`) drive the
-pipeline only through their in-memory fakes — every `Fake`/`Memory` backend is in scope;
-**no real adapter** (HTTP fetch, OpenAI, Anthropic, Resend, R2, pgvector) is implemented yet.
-The remaining Phases 6–12 are **not** implemented: the real HTTP/SDK adapters (Phase 6),
-extraction internals (Phase 7), the HTTP API, the operator CLI subcommands, config loading,
-and observability. `reader-api` and `readerctl` are intentionally empty `main(){}`
-placeholders. Verifying "the service runs and ingests a URL" is **premature** and not part of
-this plan.
+verified by its own race-tested package tests and the C11 blackbox checks here, and the
+Phase 6 real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
+`vector.Postgres`, `blobs.R2`) now exist behind those ports — but neither is **wired into the
+binaries**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an
+adapter from `main` yet (that lands with the HTTP API and `main` lifecycle in Phases 8/11).
+The Phase 5 pipeline still drives the ports through their in-memory fakes in tests; the real
+adapters are exercised only by their own contract tests (`httptest` upstreams, and
+testcontainers Postgres/MinIO under `//go:build integration`).
+The remaining Phases 7–12 are **not** implemented: the extraction internals and salvage tiers
+(Phase 7), the HTTP API, the operator CLI subcommands, config loading, and observability.
+`reader-api` and `readerctl` are intentionally empty `main(){}` placeholders. Verifying "the
+service runs and ingests a URL" is **premature** and not part of this plan.
 
 ---
 
@@ -183,7 +199,7 @@ Expect the uncovered lines to be defensive error returns (e.g. `url.Parse` failu
 paths, IPv6 edge branches, the dispatcher's best-effort final-write error paths that
 fire only when the store rejects a terminal write), not core logic. Flag anything else.
 
-### B5. Integration suite (Store ↔ Postgres parity)
+### B5. Integration suite (Store ↔ Postgres parity, plus the Phase 6 DB/object-store adapters)
 
 ```sh
 make test-integration                       # go test -tags integration ./...
@@ -197,6 +213,12 @@ Expected behavior:
   `TestPostgresStoreContract`, `TestPostgresMigrationsAreIdempotent`, and
   `TestPostgresDeleteCascadesVector` tests run and pass — proving `store.Postgres`
   satisfies the **same** `storetest.RunContract` as `store.Memory`.
+- **Phase 6 adds two more integration arms:** `TestPostgresVectorContract`
+  (`internal/vector/postgres_test.go`) runs `vectortest.RunContract` against the pgvector
+  adapter — the same suite `vector.Memory` passes — and `TestR2_MinIORoundTrip`
+  (`internal/blobs/r2_integration_test.go`) round-trips `blobs.R2` against a MinIO container.
+  Both skip without Docker. (MinIO uses `DATABASE_URL`-independent containers, so it always
+  needs Docker.)
 - If `docker.sock` returns "permission denied" (a session that predates `docker`
   group membership) and `DATABASE_URL` is unset, testcontainers calls
   `SkipIfProviderIsNotHealthy` and the Postgres tests **skip** rather than fail. A
@@ -490,12 +512,12 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
 - [ ] **Shared conformance suite.** `vectortest.RunContract` holds `QueryRanksByCosine`,
   `ExcludesSelf`, `DeleteRemoves` (the §6 cases) plus `UpsertReplaces`, `TopKBounds`,
   `EmptyIndexReturnsNoMatches`, and `RejectsWrongDimension`. It takes a `Factory`, so the
-  Phase 6 pgvector adapter will reuse it verbatim under `-tags integration` — the same
+  Phase 6 pgvector adapter reuses it verbatim under `-tags integration` (C12) — the same
   fake↔Postgres parity mechanism `storetest` uses.
-- [ ] **No real SDK imports yet (§6 "done when").** `grep -rn "net/http\|openai\|anthropic\|
-  resend\|aws-sdk\|pgx" internal/fetch internal/extract internal/embed internal/summarize
-  internal/notify internal/blobs internal/vector` prints **nothing** — the real adapters are
-  Phase 6.
+- [ ] **Port/fake files stay SDK-free.** The Phase 4 port + fake files themselves import no real
+  SDK: `grep -rn "net/http\|openai\|anthropic\|resend\|aws-sdk\|pgx" internal/fetch/fetch.go internal/extract/extract.go internal/embed/embed.go internal/summarize/summarize.go internal/notify/notify.go internal/blobs/blobs.go internal/vector/vector.go`
+  prints **nothing**. The real adapters live in *separate* files (`http.go`, `openai.go`,
+  `anthropic.go`, `resend.go`, `postgres.go`, `r2.go`) added in Phase 6 — verified in C12, not here.
 - [ ] **Naming note / deviation from PLAN.md:** the VectorIndex port interface is named
   `vector.Index`, not `vector.VectorIndex` as written in §6, because `revive`'s exported
   rule flags `vector.VectorIndex` as a type-name stutter and the lint gate (A4) must stay
@@ -506,11 +528,10 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
   and `TestPorts_FakesAreScriptableAndRecordCalls` (port-fidelity through the public surface)
   are part of `make verify`.
 
-> Note: only the fakes/in-memory backends are in scope here. The real adapters — `fetch.HTTP`,
+> Note: C10 covers only the fakes/in-memory backends. The real adapters — `fetch.HTTP`,
 > `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
-> the integration arm of `vectortest.RunContract` belong to Phase 6 and are **not** in scope.
-> These ports are now wired into the Phase 5 pipeline (C11). Do not flag the absence of the
-> real adapters as a gap.
+> the integration arm of `vectortest.RunContract` are **Phase 6**, verified in **C12**. The
+> ports are wired into the Phase 5 pipeline (C11); the real adapters are not yet wired into `main`.
 
 ### C11. Phase 5 — processing pipeline (`internal/pipeline/pipeline.go`)
 
@@ -551,8 +572,64 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
   dispatcher's `Handler` signature.
 
 > Note: the pipeline runs only against the in-memory fakes here; it is not yet constructed from
-> `main` (that is Phase 8/11). The real external adapters remain Phase 6. Do not flag either as
-> a gap.
+> `main` (that is Phase 8/11). The real external adapters now exist (C12) but the pipeline does
+> not yet use them. Do not flag either as a gap.
+
+### C12. Phase 6 — real adapters (`internal/{fetch,embed,summarize,notify,vector,blobs}`, `internal/httpx`)
+
+Phase 6 implements the production adapter behind each Phase 4 port (except `extract`, whose
+readability adapter is Phase 7) and verifies each against a faithful upstream — `httptest` for
+the HTTP adapters, testcontainers for the DB/object-store adapters — with **no live network**.
+Read each adapter against TDD plan §8 and confirm the request shape, the happy parse, and the
+error mapping.
+
+- [ ] `go test -race ./internal/fetch/ ./internal/embed/ ./internal/summarize/ ./internal/notify/
+  ./internal/blobs/ ./internal/httpx/` passes clean (the HTTP adapters' contract tests run in the
+  default suite; the `vector.Postgres` and `blobs.R2` integration arms are build-tagged out).
+- [ ] **Shared HTTP error classification (`internal/httpx`).** `ClassifyResponse` maps a non-2xx
+  response so it agrees with `dispatch.Classify`: 429 → `*dispatch.RateLimitError` honoring
+  `Retry-After` (a `Requeue`), other 4xx → wraps `dispatch.ErrPermanent` (a `Fail`), 5xx and
+  anything else → a plain transient error (a `Retry`). `RetryAfter` parses delay-seconds and
+  HTTP-date forms; absent/past/garbage → 0. Tests: `TestClassifyResponse_*`, `TestRetryAfter`.
+- [ ] **`fetch.HTTP`.** Sets the User-Agent, follows redirects and reports the post-redirect
+  `FinalURL`, returns the status, **caps the body** (`WithMaxBytes` → `ErrBodyTooLarge` for an
+  over-cap **2xx**, rejected not truncated; a non-2xx keeps its status so the pipeline classifies
+  it), honors `WithTimeout` and `ctx` cancellation, **rejects non-http(s) schemes**
+  (`ErrUnsupportedScheme`) before dialing, and maps a **429 → `dispatch.RateLimitError`** (honoring
+  `Retry-After`) so a throttled origin **requeues** instead of permanently failing. The private-IP
+  SSRF guard is deliberately deferred to Phase 11 (TDD plan §13). Tests: `TestHTTP_*`.
+- [ ] **`embed.OpenAI`.** POSTs `/v1/embeddings` with `Bearer` auth and `model=text-embedding-3-small`,
+  parses `data[0].embedding`, and maps 429/4xx/5xx via `httpx`. Tests: `TestOpenAI_*` (request shape,
+  rate-limit→`Requeue`, 4xx→`Fail`, 5xx→`Retry`).
+- [ ] **`summarize.Anthropic`.** POSTs `/v1/messages` with `x-api-key`/`anthropic-version`, a single
+  `emit_reading` tool, and `tool_choice={type:tool,name:emit_reading}` (**forced tool use**); parses
+  the `tool_use` block's `input` into `Summary` (raw input preserved as `summary_json`). A response
+  missing the tool_use block is an **error**. 429 → `RateLimitError`. Tests: `TestAnthropic_*`.
+- [ ] **`notify.Resend`.** POSTs `/emails` (`from`/`to`/`subject`/`html`) with `Bearer` auth; any
+  non-2xx is an error (the pipeline swallows it — no retry classification needed). Tests: `TestResend_*`.
+- [ ] **`vector.Postgres`** (integration). `Upsert`/`Query`/`Delete` over `reading_vectors`, ranking
+  by cosine distance (`<=>`) with 1536-dim enforcement and self-exclusion. It satisfies the **same**
+  `vectortest.RunContract` as `vector.Memory`, run two ways: under `//go:build integration`
+  (`internal/vector/postgres_test.go`) and inside `make verify` via the harness's `postgres` vector
+  backend (`TestAcceptance_VectorIndexContract`, skips without Docker). A seed wrapper supplies the
+  FK-required `readings` row the bare-id contract upserts omit. **Proven locally** — all 8 contract
+  subtests pass against real pgvector in both paths.
+- [ ] **`blobs.R2`** (S3-compatible). Path-style `Put`/`Get`/`Delete` against a custom endpoint
+  (aws-sdk-go-v2), mapping a missing key to `blobs.ErrNotFound`. The default run does a full
+  round-trip + bucket/key/content-type composition assertion against an in-memory `httptest` S3 stub
+  (`r2_test.go`); a MinIO container round-trip runs under `//go:build integration`
+  (`r2_integration_test.go`). **Proven locally** — both pass.
+- [ ] **Automated (B/§make verify):** `TestAcceptance_RealAdapters` re-proves the HTTP adapters'
+  request shape, the forced-tool path, and `dispatch.Classify` agreement through `httptest`
+  (including the fetch **429 → Requeue**); compile-time `var _ Port = (*Adapter)(nil)` assertions
+  pin every production adapter to its port; `TestAcceptance_VectorIndexContract` runs the vector
+  contract against **both** `vector.Memory` and a testcontainers pgvector backend; and
+  `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
+  `vector.Postgres`/`blobs.R2` integration tests always compile.
+
+> Note: these adapters are not yet wired into `main` (Phase 8/11), and `extract.Readability` is
+> Phase 7. Do not flag either as a gap. New runtime dependency: `aws-sdk-go-v2` (S3 client) for
+> `blobs.R2`; the HTTP adapters are stdlib-only.
 
 ---
 
@@ -605,12 +682,12 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    `dispatch` 93.0%, `pipeline` 91.5% (B3). The store's 48.8% is a build-tag artifact, not a
    gap. No domain coverage finding is currently open; B4 is the method to use if one reopens.
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
-   dispatcher (`internal/dispatch`, C9) and the Phase 5 pipeline (`internal/pipeline`, C11)
-   are both complete and verified, but **not yet wired into them**: nothing calls
-   `Submit`/`Run`/`Sweep` or constructs a `Pipeline` from `main` (that lands with the HTTP API
-   and `main` lifecycle in Phases 8/11). The Phase 4 ports drive the pipeline through their
-   fakes only. No real HTTP/SDK adapters, HTTP API, config, or CLI subcommands exist yet
-   (Phases 6–12).
+   dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), and
+   the Phase 6 real adapters (C12) are all complete and verified, but **not yet wired into
+   them**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an
+   adapter from `main` (that lands with the HTTP API and `main` lifecycle in Phases 8/11). The
+   Phase 5 pipeline still drives the ports through their fakes in tests. The HTTP API, config,
+   CLI subcommands, and `extract.Readability` (Phase 7) do not exist yet (Phases 7–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
@@ -685,6 +762,13 @@ skipped/blocked (write why).
   requeues without consuming an attempt, fetch 4xx/5xx policy, notify failure non-fatal,
   idempotent re-entry summarizes once; status/content split; server-derived blob keys; ≥90%
   coverage; `TestAcceptance_PipelineProcess` green
+- [ ] C12 real adapters: each Phase 6 adapter matches §8 — `fetch.HTTP` (UA/timeout/size-cap/
+  redirect→FinalURL/scheme reject, **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` (request
+  shape, forced `emit_reading` tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`),
+  `notify.Resend` (shape + non-2xx error), `vector.Postgres` (`vectortest.RunContract` under
+  integration **and** the harness's pgvector backend), `blobs.R2` (httptest round-trip + MinIO under
+  integration); compile-time port conformance + `TestAcceptance_RealAdapters` green; SSRF private-IP
+  guard deferred to Phase 11
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);

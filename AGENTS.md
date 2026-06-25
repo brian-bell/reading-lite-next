@@ -1,14 +1,19 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 5 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 6 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
 the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summarize`,
-`notify`, `blobs`) with their in-memory fakes, and the processing pipeline that wires
-them together (fetch→extract→blobs→embed→vector→summarize→notify) — no real
-network/SDK code yet.
+`notify`, `blobs`) with their in-memory fakes, the processing pipeline that wires
+them together (fetch→extract→blobs→embed→vector→summarize→notify), and the real
+production adapters behind those ports — `fetch.HTTP`, `embed.OpenAI`,
+`summarize.Anthropic` (forced `emit_reading` tool use), `notify.Resend`, `vector.Postgres`
+(pgvector), and `blobs.R2` (S3-compatible) — each pinned by a contract test (`httptest`
+upstreams for the HTTP adapters; testcontainers Postgres/MinIO under `//go:build integration`
+for the DB/object-store adapters). The extraction internals (Phase 7), HTTP API, and `main`
+wiring are still pending: nothing constructs these adapters from `main` yet.
 
 ## Structure
 
@@ -36,13 +41,28 @@ network/SDK code yet.
 - `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
   `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
-  `extract` consumes a `fetch.Resource`; the production HTTP/SDK adapters land in later phases.
-- `internal/blobs/` defines the `Blobs` content-blob port and `blobs.Memory`, an in-memory
-  store of raw and extracted payloads keyed by server-derived key.
+  `extract` consumes a `fetch.Resource`. Each (except `extract`, whose readability adapter is
+  Phase 7) now also ships its real adapter: `fetch.HTTP` (UA, timeout, body-size cap,
+  redirect→`FinalURL`, non-http(s) scheme rejection, and a 429→`dispatch.RateLimitError`
+  requeue — the private-IP SSRF guard is deferred to Phase 11), `embed.OpenAI`
+  (`/v1/embeddings`, `text-embedding-3-small`), `summarize.Anthropic`
+  (Messages API with forced `emit_reading` tool use), and `notify.Resend` (`/emails`). The HTTP
+  adapters take a `WithBaseURL` option so a contract test can point them at an `httptest`
+  upstream, and classify upstream failures through `internal/httpx`.
+- `internal/httpx/` holds helpers shared by the HTTP service adapters: `ClassifyResponse` maps a
+  non-2xx response to a dispatcher-classified error (429 → `dispatch.RateLimitError` honoring
+  `Retry-After`, other 4xx → `dispatch.ErrPermanent`, 5xx → transient), and `RetryAfter` parses
+  the header. This keeps `embed.OpenAI` and `summarize.Anthropic` error semantics identical to
+  `dispatch.Classify`.
+- `internal/blobs/` defines the `Blobs` content-blob port, `blobs.Memory` (in-memory), and
+  `blobs.R2` — the production S3-compatible adapter (aws-sdk-go-v2, path-style, custom endpoint;
+  maps a missing key to `blobs.ErrNotFound`). `R2` is exercised by an `httptest` S3 stub
+  (request-shape + round-trip) on every run and a MinIO container under `//go:build integration`.
 - `internal/vector/` defines the `Index` similarity port (the VectorIndex port; renamed from
   `VectorIndex` to avoid a revive stutter), `vector.Memory` (a real cosine-similarity index),
-  and `vectortest.RunContract` — the backend-neutral suite both `vector.Memory` and the future
-  pgvector adapter must satisfy.
+  `vector.Postgres` (the pgvector adapter over `reading_vectors`, ranking by cosine distance via
+  `<=>`), and `vectortest.RunContract` — the backend-neutral suite both backends satisfy
+  (`vector.Memory` on every run, `vector.Postgres` under `//go:build integration`).
 - `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
   `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
   Reddit fails permanently with guidance; everything else fetches + extracts), embeds and
@@ -97,6 +117,14 @@ The project targets Go 1.26.
 - Scriptable port fakes expose their configured response/error as fields set before use and
   guard call recording behind a mutex; return defensive copies so callers cannot corrupt the
   script.
+- Give each real HTTP adapter a `NewX(key, ...Option)` constructor with a `WithBaseURL` (and
+  `WithHTTPClient`) seam, and contract-test it against an `httptest` upstream — assert the
+  request shape (auth, path, body) and the happy parse, plus at least one error-mapping case.
+  Route every adapter's upstream-error classification through `internal/httpx` so it agrees
+  with `dispatch.Classify`. Keep DB/object-store adapters (`vector.Postgres`, `blobs.R2`) out
+  of the default run: prove them with their conformance/round-trip suites under
+  `//go:build integration` (testcontainers), and rely on compile-time `var _ Port = (*Adapter)(nil)`
+  conformance assertions in the acceptance harness.
 - Keep retry/backoff logic in pure functions (`dispatch.decide`, `dispatch.Classify`) and run
   delays through the injected `dispatch.Delayer` seam so retry, backoff, rate-limit, and
   recovery semantics test deterministically without real goroutines, timers, or sleeps.

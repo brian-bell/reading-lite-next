@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/http"
 	"strings"
 
 	"github.com/bbell/reading-lite/internal/blobs"
@@ -432,12 +433,23 @@ func marshalDiagnostics(diag diagnostics) json.RawMessage {
 	return b
 }
 
-// classifyFetchStatus maps an HTTP status to a pipeline error: 4xx is permanent
-// (the resource is gone or forbidden), 5xx is transient (retry). 2xx is success.
+// classifyFetchStatus maps an HTTP status to a pipeline error: 429 is a rate
+// limit (requeue, no attempt consumed), other 4xx are permanent (the resource is
+// gone or forbidden), 5xx is transient (retry). 2xx is success.
+//
+// The production fetch.HTTP adapter already maps a 429 to a RateLimitError with
+// the upstream Retry-After before this runs; this case keeps the classifier
+// correct for any fetcher that returns a 429 status directly (so a rate limit is
+// never mislabeled permanent), requeuing without an extra wait.
 func classifyFetchStatus(status int) error {
 	switch {
 	case status >= 200 && status < 300:
 		return nil
+	case status == http.StatusTooManyRequests:
+		return &dispatch.RateLimitError{
+			RetryAfter: dispatch.DefaultRateLimitDelay,
+			Err:        fmt.Errorf("fetch rate limited (status %d)", status),
+		}
 	case status >= 400 && status < 500:
 		return fmt.Errorf("%w: fetch returned status %d", dispatch.ErrPermanent, status)
 	default:
