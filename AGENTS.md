@@ -1,12 +1,14 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 4 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 5 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
-and the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summarize`,
-`notify`, `blobs`) with their in-memory fakes — no real network/SDK code yet.
+the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summarize`,
+`notify`, `blobs`) with their in-memory fakes, and the processing pipeline that wires
+them together (fetch→extract→blobs→embed→vector→summarize→notify) — no real
+network/SDK code yet.
 
 ## Structure
 
@@ -21,7 +23,10 @@ and the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summariz
   and read-time stale annotation.
 - `internal/store/` defines the `Store` port, shared query/page DTOs, `store.Memory`, the
   pgx-backed `store.Postgres` adapter, embedded migrations, SQL query source for sqlc, and
-  `storetest.RunContract` for backend-neutral behavior checks.
+  `storetest.RunContract` for backend-neutral behavior checks. `UpdateStatus` advances the
+  lifecycle; `UpdateContent` overwrites the processed-content columns (title/summary/keys and
+  the `summary_json`/`similar_json`/`diagnostics_json` blobs) the pipeline produces, leaving
+  status, timestamps, error, attempts, and tags alone.
 - `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
   and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
   injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
@@ -38,6 +43,15 @@ and the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summariz
   `VectorIndex` to avoid a revive stutter), `vector.Memory` (a real cosine-similarity index),
   and `vectortest.RunContract` — the backend-neutral suite both `vector.Memory` and the future
   pgvector adapter must satisfy.
+- `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
+  `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
+  Reddit fails permanently with guidance; everything else fetches + extracts), embeds and
+  upserts a vector, snapshots similar readings, summarizes once, optionally notifies
+  (a notify failure never fails the reading), and persists the content via `store.UpdateContent`
+  + `ReplaceTags`. It returns a `dispatch.Result` (the dispatcher owns lifecycle status; the
+  pipeline owns content). Re-entry is idempotent: a persisted `content_key` checkpoint lets a
+  retried run skip fetch/extract/embed and resume at summarize. Blob keys are derived from the
+  server-side reading id.
 - `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -86,4 +100,11 @@ The project targets Go 1.26.
 - Keep retry/backoff logic in pure functions (`dispatch.decide`, `dispatch.Classify`) and run
   delays through the injected `dispatch.Delayer` seam so retry, backoff, rate-limit, and
   recovery semantics test deterministically without real goroutines, timers, or sleeps.
+- Keep the pipeline's status/content split: the dispatcher owns lifecycle status (it marks
+  running/ready/failed/pending), the pipeline owns content. `Pipeline.Process` maps step errors
+  to outcomes through the shared `dispatch.Classify`, and persists a content checkpoint before
+  the summarize step so a retried run resumes idempotently from the stored `content_key`.
+- Drive pipeline tests through an inline `dispatch.Dispatcher` (`Inline: true`) with a
+  `dispatch.FakeDelayer`, so a test exercises real status transitions and asserts the pipeline's
+  effects on the store/blobs/vector index and its scripted port fakes.
 - Use table-driven subtests and `t.Parallel()` when there is no shared mutable state.

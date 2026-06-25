@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–4)
+# reading-lite — Manual Verification Plan (Phases 0–5)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -20,7 +20,11 @@
 > are automated as well: compile-time port conformance, the VectorIndex contract
 > against `vector.Memory` (`TestAcceptance_VectorIndexContract`), and a port-fidelity
 > check that each scriptable fake returns scripted results, errors on demand, and
-> records its calls (`TestPorts_FakesAreScriptableAndRecordCalls`). Tool- and
+> records its calls (`TestPorts_FakesAreScriptableAndRecordCalls`). The Phase 5
+> processing pipeline (C11) is automated too: `TestAcceptance_PipelineProcess` drives
+> `Pipeline.Process` through an inline dispatcher against fakes and asserts the
+> web→ready happy path, the Reddit permanent-failure-with-guidance path, and the
+> rate-limit requeue. Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres integration suite. Each
@@ -31,8 +35,9 @@
 ### In scope (what exists today)
 
 The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core),
-**Phase 2** (readings metadata store), **Phase 3** (in-process dispatcher), and
-**Phase 4** (external-service ports & in-memory fakes):
+**Phase 2** (readings metadata store), **Phase 3** (in-process dispatcher),
+**Phase 4** (external-service ports & in-memory fakes), and **Phase 5** (the
+processing pipeline, fakes only):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -42,7 +47,7 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 | Status machine, terminal checks | `internal/reading/status.go` | 1 |
 | URL idempotency key + source classification | `internal/reading/url.go` | 1 |
 | Reading struct + stale annotation | `internal/reading/reading.go` | 1 |
-| Store port + DTOs | `internal/store/store.go` | 2 |
+| Store port + DTOs (incl. `UpdateContent`/`ContentFields`) | `internal/store/store.go` | 2, 5 |
 | In-memory store | `internal/store/memory.go` | 2 |
 | Postgres adapter | `internal/store/postgres.go` | 2 |
 | Embedded migration + runner | `internal/store/migrations/0001_init.sql`, `internal/store/migrate.go` | 2 |
@@ -55,21 +60,22 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 | Summarizer / Notifier ports + fakes | `internal/summarize/summarize.go`, `internal/notify/notify.go` | 4 |
 | Blobs port + in-memory backend | `internal/blobs/blobs.go` | 4 |
 | VectorIndex port (`Index`) + cosine `Memory` + conformance suite | `internal/vector/vector.go`, `internal/vector/vectortest/contract.go` | 4 |
+| Processing pipeline (orchestration) | `internal/pipeline/pipeline.go` | 5 |
 
 ### Out of scope (do not expect these to work yet)
 
-The Phase 3 dispatcher lives in `internal/dispatch/` and is fully verified — by its own
-race-tested package tests and now by the C9 blackbox checks in this harness — but it is
-**not yet wired into the binaries**: nothing calls `Submit`/`Run`/`Sweep` from `main` yet,
-because its `Handler` is the Phase 5 pipeline, which does not exist. The Phase 4 ports
-(`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`) now exist with in-memory
-fakes (C10), but only the fakes — every `Fake`/`Memory` backend is in scope; **no real
-adapter** (HTTP fetch, OpenAI, Anthropic, Resend, R2, pgvector) is implemented yet, and the
-ports are not yet wired into a pipeline. The remaining Phases 5–12 are **not** implemented:
-the pipeline, the real HTTP/SDK adapters (Phase 6), extraction internals (Phase 7), the HTTP
-API, the operator CLI subcommands, config loading, and observability. `reader-api` and
-`readerctl` are intentionally empty `main(){}` placeholders. Verifying "the service
-runs and ingests a URL" is **premature** and not part of this plan.
+The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together and is
+verified by its own race-tested package tests and the C11 blackbox checks here — but it is
+still **not wired into the binaries**: nothing calls `Submit`/`Run`/`Sweep` or constructs a
+`Pipeline` from `main` yet (that lands with the HTTP API and `main` lifecycle in Phases 8/11).
+The Phase 4 ports (`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`) drive the
+pipeline only through their in-memory fakes — every `Fake`/`Memory` backend is in scope;
+**no real adapter** (HTTP fetch, OpenAI, Anthropic, Resend, R2, pgvector) is implemented yet.
+The remaining Phases 6–12 are **not** implemented: the real HTTP/SDK adapters (Phase 6),
+extraction internals (Phase 7), the HTTP API, the operator CLI subcommands, config loading,
+and observability. `reader-api` and `readerctl` are intentionally empty `main(){}`
+placeholders. Verifying "the service runs and ingests a URL" is **premature** and not part of
+this plan.
 
 ---
 
@@ -147,19 +153,20 @@ drain), and `TestDispatch_DuplicateIdNotProcessedConcurrently` (the claim guard)
 make cover           # go test -race -cover ./...
 ```
 
-**Known-good baseline (recaptured for the Phases 0–3 pass):**
+**Known-good baseline (recaptured for the Phases 0–5 pass):**
 
 | Package | Coverage | Note |
 |---|---|---|
 | `internal/clock` | 90.9% | meets the ≥90% domain bar |
 | `internal/reading` | 97.4% | pure domain; clears the ≥90% bar |
 | `internal/dispatch` | 93.0% | Phase 3 domain logic (`decide`/`Classify`/`backoff` + the dispatcher seam); clears the ≥90% bar (TDD plan §2 lists `dispatch` as a domain package) |
-| `internal/store` | 46.7% | **expected to look low**: the Postgres adapter's statements are only executed under `-tags integration`, which is excluded from the default run. The `store.Memory` paths are well covered via the conformance suite. |
+| `internal/pipeline` | 91.5% | Phase 5 orchestration; clears the ≥90% bar (driven through an inline dispatcher against fakes) |
+| `internal/store` | 48.8% | **expected to look low**: the Postgres adapter's statements are only executed under `-tags integration`, which is excluded from the default run. The `store.Memory` paths (including `UpdateContent`) are well covered via the conformance suite. |
 | `internal/store/storedb` | 0.0% | generated sqlc code, exercised only under integration |
 | `internal/store/storetest` | 0.0% | the suite itself; counts as test code |
 
-> Verification judgment call: the three domain packages (`clock`, `reading`,
-> `dispatch`) all clear the plan's 90% bar (§2 of the TDD plan). The store's 46.7%
+> Verification judgment call: the four domain packages (`clock`, `reading`,
+> `dispatch`, `pipeline`) all clear the plan's 90% bar (§2 of the TDD plan). The store's 48.8%
 > is a measurement artifact of the build-tag split, **not** a real gap. If any
 > domain package later dips below 90%, treat it as a **finding to confirm, not a
 > hard failure** — inspect the uncovered lines (`B4`) and decide whether they are
@@ -502,7 +509,50 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
 > Note: only the fakes/in-memory backends are in scope here. The real adapters — `fetch.HTTP`,
 > `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
 > the integration arm of `vectortest.RunContract` belong to Phase 6 and are **not** in scope.
-> Wiring these ports into a pipeline is Phase 5. Do not flag their absence as a gap.
+> These ports are now wired into the Phase 5 pipeline (C11). Do not flag the absence of the
+> real adapters as a gap.
+
+### C11. Phase 5 — processing pipeline (`internal/pipeline/pipeline.go`)
+
+Phase 5 orchestrates the full process flow against fakes: `Pipeline.Process(ctx, id)` is the
+dispatcher's `Handler`. The dispatcher owns lifecycle status (it marks running before the call
+and ready/failed/pending after); the pipeline owns the reading's content. Read the package
+against TDD plan §7 and confirm the branches, the status/content split, and idempotent re-entry.
+
+- [ ] `go test -race ./internal/pipeline/...` passes clean, and `go test -cover` reports the
+  package at ≥ 90% (PLAN §2 gate for the domain/pipeline layer).
+- [ ] **Happy path (web).** `TestPipeline_HappyPath`: a web URL runs
+  fetch→extract→blobs(raw+content)→embed→`Vectors.Upsert`→`Vectors.Query`→summarize→ready,
+  with `extraction_mode=readability`, the summary's tags persisted via `ReplaceTags`,
+  `content_key`/`raw_key` set, `similar_json` hydrated from the matched neighbor, and exactly
+  one summarizer call and one notify.
+- [ ] **Extraction tiers thread through.** `TestPipeline_ExtractionFallback` (raw_dom, raw_only):
+  the pipeline records whatever `Article.Mode` the extractor reports and still embeds +
+  summarizes the salvaged text to ready. (The tier *ladder* itself lives in the Phase 7
+  extractor adapter; Phase 5 only threads the mode.)
+- [ ] **Source special-casing.** `TestPipeline_Reddit_FailsWithGuidance` (no fetch; permanent
+  `Fail`; error contains `pipeline.RedditGuidance`), `TestPipeline_Markdown_SkipsFetchExtract`
+  (fetcher + extractor uncalled; body read from the stored blob; still embeds/summarizes), and
+  `TestPipeline_YouTube_OEmbedFloor` (YouTube is fetched, unlike Reddit, and reaches ready with
+  the floor author/extraction mode).
+- [ ] **Partial-failure policy.** `TestPipeline_RateLimited_Requeues` (an embed
+  `RateLimitError{30s}` → `Requeue`, reading stays pending, attempt not consumed),
+  `TestPipeline_FetchHardError_Fails` (4xx → permanent failed; 5xx → transient retry),
+  `TestPipeline_NotifyFailureDoesNotFailReading` (a notify error leaves the reading ready and is
+  recorded in `diagnostics_json`), and `TestPipeline_TransientStepErrorsRetry`.
+- [ ] **Idempotent re-entry / "summarize once".** `TestPipeline_SummarizerError_RetriesNotDoubleSummarize`:
+  a summarize failure persists a content checkpoint (`content_key`), so the retried run skips
+  fetch/extract/embed (each called once across both runs) and re-summarizes exactly once.
+- [ ] **Server-derived blob keys.** Read `rawKey`/`contentKey`: both derive from the reading id
+  only (no client input), the Phase 11 path-traversal guard.
+- [ ] **Automated (B/§make verify):** `TestAcceptance_PipelineProcess` drives the web→ready,
+  Reddit-guidance, and rate-limit-requeue paths through an inline dispatcher, plus compile-time
+  assertions that `store.Memory` satisfies `pipeline.Store` and `Pipeline.Process` matches the
+  dispatcher's `Handler` signature.
+
+> Note: the pipeline runs only against the in-memory fakes here; it is not yet constructed from
+> `main` (that is Phase 8/11). The real external adapters remain Phase 6. Do not flag either as
+> a gap.
 
 ---
 
@@ -552,14 +602,15 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    membership, run it via `sg docker -c '…'` or after a fresh login; `DATABASE_URL`
    bypasses Docker entirely.
 2. **Domain coverage clears the 90% bar** — `clock` 90.9%, `reading` 97.4%,
-   `dispatch` 93.0% (B3). The store's 46.7% is a build-tag artifact, not a gap. No
-   domain coverage finding is currently open; B4 is the method to use if one reopens.
+   `dispatch` 93.0%, `pipeline` 91.5% (B3). The store's 48.8% is a build-tag artifact, not a
+   gap. No domain coverage finding is currently open; B4 is the method to use if one reopens.
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
-   dispatcher (`internal/dispatch`) is complete and verified (C9) but is **not yet
-   wired into them**: nothing calls `Submit`/`Run`/`Sweep` from `main`, because its
-   `Handler` is the Phase 5 pipeline, which does not exist. The Phase 4 ports + fakes
-   (C10) exist but are not yet wired into anything either. No pipeline, real HTTP/SDK
-   adapters, HTTP API, config, or CLI subcommands exist yet (Phases 5–12).
+   dispatcher (`internal/dispatch`, C9) and the Phase 5 pipeline (`internal/pipeline`, C11)
+   are both complete and verified, but **not yet wired into them**: nothing calls
+   `Submit`/`Run`/`Sweep` or constructs a `Pipeline` from `main` (that lands with the HTTP API
+   and `main` lifecycle in Phases 8/11). The Phase 4 ports drive the pipeline through their
+   fakes only. No real HTTP/SDK adapters, HTTP API, config, or CLI subcommands exist yet
+   (Phases 6–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
@@ -604,7 +655,7 @@ skipped/blocked (write why).
 ### B — Automated tests
 - [ ] B1 `make test` all `ok`
 - [ ] B2 `make test-race` no data races (incl. dispatcher worker pool + claim guard)
-- [ ] B3 `make cover` — clock ≥90%, reading ~97.4%, dispatch ~93.0%, store ~46.7% (artifact, see note)
+- [ ] B3 `make cover` — clock ≥90%, reading ~97.4%, dispatch ~93.0%, pipeline ~91.5%, store ~48.8% (artifact, see note)
 - [ ] B4 domain uncovered lines inspected and judged benign (if any finding reopens)
 - [ ] B5 `make test-integration` actually **ran** (not skipped) and passed
 - [ ] B6 `make sqlc` produces no `git` drift
@@ -629,6 +680,11 @@ skipped/blocked (write why).
   copies + ctx-checked, race-clean; `blobs.Memory` round-trip + `ErrNotFound`; `vector.Memory`
   cosine ranking/exclude/topK/dim via `vectortest.RunContract`; no real SDK imports;
   `vector.Index` rename noted; harness conformance + `TestPorts_*` green
+- [ ] C11 pipeline: `Process` matches §7 — web happy path to ready, extraction modes threaded,
+  Reddit permanent fail with guidance, markdown skips fetch/extract, YouTube fetched, rate-limit
+  requeues without consuming an attempt, fetch 4xx/5xx policy, notify failure non-fatal,
+  idempotent re-entry summarizes once; status/content split; server-derived blob keys; ≥90%
+  coverage; `TestAcceptance_PipelineProcess` green
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
