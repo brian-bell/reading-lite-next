@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–2)
+# reading-lite — Manual Verification Plan (Phases 0–3)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -13,18 +13,21 @@
 > contract and the reading-metadata lifecycle run against **both** backends — the
 > in-memory fake and real Postgres via testcontainers — so the harness proves
 > fake↔Postgres parity itself (the Postgres backend skips when Docker is
-> unavailable, or honors `DATABASE_URL`). Tool- and Docker-dependent steps skip
-> when unavailable. What stays manual: the coverage judgment call in B3/B4 and
-> reviewing the placeholder binaries. `make test-integration` remains a separate,
-> dedicated path for the store↔Postgres integration suite. Each automated test
-> names the plan section it covers.
+> unavailable, or honors `DATABASE_URL`). The Phase 3 dispatcher lifecycle and its
+> error classifier (C9) are automated too — driven inline through the public
+> `dispatch.Dispatcher` surface with a fake clock and a fake delayer, so they need
+> no goroutines, timers, or Docker. Tool- and Docker-dependent steps skip when
+> unavailable. What stays manual: the coverage judgment call in B3/B4 and reviewing
+> the placeholder binaries. `make test-integration` remains a separate, dedicated
+> path for the store↔Postgres integration suite. Each automated test names the plan
+> section it covers.
 
 ## 0. Scope
 
 ### In scope (what exists today)
 
-The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core), and
-**Phase 2** (readings metadata store):
+The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core),
+**Phase 2** (readings metadata store), and **Phase 3** (in-process dispatcher):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -40,14 +43,18 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 | Embedded migration + runner | `internal/store/migrations/0001_init.sql`, `internal/store/migrate.go` | 2 |
 | sqlc source + generated code | `internal/store/query.sql`, `sqlc.yaml`, `internal/store/storedb/*` | 2 |
 | Shared conformance suite | `internal/store/storetest/contract.go` | 2 |
+| Retry decision + error classifier (pure) | `internal/dispatch/dispatch.go` | 3 |
+| Injectable delay seam (real + fake) | `internal/dispatch/delayer.go` | 3 |
+| Worker pool, claim guard, recovery sweep | `internal/dispatch/dispatcher.go` | 3 |
 
 ### Out of scope (do not expect these to work yet)
 
-Phase 3's in-process dispatcher is implemented in `internal/dispatch/` (worker pool,
-retry/backoff and rate-limit decision logic, crash-recovery sweep) and verified by its own
-race-tested package tests — **not** by this Phase 0–2 harness, and not yet wired into the
-binaries. The remaining Phases 4–12 are **not** implemented: the pipeline, external-service
-ports (`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`), the HTTP API, the
+The Phase 3 dispatcher lives in `internal/dispatch/` and is fully verified — by its own
+race-tested package tests and now by the C9 blackbox checks in this harness — but it is
+**not yet wired into the binaries**: nothing calls `Submit`/`Run`/`Sweep` from `main` yet,
+because its `Handler` is the Phase 5 pipeline, which does not exist. The remaining Phases
+4–12 are **not** implemented: the pipeline, external-service ports
+(`fetch`/`extract`/`embed`/`vector`/`summarize`/`notify`/`blobs`), the HTTP API, the
 operator CLI subcommands, config loading, and observability. `reader-api` and
 `readerctl` are intentionally empty `main(){}` placeholders. Verifying "the service
 runs and ingests a URL" is **premature** and not part of this plan.
@@ -117,7 +124,10 @@ dependence — confirm by running with the network down; it should not matter.
 make test-race       # go test -race ./...
 ```
 Expect `ok` with no `DATA RACE` reports. This specifically exercises
-`clock.Fake` concurrent use and `store.Memory` `ConcurrentSaves`.
+`clock.Fake` concurrent use, `store.Memory` `ConcurrentSaves`, and the Phase 3
+dispatcher's real worker pool — `TestDispatch_ConcurrencyBounded` (bounded parallel
+handlers), `TestDispatch_GracefulDrain`/`DrainStopsPullingQueuedWork` (ctx-driven
+drain), and `TestDispatch_DuplicateIdNotProcessedConcurrently` (the claim guard).
 
 ### B3. Coverage
 
@@ -125,31 +135,34 @@ Expect `ok` with no `DATA RACE` reports. This specifically exercises
 make cover           # go test -race -cover ./...
 ```
 
-**Known-good baseline (captured while writing this plan):**
+**Known-good baseline (recaptured for the Phases 0–3 pass):**
 
 | Package | Coverage | Note |
 |---|---|---|
 | `internal/clock` | 90.9% | meets the ≥90% domain bar |
-| `internal/reading` | 88.6% | pure domain; just under the 90% target — see note below |
+| `internal/reading` | 97.4% | pure domain; clears the ≥90% bar |
+| `internal/dispatch` | 93.0% | Phase 3 domain logic (`decide`/`Classify`/`backoff` + the dispatcher seam); clears the ≥90% bar (TDD plan §2 lists `dispatch` as a domain package) |
 | `internal/store` | 46.7% | **expected to look low**: the Postgres adapter's statements are only executed under `-tags integration`, which is excluded from the default run. The `store.Memory` paths are well covered via the conformance suite. |
 | `internal/store/storedb` | 0.0% | generated sqlc code, exercised only under integration |
 | `internal/store/storetest` | 0.0% | the suite itself; counts as test code |
 
-> Verification judgment call: `internal/reading` at 88.6% is *slightly* below the
-> plan's 90% domain bar (§2 of the TDD plan). Treat this as a **finding to confirm,
-> not a hard failure** — inspect which lines are uncovered (`B4`) and decide whether
-> they are meaningful branches or unreachable defensive code. The store's 46.7% is a
-> measurement artifact of the build-tag split, **not** a real gap.
+> Verification judgment call: the three domain packages (`clock`, `reading`,
+> `dispatch`) all clear the plan's 90% bar (§2 of the TDD plan). The store's 46.7%
+> is a measurement artifact of the build-tag split, **not** a real gap. If any
+> domain package later dips below 90%, treat it as a **finding to confirm, not a
+> hard failure** — inspect the uncovered lines (`B4`) and decide whether they are
+> meaningful branches or unreachable defensive code.
 
-### B4. Per-line coverage inspection (optional, for the 88.6% question)
+### B4. Per-line coverage inspection (optional)
 
 ```sh
-go test -coverprofile=/tmp/cover.out ./internal/reading/...
+go test -coverprofile=/tmp/cover.out ./internal/reading/... ./internal/dispatch/...
 go tool cover -func=/tmp/cover.out | sort -k3 -n | head
 go tool cover -html=/tmp/cover.out -o /tmp/cover.html   # open in a browser
 ```
 Expect the uncovered lines to be defensive error returns (e.g. `url.Parse` failure
-paths, IPv6 edge branches), not core logic. Flag anything else.
+paths, IPv6 edge branches, the dispatcher's best-effort final-write error paths that
+fire only when the store rejects a terminal write), not core logic. Flag anything else.
 
 ### B5. Integration suite (Store ↔ Postgres parity)
 
@@ -350,6 +363,79 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
   cascade removes the vector row — all green against a real testcontainers Postgres
   (see B5 baseline). Re-run with `-count=1` if you want fresh (uncached) proof.
 
+### C9. Phase 3 — in-process dispatcher (`internal/dispatch/`)
+
+The dispatcher's whole point is that its semantics are testable without real time or
+goroutines: the decision logic is pure, and every delay flows through an injectable
+seam. Read it against TDD plan §5 and confirm each spec bullet maps to a named test.
+
+- [ ] `go test -v ./internal/dispatch/` passes; `go test -race ./internal/dispatch/`
+  is clean (the worker pool and `FakeDelayer` are exercised concurrently — see B2).
+- [ ] **Pure decision core (`dispatch.go`, §5.1–5.2).** Read `decide` and confirm it
+  is the single branch point and matches the table:
+  - `Done` → no redispatch, not failed.
+  - `Retry` → redispatch with `Delay = backoff(attempt)` and `NextAttempt = attempt+1`,
+    **unless** `attempt+1 >= Max`, in which case `MarkFailed` (no redispatch) — the
+    reading becomes a *retryable* `failed`, and the in-memory item is dropped.
+  - `Requeue` → redispatch with `NextAttempt = attempt` (**unchanged** — a rate limit
+    does not consume an attempt) and `Delay = After`.
+  - `Fail` → `MarkFailed` regardless of attempt.
+  - `backoff` is the `1s,2s,4s,8s,16s,…` schedule capped at 30s.
+  - Tests: `TestDecide_Done`, `TestDecide_RetryBackoff`, `TestDecide_RequeueKeepsAttempt`,
+    `TestDecide_RetryExhaustion`, `TestDecide_PermanentFailsFast`, `TestBackoff_Schedule`.
+  - These are the project's only sanctioned white-box tests (`decide_test.go` is
+    `package dispatch`); the conventions audit (D3) allow-lists exactly that file.
+- [ ] **Error classifier (`Classify`, §5.1).** `nil → Done`; `*RateLimitError → Requeue`
+  (carrying `RetryAfter` as `After`); `errors.Is(err, ErrPermanent) → Fail`; anything
+  else → `Retry`. Both wrapped and direct errors classify alike, so the pipeline (Phase 5)
+  and the dispatcher will agree. Tests: `TestClassify_*`, `TestRateLimitError_ErrorAndUnwrap`.
+- [ ] **Worker pool & lifecycle persistence (`dispatcher.go`, §5.3).** Confirm:
+  - `Submit` enqueues at attempt 0 and is non-blocking — a duplicate (already claimed)
+    or a full buffer is **dropped**, not blocked; the still-`pending` reading is the
+    recovery sweep's job (PLAN §1.4).
+  - `handle` is the only method that touches `Store` and `Delay`: it marks the reading
+    `running` (mirroring `attempt → process_attempts`, clearing the error), runs
+    `Handler`, applies `decide`, then persists `ready` / `pending`+scheduled-redispatch /
+    `failed`. The persisted failure reason is always non-empty and distinguishes a spent
+    budget from a permanent error.
+  - The dedup **claim** is held from enqueue through *every* retry/requeue until a
+    terminal outcome, so a second `Submit` or a sweep re-enqueue cannot double-run a
+    reading and clobber the winner's status (matches the single-instance topology).
+  - Tests: `TestDispatch_SubmitRunsHandlerOnce`, `TestDispatch_RetrySchedulesDelayedRedispatch`,
+    `TestDispatch_RequeueDoesNotConsumeAttempt`, `TestDispatch_RetryExhaustionFailsRetryable`
+    (incl. reprocess-after-failure), `TestDispatch_DefaultMaxAttempts`,
+    `TestDispatch_ExhaustionMessageIncludesCause`, `TestDispatch_PermanentFailRecordsError`,
+    `TestDispatch_GracefulDrain`, `TestDispatch_DrainStopsPullingQueuedWork`,
+    `TestDispatch_ConcurrencyBounded`, `TestDispatch_DuplicateIdNotProcessedConcurrently`,
+    `TestDispatch_BufferedDuplicateRunsOnce`.
+- [ ] **Delay seam (`delayer.go`).** `RealDelayer` uses `time.AfterFunc`; `FakeDelayer`
+  records scheduled delays and fires them on demand (`Durations`/`PendingLen`/`Total`/
+  `FireAll`), so retry/backoff/requeue timing is asserted with **no** sleeps. The
+  `Inline` flag runs the initial handle synchronously (the HTTP/test seam) while
+  re-dispatch still flows through `Delay`. Tests: `TestRealDelayer_FiresCallback` plus
+  every redispatch assertion above.
+- [ ] **Recovery sweep (`Sweep`, §5.4).** Reads `Store.ListNonTerminal(cutoff)` — a
+  single indexed query returning `pending` + `running` started before
+  `now − RunningTTL` — and re-dispatches each at its **stored** `process_attempts`, so
+  `Max` is honored across restarts. Terminal readings are left alone. Recovery is
+  non-lossy (blocks until a worker accepts each id, or ctx is cancelled) so a backlog
+  larger than `Buffer` is not silently dropped. Tests:
+  `TestDispatch_RecoverySweepReenqueuesNonTerminal`, `TestDispatch_SweepResumesAtStoredAttempt`,
+  `TestDispatch_SweepRecoversBacklogWithoutDropping`, `TestDispatch_SweepStopsOnCanceledContext`,
+  `TestDispatch_SweepPropagatesListError`.
+- [ ] **Automated (B/§make verify):** `TestAcceptance_DispatcherLifecycle` and
+  `TestAcceptance_DispatcherClassifiesErrors` re-prove the spec bullets that matter most —
+  submit→ready, rate-limit requeue (attempt preserved), retry-exhaustion→retryable
+  `failed`, recovery-sweep selection, and sweep-resumes-at-stored-attempt — through the
+  **public** `dispatch.Dispatcher` surface against `store.Memory` + `clock.Fake` +
+  `FakeDelayer`. They are part of `make verify`.
+
+> Note: the dispatcher's `Store` is a **narrow** port (`UpdateStatus` + `ListNonTerminal`)
+> distinct from the full `store.Store`; `store.Memory` satisfies both. The end-to-end
+> stories (`TestE2E_RetryExhaustionFailsRetryable`, `TestE2E_RateLimitRequeue`,
+> `TestE2E_RecoveryAfterRestart` in PLAN §16) belong to Phase 9 and are **not** in scope
+> here — they need the pipeline + HTTP surface. C9 proves the dispatcher in isolation.
+
 ---
 
 ## 5. Section D — Conventions & constraints audit (`CLAUDE.md`)
@@ -363,15 +449,29 @@ Spot-check the project rules that aren't covered by a passing test:
   time is supplied — confirm that's only a fallback and tests always inject `Now`.)
 - [ ] **`internal/reading` is stdlib-only:** `go list -deps ./internal/reading` shows
   no third-party imports.
+- [ ] **Pure retry logic + injected seams (`dispatch`):** confirm `decide`/`Classify`/
+  `backoff` are pure functions and that the dispatcher's only impure dependencies are
+  the injected `clock.Clock`, `Delayer`, and `Store` — no `time.Sleep`, no bare
+  `time.Now()`, no goroutine-timed waits in the semantics (`CLAUDE.md` → keep
+  retry/backoff logic pure, run delays through the `Delayer` seam).
+  `grep -rn "time.Sleep\|time.Now" internal/dispatch` should print **nothing** — the
+  dispatcher never sleeps and reads time only through the injected `clock.Clock`. The
+  one production timer is `time.AfterFunc`, confined to `RealDelayer.After` in
+  `delayer.go` (the seam); `grep -rn "time.AfterFunc" internal/dispatch` shows it lives
+  there and nowhere else.
 - [ ] **Black-box test packages:** confirm `_test.go` files use `package *_test`
-  (e.g. `reading_test`, `clock_test`, `store_test`, `storetest`).
+  (e.g. `reading_test`, `clock_test`, `store_test`, `storetest`, `dispatch_test`,
+  `acceptance_test`). The **one** sanctioned white-box file is
+  `internal/dispatch/decide_test.go` (`package dispatch`) — testing the unexported
+  `decide`/`backoff` is the right boundary, and the harness's
+  `TestConventions_TestPackagesAreBlackbox` allow-lists exactly that path.
 - [ ] **Integration behind build tag:** only `postgres_test.go` carries
   `//go:build integration`; nothing else pulls Docker into the default run.
-- [ ] **Fakes next to ports, concurrency-safe:** `clock.Fake` and `store.Memory` are
-  in their port packages and pass `-race`.
+- [ ] **Fakes next to ports, concurrency-safe:** `clock.Fake`, `store.Memory`, and
+  `dispatch.FakeDelayer` live in their port packages and pass `-race`.
 - [ ] **Table-driven + `t.Parallel()`:** confirm subtests use `t.Run` and parallelism
-  where there's no shared state (the contract suite does; `ConcurrentSaves`
-  deliberately does not call `t.Parallel`).
+  where there's no shared state (the contract suite and the `dispatch` tests do;
+  `ConcurrentSaves` deliberately does not call `t.Parallel`).
 
 ---
 
@@ -383,15 +483,27 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    green against testcontainers (see B5). In a session that predates `docker` group
    membership, run it via `sg docker -c '…'` or after a fresh login; `DATABASE_URL`
    bypasses Docker entirely.
-2. **`internal/reading` coverage is 88.6%**, just under the 90% domain target. Decide
-   (via B4) whether the uncovered lines are meaningful.
+2. **Domain coverage clears the 90% bar** — `clock` 90.9%, `reading` 97.4%,
+   `dispatch` 93.0% (B3). The store's 46.7% is a build-tag artifact, not a gap. No
+   domain coverage finding is currently open; B4 is the method to use if one reopens.
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
-   dispatcher (`internal/dispatch`) exists but is not yet wired into them; no HTTP,
-   pipeline, adapters, config, or CLI subcommands exist yet (Phases 4–12).
-4. **Toolchain `PATH` is configured in `~/.bashrc`** — interactive shells resolve
+   dispatcher (`internal/dispatch`) is complete and verified (C9) but is **not yet
+   wired into them**: nothing calls `Submit`/`Run`/`Sweep` from `main`, because its
+   `Handler` is the Phase 5 pipeline, which does not exist. No HTTP, pipeline,
+   adapters, config, or CLI subcommands exist yet (Phases 4–12).
+4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
+   single-process exactly-once dispatch, matching the single-instance topology
+   (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
+   would need a store-level claim (e.g. `SELECT … FOR UPDATE SKIP LOCKED`, PLAN §14).
+   Do not flag the in-memory map as a distributed-correctness bug — it is by design.
+5. **Dropped final writes are best-effort** — `handle` discards the error from its
+   terminal `ready`/`failed`/`pending` write (no logger until a later phase). A
+   dropped write leaves the reading non-terminal, which the recovery sweep plus
+   read-time stale annotation recover. This is intentional, not a missing error check.
+6. **Toolchain `PATH` is configured in `~/.bashrc`** — interactive shells resolve
    the tools directly; only minimal non-interactive shells need the manual export
    in §1.
-5. **`store.Postgres.UpdateStatus` does a read-then-write** (GetByID then update)
+7. **`store.Postgres.UpdateStatus` does a read-then-write** (GetByID then update)
    rather than a single statement — correct under the current single-instance design,
    but note it is not transactionally atomic across the two calls (revisit if/when
    multi-instance workers land, TDD plan §14).
@@ -422,9 +534,9 @@ skipped/blocked (write why).
 
 ### B — Automated tests
 - [ ] B1 `make test` all `ok`
-- [ ] B2 `make test-race` no data races
-- [ ] B3 `make cover` — clock ≥90%, reading ~88.6%, store ~46.7% (artifact, see note)
-- [ ] B4 reading uncovered lines inspected and judged benign
+- [ ] B2 `make test-race` no data races (incl. dispatcher worker pool + claim guard)
+- [ ] B3 `make cover` — clock ≥90%, reading ~97.4%, dispatch ~93.0%, store ~46.7% (artifact, see note)
+- [ ] B4 domain uncovered lines inspected and judged benign (if any finding reopens)
 - [ ] B5 `make test-integration` actually **ran** (not skipped) and passed
 - [ ] B6 `make sqlc` produces no `git` drift
 
@@ -440,19 +552,25 @@ skipped/blocked (write why).
   tolerated
 - [ ] C8 Postgres/migration/sqlc: schema+indexes match §4.1, query semantics match
   §4.2, error mapping correct, migrations idempotent, FK cascade (parity proven, B5)
+- [ ] C9 dispatcher: `decide`/`Classify`/`backoff` match §5.1–5.2; worker pool persists
+  lifecycle via narrow `Store`; rate-limit keeps attempt; retry-exhaustion → retryable
+  `failed` (reprocessable); claim held across retries; `Sweep` recovers non-terminal at
+  stored attempt, non-lossy; `FakeDelayer` seam; harness lifecycle+classifier green
 
 ### D — Conventions
-- [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted)
+- [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
+  `dispatch` retry logic pure + delays through the `Delayer` seam
 - [ ] D2 `internal/reading` stdlib-only (`go list -deps`)
-- [ ] D3 black-box `_test` packages
+- [ ] D3 black-box `_test` packages (only `dispatch/decide_test.go` white-box, allow-listed)
 - [ ] D4 integration behind `//go:build integration` only
-- [ ] D5 fakes co-located with ports and race-safe
+- [ ] D5 fakes co-located with ports and race-safe (`clock.Fake`, `store.Memory`, `dispatch.FakeDelayer`)
 - [ ] D6 table-driven subtests + `t.Parallel()` where safe
 
 ### E — Sign-off
 - [ ] Limitations in §6 acknowledged
 - [ ] Any deviation from `docs/PLAN.md` recorded with rationale
-- [ ] Overall verdict: Phases 0–2 **accept / reject** (record in §8 sign-off log)
+- [ ] C9 dispatcher behavior confirmed and harness `TestAcceptance_Dispatcher*` green
+- [ ] Overall verdict: Phases 0–3 **accept / reject** (record in §8 sign-off log)
 
 ---
 
