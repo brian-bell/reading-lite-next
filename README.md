@@ -27,7 +27,7 @@ make build
 make verify   # blackbox verification harness (internal/acceptance, -tags verify)
 ```
 
-`make verify` automates `docs/manual-verification-plan.md`: build/vet/gofmt/lint,
+`make verify` automates `docs/ACCEPTANCE.md`: build/vet/gofmt/lint,
 sqlc-drift, the conventions audit, and cross-package behavioral acceptance. The
 store contract and reading lifecycle run against both `store.Memory` and a
 testcontainers Postgres. Steps that need a tool (golangci-lint, sqlc) or Docker

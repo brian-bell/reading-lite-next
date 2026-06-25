@@ -1,6 +1,6 @@
 //go:build verify
 
-// Package acceptance_test is the executable form of docs/manual-verification-plan.md.
+// Package acceptance_test is the executable form of docs/ACCEPTANCE.md.
 //
 // Each test corresponds to a section of that plan:
 //

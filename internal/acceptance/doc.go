@@ -1,5 +1,5 @@
 // Package acceptance hosts the blackbox verification harness that automates the
-// project's manual verification plan (docs/manual-verification-plan.md).
+// project's acceptance plan (docs/ACCEPTANCE.md).
 //
 // The harness lives in build-tagged external test files and runs only under the
 // "verify" build tag:

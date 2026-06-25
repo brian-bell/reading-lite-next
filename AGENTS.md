@@ -33,7 +33,7 @@ The project targets Go 1.26.
   cross-package behavioral acceptance. The store contract and reading lifecycle run
   against both `store.Memory` and a testcontainers Postgres (the Postgres backend
   skips without Docker, or uses `DATABASE_URL`). It automates
-  `docs/manual-verification-plan.md`.
+  `docs/ACCEPTANCE.md`.
 - `make test-race` runs `go test -race ./...`.
 - `make cover` runs `go test -race -cover ./...`.
 - `make test-integration` runs tests behind the `integration` build tag. Store integration
