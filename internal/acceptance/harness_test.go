@@ -83,6 +83,11 @@ var (
 	_ vector.Index         = (*vector.Postgres)(nil)
 	_ blobs.Blobs          = (*blobs.R2)(nil)
 
+	// Phase 7 real extractor: the readability tier ladder satisfies the Extractor
+	// port. (extract.YouTube is intentionally not an Extractor — its oEmbed floor
+	// takes a video URL and makes its own requests, so it sits beside the ladder.)
+	_ extract.Extractor = (*extract.Readability)(nil)
+
 	// Phase 5 pipeline: the memory store satisfies the pipeline's narrow Store
 	// port, and Pipeline.Process has the dispatcher's Handler signature.
 	_ pipeline.Store                                = (*store.Memory)(nil)
@@ -883,6 +888,121 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 	})
 }
 
+// TestAcceptance_Extraction proves the Phase 7 extraction internals through their
+// public surfaces (PLAN §9): the readability tier ladder selects readability /
+// raw_dom / raw_only by readerability, the YouTube oEmbed client returns the
+// title/author floor (classifying its own upstream errors through dispatch.Classify),
+// and the canonical Reddit guidance is the single string the pipeline reuses.
+func TestAcceptance_Extraction(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ReadabilityLadderSelectsTier", func(t *testing.T) {
+		const articleHTML = `<!DOCTYPE html><html lang="en"><head><title>Indexing Notes | Site</title></head><body>
+<nav><a href="/">Home</a></nav>
+<article>
+<h1>Indexing Notes</h1>
+<p class="byline">By Cal Engineer</p>
+<p>A single managed Postgres instance covers metadata, full-text search, and vector
+similarity for a personal reading service. Keeping everything in one database means
+backups are atomic and similarity ranking is just a join away.</p>
+<p>The temptation to add a dedicated vector store should be resisted until the corpus
+genuinely outgrows a single node. Until then, fewer moving parts means fewer outages
+and a smaller bill, which is what a personal service actually wants.</p>
+<p>When growth finally arrives, the ports in front of the store let the backend change
+without touching the pipeline, so the simple choice today does not foreclose the
+scalable choice tomorrow.</p>
+</article>
+<footer>copyright</footer>
+</body></html>`
+		const forumHTML = `<!DOCTYPE html><html lang="en"><head><title>Thread</title></head><body>
+<div class="comments">
+<div class="comment"><span>For a personal database the cheapest reliable backup is a nightly logical dump shipped to object storage, boring but restorable anywhere.</span></div>
+<div class="comment"><span>Logical dumps are fine until the database is large; past a few gigabytes you want physical base backups plus WAL archiving for point in time recovery.</span></div>
+</div></body></html>`
+		const spaHTML = `<!DOCTYPE html><html lang="en"><head><title>App</title></head><body><div id="root"></div><script>function renderApp(){return 1;}</script></body></html>`
+
+		ext := extract.NewReadability()
+		cases := []struct {
+			name string
+			body string
+			want extract.Mode
+		}{
+			{"readerable article", articleHTML, extract.ModeReadability},
+			{"non-article salvages raw_dom", forumHTML, extract.ModeRawDOM},
+			{"js-only floors to raw_only", spaHTML, extract.ModeRawOnly},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				got, err := ext.Extract(ctx, fetch.Resource{Body: []byte(c.body), Status: 200})
+				if err != nil {
+					t.Fatalf("Extract: %v", err)
+				}
+				if got.Mode != c.want {
+					t.Fatalf("Mode = %q, want %q", got.Mode, c.want)
+				}
+				if strings.TrimSpace(got.Markdown) == "" {
+					t.Fatalf("Mode %q produced empty markdown", got.Mode)
+				}
+			})
+		}
+	})
+
+	t.Run("YouTubeOEmbedFloor", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/oembed" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.URL.Query().Get("format") != "json" {
+				t.Errorf("oembed format = %q, want json", r.URL.Query().Get("format"))
+			}
+			_, _ = w.Write([]byte(`{"title":"A Talk","author_name":"Speaker","provider_name":"YouTube"}`))
+		}))
+		defer srv.Close()
+
+		got, err := extract.NewYouTube(extract.WithYouTubeBaseURL(srv.URL)).
+			Extract(ctx, "https://www.youtube.com/watch?v=abcdEFGHijk")
+		if err != nil {
+			t.Fatalf("YouTube Extract: %v", err)
+		}
+		if got.Title != "A Talk" || got.Author != "Speaker" || got.Site != "YouTube" {
+			t.Fatalf("floor = %+v, want title/author/site from oEmbed", got)
+		}
+		if got.Mode != extract.ModeRawOnly {
+			t.Fatalf("Mode = %q, want raw_only (oEmbed floor)", got.Mode)
+		}
+
+		// A deleted/private video's 404 oEmbed is a permanent failure for the dispatcher.
+		gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer gone.Close()
+		_, err = extract.NewYouTube(extract.WithYouTubeBaseURL(gone.URL)).
+			Extract(ctx, "https://www.youtube.com/watch?v=abcdEFGHijk")
+		if got := dispatch.Classify(err).Outcome; got != dispatch.Fail {
+			t.Fatalf("Classify(oembed 404) = %v, want Fail", got)
+		}
+	})
+
+	t.Run("RedditGuidanceIsTheSharedString", func(t *testing.T) {
+		if extract.RedditGuidance == "" {
+			t.Fatal("RedditGuidance is empty")
+		}
+		// The pipeline reuses the extract constant verbatim — one source of truth.
+		if pipeline.RedditGuidance != extract.RedditGuidance {
+			t.Fatalf("pipeline.RedditGuidance = %q, want extract.RedditGuidance %q", pipeline.RedditGuidance, extract.RedditGuidance)
+		}
+		// The classifier routes Reddit to the kind that triggers the guidance path.
+		key, err := reading.URLKey("https://www.reddit.com/r/golang/comments/abc/post")
+		if err != nil {
+			t.Fatalf("URLKey: %v", err)
+		}
+		if got := reading.ClassifySource(key); got != reading.SourceReddit {
+			t.Fatalf("ClassifySource = %q, want reddit", got)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Section D — conventions audit (source inspection)
 // ---------------------------------------------------------------------------
@@ -895,6 +1015,10 @@ func TestConventions_TestPackagesAreBlackbox(t *testing.T) {
 		// decide and backoff are unexported retry-decision internals; testing them
 		// directly is the right boundary (the plan names this file specifically).
 		"internal/dispatch/decide_test.go": true,
+		// selectTier and the raw_only string helpers are the pure tier-selection
+		// internals; the plan requires them "separately tested from the HTML
+		// libraries", so testing them white-box is the right boundary.
+		"internal/extract/ladder_test.go": true,
 	}
 
 	var violations []string
