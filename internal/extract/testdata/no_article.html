@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Thread: best way to back up a personal Postgres</title>
+</head>
+<body>
+  <div class="navbar menu">
+    <span><a href="/">Forum</a></span>
+    <span><a href="/new">New</a></span>
+    <span><a href="/login">Log in</a></span>
+  </div>
+  <div class="comments">
+    <div class="comment">
+      <span class="comment-author">pgfan</span>
+      <span class="comment-text">For a personal database the cheapest reliable
+      backup is a nightly logical dump shipped to object storage. It is boring,
+      it restores anywhere, and you can test it with a one-line restore into a
+      throwaway container.</span>
+    </div>
+    <div class="comment">
+      <span class="comment-author">opsbear</span>
+      <span class="comment-text">Logical dumps are fine until the database is
+      large. Past a few gigabytes you want physical base backups plus WAL
+      archiving so you get point-in-time recovery instead of losing a whole day.</span>
+    </div>
+    <div class="comment">
+      <span class="comment-author">pgfan</span>
+      <span class="comment-text">Agreed, but for a reading service the corpus is
+      tiny. Start with the dump, add WAL archiving only once a lost day actually
+      hurts. Premature operational complexity is its own kind of outage.</span>
+    </div>
+  </div>
+  <div class="sidebar">
+    <h4>Related threads</h4>
+    <ul>
+      <li><a href="/t/41">pgvector index tuning</a></li>
+      <li><a href="/t/40">connection pooling on Neon</a></li>
+    </ul>
+  </div>
+</body>
+</html>
