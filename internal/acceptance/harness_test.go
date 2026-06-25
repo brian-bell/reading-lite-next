@@ -43,6 +43,7 @@ import (
 	"github.com/bbell/reading-lite/internal/extract"
 	"github.com/bbell/reading-lite/internal/fetch"
 	"github.com/bbell/reading-lite/internal/notify"
+	"github.com/bbell/reading-lite/internal/pipeline"
 	"github.com/bbell/reading-lite/internal/reading"
 	"github.com/bbell/reading-lite/internal/store"
 	"github.com/bbell/reading-lite/internal/store/storetest"
@@ -70,6 +71,11 @@ var (
 	_ summarize.Summarizer = (*summarize.Fake)(nil)
 	_ notify.Notifier      = (*notify.Fake)(nil)
 	_ vector.Index         = (*vector.Memory)(nil)
+
+	// Phase 5 pipeline: the memory store satisfies the pipeline's narrow Store
+	// port, and Pipeline.Process has the dispatcher's Handler signature.
+	_ pipeline.Store                                = (*store.Memory)(nil)
+	_ func(context.Context, string) dispatch.Result = (&pipeline.Pipeline{}).Process
 )
 
 // ---------------------------------------------------------------------------
@@ -621,6 +627,110 @@ func TestAcceptance_DispatcherClassifiesErrors(t *testing.T) {
 	if got := dispatch.Classify(errors.New("connection reset")); got.Outcome != dispatch.Retry {
 		t.Fatalf("Classify(transient) = %v, want Retry", got.Outcome)
 	}
+}
+
+// TestAcceptance_PipelineProcess proves the Phase 5 processing pipeline wired to
+// fakes and driven through the in-process dispatcher: a web URL processes to
+// ready with content/summary/similar persisted, a Reddit URL fails with
+// guidance, and a rate-limited step requeues without spending an attempt.
+func TestAcceptance_PipelineProcess(t *testing.T) {
+	newPipeline := func() (*pipeline.Pipeline, *store.Memory, *clock.Fake, *embed.Fake, *notify.Fake) {
+		st := store.NewMemory()
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0).UTC())
+		emb := &embed.Fake{Vec: pipelineUnitVec()}
+		ntf := &notify.Fake{}
+		p := &pipeline.Pipeline{
+			Store:      st,
+			Blobs:      blobs.NewMemory(),
+			Fetcher:    &fetch.Fake{Resource: fetch.Resource{Body: []byte("<html>hi</html>"), ContentType: "text/html", Status: 200}},
+			Extractor:  &extract.Fake{Article: extract.Article{Title: "T", Author: "A", Markdown: "body", Mode: extract.ModeReadability, WordCount: 1}},
+			Embedder:   emb,
+			Vectors:    vector.NewMemory(),
+			Summarizer: &summarize.Fake{Summary: summarize.Summary{Title: "Refined", Summary: "sum", Tags: []string{"go"}}},
+			Notifier:   ntf,
+			Clock:      clk,
+			Config:     pipeline.Config{TopK: 5, NotifyEnabled: true, NotifyFrom: "a@b.c", NotifyTo: "d@e.f"},
+		}
+		return p, st, clk, emb, ntf
+	}
+
+	seed := func(t *testing.T, st *store.Memory, clk *clock.Fake, id, rawURL string) {
+		t.Helper()
+		key, err := reading.URLKey(rawURL)
+		if err != nil {
+			t.Fatalf("URLKey: %v", err)
+		}
+		r := reading.Reading{
+			ID: id, URL: rawURL, URLKey: key,
+			Status: reading.Pending, SourceKind: reading.ClassifySource(key),
+			CreatedAt: clk.Now(), UpdatedAt: clk.Now(),
+		}
+		if err := st.SaveReading(context.Background(), r); err != nil {
+			t.Fatalf("seed %q: %v", id, err)
+		}
+	}
+
+	t.Run("WebProcessesToReady", func(t *testing.T) {
+		p, st, clk, _, ntf := newPipeline()
+		seed(t, st, clk, "r1", "https://example.com/post")
+		d := &dispatch.Dispatcher{Handler: p.Process, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true}
+
+		d.Submit("r1")
+
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Ready {
+			t.Fatalf("status = %q, want ready", got.Status)
+		}
+		if got.ExtractionMode != string(extract.ModeReadability) || got.Summary != "sum" || got.ContentKey == "" {
+			t.Fatalf("content not persisted: mode=%q summary=%q content_key=%q", got.ExtractionMode, got.Summary, got.ContentKey)
+		}
+		if len(got.SimilarJSON) == 0 || len(got.DiagnosticsJSON) == 0 {
+			t.Fatalf("similar/diagnostics not snapshotted: %s / %s", got.SimilarJSON, got.DiagnosticsJSON)
+		}
+		if len(ntf.Sent()) != 1 {
+			t.Fatalf("notify sent = %d, want 1", len(ntf.Sent()))
+		}
+	})
+
+	t.Run("RedditFailsWithGuidance", func(t *testing.T) {
+		p, st, clk, _, _ := newPipeline()
+		seed(t, st, clk, "r1", "https://www.reddit.com/r/golang/comments/x/y")
+		d := &dispatch.Dispatcher{Handler: p.Process, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true}
+
+		d.Submit("r1")
+
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Failed {
+			t.Fatalf("status = %q, want failed", got.Status)
+		}
+		if !strings.Contains(got.Error, pipeline.RedditGuidance) {
+			t.Fatalf("error = %q, want the reddit guidance", got.Error)
+		}
+	})
+
+	t.Run("RateLimitRequeuesWithoutAttempt", func(t *testing.T) {
+		p, st, clk, emb, _ := newPipeline()
+		emb.Err = &dispatch.RateLimitError{RetryAfter: 30 * time.Second}
+		seed(t, st, clk, "r1", "https://example.com/post")
+		delay := &dispatch.FakeDelayer{}
+		d := &dispatch.Dispatcher{Handler: p.Process, Store: st, Clock: clk, Delay: delay, Max: 3, Inline: true}
+
+		d.Submit("r1")
+
+		got := mustGetReading(t, st, "r1")
+		if got.Status != reading.Pending || got.ProcessAttempts != 0 {
+			t.Fatalf("after rate limit = %q/attempts %d, want pending/0", got.Status, got.ProcessAttempts)
+		}
+		if ds := delay.Durations(); len(ds) != 1 || ds[0] != 30*time.Second {
+			t.Fatalf("scheduled delays = %v, want [30s]", ds)
+		}
+	})
+}
+
+func pipelineUnitVec() []float32 {
+	v := make([]float32, embed.Dim)
+	v[0] = 1
+	return v
 }
 
 // ---------------------------------------------------------------------------
