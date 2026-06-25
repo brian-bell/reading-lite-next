@@ -183,6 +183,14 @@ func parseToolUse(resp anthropicResponse) (Summary, error) {
 		if err := json.Unmarshal(block.Input, &fields); err != nil {
 			return Summary{}, fmt.Errorf("summarize: decode %s input: %w", toolName, err)
 		}
+		// The API forces the tool *call* but does not enforce the input_schema, so a
+		// tool_use block can still carry valid-but-incomplete JSON (null, {}, or a
+		// blank summary). Reject an empty title/summary rather than persist a blank
+		// summary and mark the reading ready. This is transient: a retry gives the
+		// non-deterministic model another chance. (Tags may legitimately be empty.)
+		if strings.TrimSpace(fields.Title) == "" || strings.TrimSpace(fields.Summary) == "" {
+			return Summary{}, fmt.Errorf("summarize: %s input is missing a required title or summary", toolName)
+		}
 		return Summary{
 			Title:   fields.Title,
 			Summary: fields.Summary,

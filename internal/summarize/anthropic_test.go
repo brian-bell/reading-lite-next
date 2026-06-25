@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,6 +128,40 @@ func TestAnthropic_MissingToolUseIsError(t *testing.T) {
 	s := summarize.NewAnthropic("k", summarize.WithBaseURL(srv.URL))
 	if _, err := s.Summarize(context.Background(), summarize.SummaryInput{Markdown: "x"}); err == nil {
 		t.Fatal("missing tool_use = nil error, want an error")
+	}
+}
+
+func TestAnthropic_EmptyToolInputIsError(t *testing.T) {
+	t.Parallel()
+
+	// Forced tool use makes the model *call* emit_reading, but the API does not
+	// enforce the input_schema, so a tool_use block with valid-but-incomplete JSON
+	// is possible. The adapter must reject a blank title/summary rather than persist
+	// an empty summary and let the reading be marked ready. The error is transient
+	// (a retry gives the non-deterministic model another chance).
+	cases := []struct{ name, input string }{
+		{"null input", `null`},
+		{"empty object", `{}`},
+		{"missing title", `{"summary":"S","tags":["go"]}`},
+		{"blank summary", `{"title":"T","summary":"   ","tags":["go"]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"emit_reading","input":%s}]}`, c.input)
+			}))
+			defer srv.Close()
+
+			s := summarize.NewAnthropic("k", summarize.WithBaseURL(srv.URL))
+			_, err := s.Summarize(context.Background(), summarize.SummaryInput{Markdown: "x"})
+			if err == nil {
+				t.Fatalf("input %s = nil error, want an error (a blank summary must not be accepted)", c.input)
+			}
+			if got := dispatch.Classify(err); got.Outcome != dispatch.Retry {
+				t.Fatalf("Classify(incomplete tool input) = %v, want Retry", got.Outcome)
+			}
+		})
 	}
 }
 

@@ -815,6 +815,16 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 		if out.Title != "T" || out.Summary != "S" || len(out.Tags) != 1 {
 			t.Fatalf("summary = %+v, want fields parsed from the tool_use input", out)
 		}
+
+		// An incomplete tool input (the API forces the call but not the schema) must
+		// be rejected, not persisted as a blank summary that marks the reading ready.
+		blank := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"content":[{"type":"tool_use","name":"emit_reading","input":{}}]}`))
+		}))
+		defer blank.Close()
+		if _, err := summarize.NewAnthropic("k", summarize.WithBaseURL(blank.URL)).Summarize(ctx, summarize.SummaryInput{Markdown: "body"}); err == nil {
+			t.Fatal("blank emit_reading input = nil error, want an error (no blank summary accepted)")
+		}
 	})
 
 	t.Run("NotifyErrorIsSwallowable", func(t *testing.T) {
