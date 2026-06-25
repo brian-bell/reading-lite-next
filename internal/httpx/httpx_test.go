@@ -26,18 +26,62 @@ func resp(status int, header http.Header, body string) *http.Response {
 func TestClassifyResponse_RateLimit(t *testing.T) {
 	t.Parallel()
 
-	h := http.Header{"Retry-After": {"30"}}
+	h := http.Header{"Retry-After": {"45"}}
 	err := httpx.ClassifyResponse("embed", resp(http.StatusTooManyRequests, h, `{"error":"slow down"}`))
 
 	var rl *dispatch.RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("429 = %v, want *dispatch.RateLimitError", err)
 	}
-	if rl.RetryAfter != 30*time.Second {
-		t.Fatalf("RetryAfter = %v, want 30s", rl.RetryAfter)
+	if rl.RetryAfter != 45*time.Second {
+		t.Fatalf("RetryAfter = %v, want 45s (explicit Retry-After honored)", rl.RetryAfter)
 	}
-	if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 30*time.Second {
-		t.Fatalf("Classify = %v/%v, want Requeue/30s", got.Outcome, got.After)
+	if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 45*time.Second {
+		t.Fatalf("Classify = %v/%v, want Requeue/45s", got.Outcome, got.After)
+	}
+}
+
+func TestClassifyResponse_RateLimitWithoutRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	// A 429 with no usable Retry-After must NOT yield a zero delay (which would
+	// requeue immediately and spin the dispatcher) — it falls back to the bounded
+	// default so a bare-429 origin is retried gently, not in a tight loop.
+	err := httpx.ClassifyResponse("embed", resp(http.StatusTooManyRequests, nil, "rate limited"))
+
+	var rl *dispatch.RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("429 = %v, want *dispatch.RateLimitError", err)
+	}
+	if rl.RetryAfter != dispatch.DefaultRateLimitDelay {
+		t.Fatalf("RetryAfter = %v, want DefaultRateLimitDelay %v", rl.RetryAfter, dispatch.DefaultRateLimitDelay)
+	}
+	if rl.RetryAfter <= 0 {
+		t.Fatal("RetryAfter must be > 0 to avoid an immediate-requeue spin")
+	}
+}
+
+func TestRateLimitDelay(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"explicit seconds honored", "45", 45 * time.Second},
+		{"one second honored", "1", 1 * time.Second},
+		{"missing falls back", "", dispatch.DefaultRateLimitDelay},
+		{"zero falls back", "0", dispatch.DefaultRateLimitDelay},
+		{"garbage falls back", "soon", dispatch.DefaultRateLimitDelay},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if got := httpx.RateLimitDelay(c.in); got != c.want {
+				t.Fatalf("RateLimitDelay(%q) = %v, want %v", c.in, got, c.want)
+			}
+		})
 	}
 }
 

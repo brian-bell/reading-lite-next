@@ -487,6 +487,32 @@ func TestPipeline_FetchHardError_Fails(t *testing.T) {
 	}
 }
 
+func TestPipeline_FetchRateLimited_Requeues(t *testing.T) {
+	t.Parallel()
+
+	// A fetched 429 is a rate limit: the reading stays pending, no attempt is
+	// consumed, and a re-dispatch is scheduled — never a permanent failure.
+	h := newHarness(t)
+	h.fetcher.Resource = fetch.Resource{Status: 429}
+	h.seed(t, "r1", "https://example.com/post")
+
+	h.dispatcher.Submit("r1")
+
+	got := h.get(t, "r1")
+	if got.Status != reading.Pending {
+		t.Fatalf("status = %q, want pending (a rate limit requeues, not fails)", got.Status)
+	}
+	if got.ProcessAttempts != 0 {
+		t.Fatalf("process_attempts = %d, want 0 (a rate limit must not consume an attempt)", got.ProcessAttempts)
+	}
+	if h.delay.Total() != 1 {
+		t.Fatalf("delays scheduled = %d, want 1 (the requeue)", h.delay.Total())
+	}
+	if h.extractor.Calls() != 0 {
+		t.Fatalf("extractor calls = %d, want 0 (a rate-limited fetch never extracts)", h.extractor.Calls())
+	}
+}
+
 func TestPipeline_MarkdownWithoutBody_FailsPermanently(t *testing.T) {
 	t.Parallel()
 

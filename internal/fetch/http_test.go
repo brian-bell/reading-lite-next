@@ -132,6 +132,57 @@ func TestHTTP_OversizedNon2xxPreservesStatus(t *testing.T) {
 	}
 }
 
+func TestHTTP_RateLimitMapsToRateLimitError(t *testing.T) {
+	t.Parallel()
+
+	// A 429 from the origin is a rate limit, not a hard failure: the adapter must
+	// surface it as a RateLimitError (honoring Retry-After) so the dispatcher
+	// requeues without consuming an attempt — not let the pipeline's 4xx→permanent
+	// status policy fail the reading.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("slow down"))
+	}))
+	defer srv.Close()
+
+	_, err := fetch.NewHTTP().Get(context.Background(), srv.URL)
+	var rl *dispatch.RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("429 = %v, want *dispatch.RateLimitError", err)
+	}
+	if rl.RetryAfter != 30*time.Second {
+		t.Fatalf("RetryAfter = %v, want 30s (from Retry-After header)", rl.RetryAfter)
+	}
+	if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 30*time.Second {
+		t.Fatalf("Classify(429) = %v/%v, want Requeue/30s", got.Outcome, got.After)
+	}
+}
+
+func TestHTTP_RateLimitWithoutRetryAfterUsesBoundedDelay(t *testing.T) {
+	t.Parallel()
+
+	// A bare 429 (no Retry-After) must not requeue with a zero delay: that would
+	// spin the dispatcher (Requeue consumes no attempt) on an origin that always
+	// 429s. The adapter falls back to the bounded default delay.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	_, err := fetch.NewHTTP().Get(context.Background(), srv.URL)
+	var rl *dispatch.RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("bare 429 = %v, want *dispatch.RateLimitError", err)
+	}
+	if rl.RetryAfter != dispatch.DefaultRateLimitDelay {
+		t.Fatalf("RetryAfter = %v, want DefaultRateLimitDelay %v", rl.RetryAfter, dispatch.DefaultRateLimitDelay)
+	}
+	if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After <= 0 {
+		t.Fatalf("Classify(bare 429) = %v/%v, want Requeue with a positive delay", got.Outcome, got.After)
+	}
+}
+
 func TestHTTP_RejectsNonHTTPScheme(t *testing.T) {
 	t.Parallel()
 

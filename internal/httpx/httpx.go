@@ -32,7 +32,7 @@ func ClassifyResponse(svc string, resp *http.Response) error {
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return &dispatch.RateLimitError{
-			RetryAfter: RetryAfter(resp.Header.Get("Retry-After")),
+			RetryAfter: RateLimitDelay(resp.Header.Get("Retry-After")),
 			Err:        fmt.Errorf("%s: rate limited: %s", svc, snippet),
 		}
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
@@ -40,6 +40,19 @@ func ClassifyResponse(svc string, resp *http.Response) error {
 	default:
 		return fmt.Errorf("%s: status %d: %s", svc, resp.StatusCode, snippet)
 	}
+}
+
+// RateLimitDelay returns the re-dispatch delay for a rate-limited (429) response.
+// A meaningful explicit Retry-After (>= 1s) is honored; a missing, zero, or
+// sub-second value falls back to [dispatch.DefaultRateLimitDelay]. The fallback is
+// essential: a Requeue does not consume an attempt, so a zero delay would
+// re-dispatch immediately and spin the dispatcher on an origin that always 429s
+// without a usable Retry-After.
+func RateLimitDelay(header string) time.Duration {
+	if d := RetryAfter(header); d >= time.Second {
+		return d
+	}
+	return dispatch.DefaultRateLimitDelay
 }
 
 // RetryAfter parses a Retry-After header value, accepting either a delay in

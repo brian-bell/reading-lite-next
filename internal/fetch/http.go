@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bbell/reading-lite/internal/dispatch"
+	"github.com/bbell/reading-lite/internal/httpx"
 )
 
 // Default tuning for the HTTP fetcher. The body cap bounds memory against a
@@ -104,6 +105,18 @@ func (h *HTTP) Get(ctx context.Context, url string) (Resource, error) {
 		return Resource{}, fmt.Errorf("fetch: get %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// A 429 is a rate limit, not a hard failure: surface it as a RateLimitError
+	// (honoring Retry-After) so the dispatcher requeues without consuming an
+	// attempt, the same way the embed/summarize adapters handle a 429. Returning
+	// the raw status instead would let the pipeline's 4xx→permanent policy
+	// permanently fail a reading that a throttled origin would serve on retry.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return Resource{}, &dispatch.RateLimitError{
+			RetryAfter: httpx.RateLimitDelay(resp.Header.Get("Retry-After")),
+			Err:        fmt.Errorf("fetch: rate limited by %s", url),
+		}
+	}
 
 	body, oversize, err := readCapped(resp.Body, h.maxBytes)
 	if err != nil {
