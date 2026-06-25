@@ -76,6 +76,16 @@ func TestStaticAnalysis_GoVetIntegrationTag(t *testing.T) {
 	}
 }
 
+func TestStaticAnalysis_GoVetVerifyHarness(t *testing.T) {
+	// TestStaticAnalysis_GoVet runs `go vet ./...` under the default tags, which
+	// excludes the //go:build verify files — so this harness would never vet
+	// itself. Vet the acceptance package under the verify tag to close that gap.
+	root, goBin := repoRoot(t), goBin(t)
+	if out, err := runTool(t, root, goBin, "vet", "-tags", "verify", "./internal/acceptance/..."); err != nil {
+		t.Fatalf("go vet -tags verify ./internal/acceptance/... failed: %v\n%s", err, out)
+	}
+}
+
 func TestStaticAnalysis_Gofmt(t *testing.T) {
 	root, gofmt := repoRoot(t), gofmtBin(t)
 	out, err := runTool(t, root, gofmt, "-l", ".")
