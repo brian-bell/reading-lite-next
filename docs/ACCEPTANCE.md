@@ -394,10 +394,13 @@ Record these so a reviewer doesn't waste time or raise false bugs:
 
 ---
 
-## 7. Consolidated checklist
+## 7. Consolidated checklist (template)
 
-Copy this block into a review note and tick as you go. `[ ]` = todo, `[x]` = verified,
-`[~]` = skipped/blocked (write why).
+**This is a blank template — leave the boxes unticked here.** Copy this block into
+a review note (or a PR) and tick it there as you work through one verification pass;
+record the outcome of a completed pass as a row in the §8 sign-off log rather than
+by ticking boxes in this document. `[ ]` = todo, `[x]` = verified, `[~]` =
+skipped/blocked (write why).
 
 ### Environment
 - [ ] `command -v go gofmt golangci-lint sqlc` all resolve (PATH set in `~/.bashrc`)
@@ -443,9 +446,9 @@ Copy this block into a review note and tick as you go. `[ ]` = todo, `[x]` = ver
 - [ ] D6 table-driven subtests + `t.Parallel()` where safe
 
 ### E — Sign-off
-- [x] Limitations in §6 acknowledged
-- [x] Any deviation from `docs/backend-tdd-plan.md` recorded with rationale (none)
-- [x] Overall verdict: Phases 0–2 **accepted** (see §8 sign-off log)
+- [ ] Limitations in §6 acknowledged
+- [ ] Any deviation from `docs/backend-tdd-plan.md` recorded with rationale
+- [ ] Overall verdict: Phases 0–2 **accept / reject** (record in §8 sign-off log)
 
 ---
 
