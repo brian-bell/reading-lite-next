@@ -127,6 +127,44 @@ func (m *Memory) UpdateStatus(ctx context.Context, id string, status reading.Sta
 	return nil
 }
 
+// UpdateContent overwrites a reading's processed content fields without touching
+// its lifecycle status, timestamps, error, attempt count, or tags.
+func (m *Memory) UpdateContent(ctx context.Context, id string, fields ContentFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.byID[id]
+	if !ok {
+		return ErrNotFound
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	r.Title = fields.Title
+	r.Author = fields.Author
+	r.Site = fields.Site
+	r.Lang = fields.Lang
+	r.WordCount = fields.WordCount
+	r.ExtractionMode = fields.ExtractionMode
+	r.ContentKey = fields.ContentKey
+	r.RawKey = fields.RawKey
+	r.Summary = fields.Summary
+	r.SummaryJSON = fields.SummaryJSON
+	r.SimilarJSON = fields.SimilarJSON
+	r.DiagnosticsJSON = fields.DiagnosticsJSON
+	r.UpdatedAt = now
+
+	m.byID[id] = cloneReading(r)
+	return nil
+}
+
 // ReplaceTags replaces a reading's tag set.
 func (m *Memory) ReplaceTags(ctx context.Context, id string, tags []string) error {
 	if err := ctx.Err(); err != nil {
@@ -380,7 +418,17 @@ func cloneReading(r reading.Reading) reading.Reading {
 	r.Tags = cloneStrings(r.Tags)
 	r.StartedAt = cloneTimePtr(r.StartedAt)
 	r.FinishedAt = cloneTimePtr(r.FinishedAt)
+	r.SummaryJSON = cloneBytes(r.SummaryJSON)
+	r.SimilarJSON = cloneBytes(r.SimilarJSON)
+	r.DiagnosticsJSON = cloneBytes(r.DiagnosticsJSON)
 	return r
+}
+
+func cloneBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	return slices.Clone(in)
 }
 
 func cloneStrings(in []string) []string {

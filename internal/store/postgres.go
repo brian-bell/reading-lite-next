@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -41,7 +42,10 @@ func (p *Postgres) SaveReading(ctx context.Context, r reading.Reading) error {
 		Column12:        r.ContentKey,
 		Column13:        r.RawKey,
 		Column14:        r.Summary,
-		Column15:        r.Error,
+		SummaryJson:     r.SummaryJSON,
+		SimilarJson:     r.SimilarJSON,
+		DiagnosticsJson: r.DiagnosticsJSON,
+		Column18:        r.Error,
 		ProcessAttempts: int32(r.ProcessAttempts),
 		Tags:            normalizeTags(r.Tags),
 		CreatedAt:       timestamptz(r.CreatedAt),
@@ -119,6 +123,38 @@ func (p *Postgres) UpdateStatus(ctx context.Context, id string, status reading.S
 		Column5:         r.Error,
 		ProcessAttempts: int32(r.ProcessAttempts),
 		UpdatedAt:       timestamptz(r.UpdatedAt),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateContent overwrites a reading's processed content fields without touching
+// its lifecycle status, timestamps, error, attempt count, or tags.
+func (p *Postgres) UpdateContent(ctx context.Context, id string, fields ContentFields) error {
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := p.queries.UpdateReadingContent(ctx, storedb.UpdateReadingContentParams{
+		ID:              id,
+		Column2:         fields.Title,
+		Column3:         fields.Author,
+		Column4:         fields.Site,
+		Column5:         fields.Lang,
+		WordCount:       int32Ptr(fields.WordCount),
+		Column7:         fields.ExtractionMode,
+		Column8:         fields.ContentKey,
+		Column9:         fields.RawKey,
+		Column10:        fields.Summary,
+		SummaryJson:     fields.SummaryJSON,
+		SimilarJson:     fields.SimilarJSON,
+		DiagnosticsJson: fields.DiagnosticsJSON,
+		UpdatedAt:       timestamptz(now),
 	})
 	if err != nil {
 		return err
@@ -280,6 +316,9 @@ func readingFromGetByID(row storedb.GetReadingByIDRow) reading.Reading {
 		contentKey:      row.ContentKey,
 		rawKey:          row.RawKey,
 		summary:         row.Summary,
+		summaryJSON:     row.SummaryJson,
+		similarJSON:     row.SimilarJson,
+		diagnosticsJSON: row.DiagnosticsJson,
 		err:             row.Error,
 		processAttempts: row.ProcessAttempts,
 		tags:            row.Tags,
@@ -306,6 +345,9 @@ func readingFromGetByURLKey(row storedb.GetReadingByURLKeyRow) reading.Reading {
 		contentKey:      row.ContentKey,
 		rawKey:          row.RawKey,
 		summary:         row.Summary,
+		summaryJSON:     row.SummaryJson,
+		similarJSON:     row.SimilarJson,
+		diagnosticsJSON: row.DiagnosticsJson,
 		err:             row.Error,
 		processAttempts: row.ProcessAttempts,
 		tags:            row.Tags,
@@ -339,6 +381,9 @@ func readingsFromNewestRows(rows []storedb.SearchReadingsNewestRow) []postgresSe
 			contentKey:      row.ContentKey,
 			rawKey:          row.RawKey,
 			summary:         row.Summary,
+			summaryJSON:     row.SummaryJson,
+			similarJSON:     row.SimilarJson,
+			diagnosticsJSON: row.DiagnosticsJson,
 			err:             row.Error,
 			processAttempts: row.ProcessAttempts,
 			tags:            row.Tags,
@@ -369,6 +414,9 @@ func readingsFromOldestRows(rows []storedb.SearchReadingsOldestRow) []postgresSe
 			contentKey:      row.ContentKey,
 			rawKey:          row.RawKey,
 			summary:         row.Summary,
+			summaryJSON:     row.SummaryJson,
+			similarJSON:     row.SimilarJson,
+			diagnosticsJSON: row.DiagnosticsJson,
 			err:             row.Error,
 			processAttempts: row.ProcessAttempts,
 			tags:            row.Tags,
@@ -399,6 +447,9 @@ func readingsFromTitleRows(rows []storedb.SearchReadingsTitleRow) []postgresSear
 			contentKey:      row.ContentKey,
 			rawKey:          row.RawKey,
 			summary:         row.Summary,
+			summaryJSON:     row.SummaryJson,
+			similarJSON:     row.SimilarJson,
+			diagnosticsJSON: row.DiagnosticsJson,
 			err:             row.Error,
 			processAttempts: row.ProcessAttempts,
 			tags:            row.Tags,
@@ -426,6 +477,9 @@ type readingFields struct {
 	contentKey      *string
 	rawKey          *string
 	summary         *string
+	summaryJSON     []byte
+	similarJSON     []byte
+	diagnosticsJSON []byte
 	err             *string
 	processAttempts int32
 	tags            []string
@@ -451,6 +505,9 @@ func readingFromFields(f readingFields) reading.Reading {
 		ContentKey:      stringValue(f.contentKey),
 		RawKey:          stringValue(f.rawKey),
 		Summary:         stringValue(f.summary),
+		SummaryJSON:     jsonValue(f.summaryJSON),
+		SimilarJSON:     jsonValue(f.similarJSON),
+		DiagnosticsJSON: jsonValue(f.diagnosticsJSON),
 		Error:           stringValue(f.err),
 		ProcessAttempts: int(f.processAttempts),
 		Tags:            cloneStrings(f.tags),
@@ -478,6 +535,13 @@ func stringValue(v *string) string {
 		return ""
 	}
 	return *v
+}
+
+func jsonValue(v []byte) json.RawMessage {
+	if len(v) == 0 {
+		return nil
+	}
+	return json.RawMessage(v)
 }
 
 func intValue(v *int32) int {

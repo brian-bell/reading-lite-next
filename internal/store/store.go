@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -59,6 +60,39 @@ type Pending struct {
 	ProcessAttempts int
 }
 
+// ContentFields carries the processed content a pipeline run persists. It
+// overwrites the extraction/summary columns and updated_at without touching the
+// lifecycle status, timestamps, error, attempt count, or tags (the dispatcher
+// owns status; tags go through ReplaceTags).
+type ContentFields struct {
+	// Now is the updated_at timestamp to record (falls back to wall clock when zero).
+	Now time.Time
+	// Title is the extracted or refined article title.
+	Title string
+	// Author is the extracted article author.
+	Author string
+	// Site is the extracted or inferred site name.
+	Site string
+	// Lang is the detected content language.
+	Lang string
+	// WordCount is the extracted body's word count.
+	WordCount int
+	// ExtractionMode records which extraction tier produced the content.
+	ExtractionMode string
+	// ContentKey points at the extracted content blob.
+	ContentKey string
+	// RawKey points at the raw source blob.
+	RawKey string
+	// Summary is the generated human-readable summary.
+	Summary string
+	// SummaryJSON is the raw structured summarizer payload.
+	SummaryJSON json.RawMessage
+	// SimilarJSON is the snapshot of similar readings.
+	SimilarJSON json.RawMessage
+	// DiagnosticsJSON records per-step pipeline diagnostics.
+	DiagnosticsJSON json.RawMessage
+}
+
 // StatusFields carries optional metadata to apply during UpdateStatus.
 type StatusFields struct {
 	Now             time.Time
@@ -75,6 +109,7 @@ type Store interface {
 	GetByID(ctx context.Context, id string) (reading.Reading, error)
 	GetByURLKey(ctx context.Context, key string) (reading.Reading, error)
 	UpdateStatus(ctx context.Context, id string, status reading.Status, fields StatusFields) error
+	UpdateContent(ctx context.Context, id string, fields ContentFields) error
 	ReplaceTags(ctx context.Context, id string, tags []string) error
 	Search(ctx context.Context, q Query) (Page, error)
 	ListNonTerminal(ctx context.Context, runningCutoff time.Time) ([]Pending, error)

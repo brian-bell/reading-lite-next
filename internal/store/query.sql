@@ -1,19 +1,22 @@
 -- name: CreateReading :one
 insert into readings (
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 ) values (
   $1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), nullif($8, ''), nullif($9, ''),
-  $10, nullif($11, ''), nullif($12, ''), nullif($13, ''), nullif($14, ''), nullif($15, ''),
-  $16, $17, $18, $19, $20, $21
+  $10, nullif($11, ''), nullif($12, ''), nullif($13, ''), nullif($14, ''), $15, $16,
+  $17, nullif($18, ''), $19, $20,
+  $21, $22, $23, $24
 ) on conflict (url_key) do nothing
 returning id;
 
 -- name: GetReadingByID :one
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 from readings
 where id = $1;
@@ -21,7 +24,8 @@ where id = $1;
 -- name: GetReadingByURLKey :one
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 from readings
 where url_key = $1;
@@ -35,6 +39,24 @@ set
   error = nullif($5, ''),
   process_attempts = $6,
   updated_at = $7
+where id = $1;
+
+-- name: UpdateReadingContent :execrows
+update readings
+set
+  title = nullif($2, ''),
+  author = nullif($3, ''),
+  site = nullif($4, ''),
+  lang = nullif($5, ''),
+  word_count = $6,
+  extraction_mode = nullif($7, ''),
+  content_key = nullif($8, ''),
+  raw_key = nullif($9, ''),
+  summary = nullif($10, ''),
+  summary_json = $11,
+  similar_json = $12,
+  diagnostics_json = $13,
+  updated_at = $14
 where id = $1;
 
 -- name: ReplaceReadingTags :execrows
@@ -52,7 +74,8 @@ where ($1 = '' or search @@ websearch_to_tsquery('english', $1))
 -- name: SearchReadingsNewest :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings
@@ -76,7 +99,8 @@ limit $8;
 -- name: SearchReadingsOldest :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings
@@ -100,7 +124,8 @@ limit $8;
 -- name: SearchReadingsTitle :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings

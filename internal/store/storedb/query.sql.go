@@ -35,12 +35,14 @@ func (q *Queries) CountReadings(ctx context.Context, arg CountReadingsParams) (i
 const createReading = `-- name: CreateReading :one
 insert into readings (
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 ) values (
   $1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), nullif($8, ''), nullif($9, ''),
-  $10, nullif($11, ''), nullif($12, ''), nullif($13, ''), nullif($14, ''), nullif($15, ''),
-  $16, $17, $18, $19, $20, $21
+  $10, nullif($11, ''), nullif($12, ''), nullif($13, ''), nullif($14, ''), $15, $16,
+  $17, nullif($18, ''), $19, $20,
+  $21, $22, $23, $24
 ) on conflict (url_key) do nothing
 returning id
 `
@@ -60,7 +62,10 @@ type CreateReadingParams struct {
 	Column12        interface{}
 	Column13        interface{}
 	Column14        interface{}
-	Column15        interface{}
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
+	Column18        interface{}
 	ProcessAttempts int32
 	Tags            []string
 	CreatedAt       pgtype.Timestamptz
@@ -85,7 +90,10 @@ func (q *Queries) CreateReading(ctx context.Context, arg CreateReadingParams) (s
 		arg.Column12,
 		arg.Column13,
 		arg.Column14,
-		arg.Column15,
+		arg.SummaryJson,
+		arg.SimilarJson,
+		arg.DiagnosticsJson,
+		arg.Column18,
 		arg.ProcessAttempts,
 		arg.Tags,
 		arg.CreatedAt,
@@ -114,7 +122,8 @@ func (q *Queries) DeleteReading(ctx context.Context, id string) (int64, error) {
 const getReadingByID = `-- name: GetReadingByID :one
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 from readings
 where id = $1
@@ -135,6 +144,9 @@ type GetReadingByIDRow struct {
 	ContentKey      *string
 	RawKey          *string
 	Summary         *string
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
 	Error           *string
 	ProcessAttempts int32
 	Tags            []string
@@ -162,6 +174,9 @@ func (q *Queries) GetReadingByID(ctx context.Context, id string) (GetReadingByID
 		&i.ContentKey,
 		&i.RawKey,
 		&i.Summary,
+		&i.SummaryJson,
+		&i.SimilarJson,
+		&i.DiagnosticsJson,
 		&i.Error,
 		&i.ProcessAttempts,
 		&i.Tags,
@@ -176,7 +191,8 @@ func (q *Queries) GetReadingByID(ctx context.Context, id string) (GetReadingByID
 const getReadingByURLKey = `-- name: GetReadingByURLKey :one
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at
 from readings
 where url_key = $1
@@ -197,6 +213,9 @@ type GetReadingByURLKeyRow struct {
 	ContentKey      *string
 	RawKey          *string
 	Summary         *string
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
 	Error           *string
 	ProcessAttempts int32
 	Tags            []string
@@ -224,6 +243,9 @@ func (q *Queries) GetReadingByURLKey(ctx context.Context, urlKey string) (GetRea
 		&i.ContentKey,
 		&i.RawKey,
 		&i.Summary,
+		&i.SummaryJson,
+		&i.SimilarJson,
+		&i.DiagnosticsJson,
 		&i.Error,
 		&i.ProcessAttempts,
 		&i.Tags,
@@ -290,7 +312,8 @@ func (q *Queries) ReplaceReadingTags(ctx context.Context, arg ReplaceReadingTags
 const searchReadingsNewest = `-- name: SearchReadingsNewest :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings
@@ -338,6 +361,9 @@ type SearchReadingsNewestRow struct {
 	ContentKey      *string
 	RawKey          *string
 	Summary         *string
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
 	Error           *string
 	ProcessAttempts int32
 	Tags            []string
@@ -381,6 +407,9 @@ func (q *Queries) SearchReadingsNewest(ctx context.Context, arg SearchReadingsNe
 			&i.ContentKey,
 			&i.RawKey,
 			&i.Summary,
+			&i.SummaryJson,
+			&i.SimilarJson,
+			&i.DiagnosticsJson,
 			&i.Error,
 			&i.ProcessAttempts,
 			&i.Tags,
@@ -403,7 +432,8 @@ func (q *Queries) SearchReadingsNewest(ctx context.Context, arg SearchReadingsNe
 const searchReadingsOldest = `-- name: SearchReadingsOldest :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings
@@ -451,6 +481,9 @@ type SearchReadingsOldestRow struct {
 	ContentKey      *string
 	RawKey          *string
 	Summary         *string
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
 	Error           *string
 	ProcessAttempts int32
 	Tags            []string
@@ -494,6 +527,9 @@ func (q *Queries) SearchReadingsOldest(ctx context.Context, arg SearchReadingsOl
 			&i.ContentKey,
 			&i.RawKey,
 			&i.Summary,
+			&i.SummaryJson,
+			&i.SimilarJson,
+			&i.DiagnosticsJson,
 			&i.Error,
 			&i.ProcessAttempts,
 			&i.Tags,
@@ -516,7 +552,8 @@ func (q *Queries) SearchReadingsOldest(ctx context.Context, arg SearchReadingsOl
 const searchReadingsTitle = `-- name: SearchReadingsTitle :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
-  extraction_mode, content_key, raw_key, summary, error, process_attempts, tags,
+  extraction_mode, content_key, raw_key, summary, summary_json, similar_json,
+  diagnostics_json, error, process_attempts, tags,
   created_at, started_at, finished_at, updated_at,
   case when $1 <> '' then ts_rank(search, websearch_to_tsquery('english', $1)) else 0::real end as search_rank
 from readings
@@ -564,6 +601,9 @@ type SearchReadingsTitleRow struct {
 	ContentKey      *string
 	RawKey          *string
 	Summary         *string
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
 	Error           *string
 	ProcessAttempts int32
 	Tags            []string
@@ -607,6 +647,9 @@ func (q *Queries) SearchReadingsTitle(ctx context.Context, arg SearchReadingsTit
 			&i.ContentKey,
 			&i.RawKey,
 			&i.Summary,
+			&i.SummaryJson,
+			&i.SimilarJson,
+			&i.DiagnosticsJson,
 			&i.Error,
 			&i.ProcessAttempts,
 			&i.Tags,
@@ -624,6 +667,65 @@ func (q *Queries) SearchReadingsTitle(ctx context.Context, arg SearchReadingsTit
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateReadingContent = `-- name: UpdateReadingContent :execrows
+update readings
+set
+  title = nullif($2, ''),
+  author = nullif($3, ''),
+  site = nullif($4, ''),
+  lang = nullif($5, ''),
+  word_count = $6,
+  extraction_mode = nullif($7, ''),
+  content_key = nullif($8, ''),
+  raw_key = nullif($9, ''),
+  summary = nullif($10, ''),
+  summary_json = $11,
+  similar_json = $12,
+  diagnostics_json = $13,
+  updated_at = $14
+where id = $1
+`
+
+type UpdateReadingContentParams struct {
+	ID              string
+	Column2         interface{}
+	Column3         interface{}
+	Column4         interface{}
+	Column5         interface{}
+	WordCount       *int32
+	Column7         interface{}
+	Column8         interface{}
+	Column9         interface{}
+	Column10        interface{}
+	SummaryJson     []byte
+	SimilarJson     []byte
+	DiagnosticsJson []byte
+	UpdatedAt       pgtype.Timestamptz
+}
+
+func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingContentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateReadingContent,
+		arg.ID,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+		arg.WordCount,
+		arg.Column7,
+		arg.Column8,
+		arg.Column9,
+		arg.Column10,
+		arg.SummaryJson,
+		arg.SimilarJson,
+		arg.DiagnosticsJson,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateReadingStatus = `-- name: UpdateReadingStatus :execrows
