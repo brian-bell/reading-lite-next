@@ -306,7 +306,11 @@ func TestAcceptance_ClockDeterminism(t *testing.T) {
 // external (_test) package. Add a justified white-box file to whiteboxAllowed.
 func TestConventions_TestPackagesAreBlackbox(t *testing.T) {
 	root := repoRoot(t)
-	whiteboxAllowed := map[string]bool{}
+	whiteboxAllowed := map[string]bool{
+		// decide and backoff are unexported retry-decision internals; testing them
+		// directly is the right boundary (the plan names this file specifically).
+		"internal/dispatch/decide_test.go": true,
+	}
 
 	var violations []string
 	for _, path := range goFiles(t, root, true) {
