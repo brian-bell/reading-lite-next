@@ -146,12 +146,28 @@ func rawDOMTier(r fetch.Resource) (Article, bool) {
 	return a, sufficient(md)
 }
 
-// rawOnlyTier is the floor: it collects every text node from the parsed body,
+// rawOnlyTier is the floor: it collects every text node from the parsed <body>,
 // including script/style raw-text bodies, so even a JS-only or near-binary page
 // yields something. It always succeeds.
+//
+// Body text is the content; title/lang are read from the document as metadata —
+// like rawDOMTier — so a salvaged page still carries its <title>/<html lang> even
+// though head text is excluded from the body content and the word count. (The
+// caller's empty-content guard keys on WordCount, which stays body-only, so a
+// page with only a <title> and an empty body still fails permanently.)
 func rawOnlyTier(r fetch.Resource) Article {
-	text := rawText(r.Body)
+	doc, err := html.Parse(bytes.NewReader(r.Body))
+	if err != nil {
+		// html.Parse does not error on a byte slice, but if that ever changes,
+		// fall back to the collapsed raw bytes so the floor still yields text.
+		text := collapseSpaces(string(r.Body))
+		return Article{Markdown: text, Mode: ModeRawOnly, WordCount: wordCount(text)}
+	}
+
+	text := bodyText(doc)
 	return Article{
+		Title:     documentTitle(doc),
+		Lang:      documentLang(doc),
 		Markdown:  text,
 		Mode:      ModeRawOnly,
 		WordCount: wordCount(text),
@@ -182,9 +198,9 @@ func wordCount(s string) int {
 	return len(strings.Fields(s))
 }
 
-// rawText collects every text node from the parsed document's <body> and
-// collapses whitespace. It walks script/style raw-text bodies too, so a JS-only
-// or near-binary page still yields its text. Unlike a hand-rolled tag stripper it
+// bodyText collects every text node from the document's <body> and collapses
+// whitespace. It walks script/style raw-text bodies too, so a JS-only or
+// near-binary page still yields its text. Unlike a hand-rolled tag stripper it
 // relies on the HTML tokenizer, which preserves literal '<'/'>' inside raw-text
 // elements and free text (e.g. `for (i < n)`), so the floor does not mangle the
 // JS-heavy pages it exists to salvage.
@@ -192,15 +208,8 @@ func wordCount(s string) int {
 // It walks only the <body>, not <head>: head text (a <title>, meta) is page
 // metadata, not article content, so a bodyless page yields no words and the
 // caller's empty-content guard fails it permanently instead of marking it ready
-// with just its title.
-func rawText(body []byte) string {
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		// html.Parse does not error on a byte slice, but if that ever changes,
-		// fall back to the collapsed raw bytes so the floor still yields text.
-		return strings.Join(strings.Fields(string(body)), " ")
-	}
-
+// with just its title. (Title/lang are still surfaced as metadata by the caller.)
+func bodyText(doc *html.Node) string {
 	root := bodyNode(doc)
 	if root == nil {
 		// html.Parse always synthesizes a <body>; if some future input does not,
@@ -220,7 +229,12 @@ func rawText(body []byte) string {
 		}
 	}
 	walk(root)
-	return strings.Join(strings.Fields(b.String()), " ")
+	return collapseSpaces(b.String())
+}
+
+// collapseSpaces trims and collapses all runs of whitespace to single spaces.
+func collapseSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // bodyNode returns the document's <body> element, or nil if there is none.

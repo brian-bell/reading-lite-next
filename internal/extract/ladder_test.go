@@ -5,7 +5,12 @@ package extract
 // touching the HTML libraries, so the selection contract is pinned independently
 // of go-readability / html-to-markdown behavior.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"golang.org/x/net/html"
+)
 
 func TestSelectTier_FirstSufficientWins(t *testing.T) {
 	t.Parallel()
@@ -89,7 +94,7 @@ func TestWordCount_CountsFields(t *testing.T) {
 	}
 }
 
-func TestRawText_KeepsTextStripsTags(t *testing.T) {
+func TestBodyText_KeepsTextStripsTags(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -110,12 +115,18 @@ func TestRawText_KeepsTextStripsTags(t *testing.T) {
 		{"keeps angle brackets in script", "<body><script>for (i = 0; i < n; i++) {}</script></body>", "for (i = 0; i < n; i++) {}"},
 		{"keeps angle brackets in style", "<body><style>a < b { color: red }</style></body>", "a < b { color: red }"},
 		{"keeps free-text comparison", "price > 5 and qty < 3", "price > 5 and qty < 3"},
+		// Head text is metadata, not content: a <title> is excluded from body text.
+		{"skips head title", "<html><head><title>Login</title></head><body>real content</body></html>", "real content"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			if got := rawText([]byte(c.in)); got != c.want {
-				t.Fatalf("rawText(%q) = %q, want %q", c.in, got, c.want)
+			doc, err := html.Parse(strings.NewReader(c.in))
+			if err != nil {
+				t.Fatalf("parse %q: %v", c.in, err)
+			}
+			if got := bodyText(doc); got != c.want {
+				t.Fatalf("bodyText(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

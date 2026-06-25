@@ -157,6 +157,14 @@ func TestReadability_RawOnly(t *testing.T) {
 			t.Errorf("raw_only text still contains the tag %q: %q", tag, got.Markdown)
 		}
 	}
+	// Head metadata is surfaced even though it is excluded from the body content:
+	// the floor still carries the page's <title>/<html lang>.
+	if got.Title != "App" {
+		t.Errorf("Title = %q, want the <title> preserved as metadata", got.Title)
+	}
+	if got.Lang != "en" {
+		t.Errorf("Lang = %q, want en", got.Lang)
+	}
 }
 
 func TestReadability_EmptyBodyIsPermanentError(t *testing.T) {
