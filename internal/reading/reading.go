@@ -2,6 +2,7 @@
 package reading
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -36,6 +37,12 @@ type Reading struct {
 	RawKey string `json:"raw_key,omitempty"`
 	// Summary is the generated human-readable summary.
 	Summary string `json:"summary,omitempty"`
+	// SummaryJSON is the raw structured summarizer payload (emit_reading output).
+	SummaryJSON json.RawMessage `json:"summary_json,omitempty"`
+	// SimilarJSON is the snapshot of similar readings found by vector search.
+	SimilarJSON json.RawMessage `json:"similar_json,omitempty"`
+	// DiagnosticsJSON records per-step pipeline diagnostics (tiers, outcomes).
+	DiagnosticsJSON json.RawMessage `json:"diagnostics_json,omitempty"`
 	// Error is the persisted processing error for failed readings.
 	Error string `json:"error,omitempty"`
 	// StaleReason is a read-time annotation for stale pending or running readings.

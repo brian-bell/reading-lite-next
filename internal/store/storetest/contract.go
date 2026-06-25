@@ -3,6 +3,7 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -404,6 +405,125 @@ func RunContract(t *testing.T, newStore Factory) {
 		}
 	})
 
+	t.Run("SaveReadingPersistsJSON", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s := newStore(t)
+		r := sampleReading("r1", "https://example.com/one", at(1), reading.Ready)
+		r.SummaryJSON = []byte(`{"tags":["go"]}`)
+		r.SimilarJSON = []byte(`[{"id":"r2","score":0.5}]`)
+		r.DiagnosticsJSON = []byte(`{"source":"web"}`)
+
+		if err := s.SaveReading(ctx, r); err != nil {
+			t.Fatalf("SaveReading: %v", err)
+		}
+		got, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+
+		// Both backends must round-trip the JSON columns set at save time, so the
+		// fake and Postgres satisfy the same data contract.
+		assertJSONEqual(t, "SummaryJSON", r.SummaryJSON, got.SummaryJSON)
+		assertJSONEqual(t, "SimilarJSON", r.SimilarJSON, got.SimilarJSON)
+		assertJSONEqual(t, "DiagnosticsJSON", r.DiagnosticsJSON, got.DiagnosticsJSON)
+	})
+
+	t.Run("UpdateContent", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s := newStore(t)
+		r := sampleReading("r1", "https://example.com/one", at(1), reading.Running)
+		startedAt := at(2)
+		r.StartedAt = &startedAt
+		r.ProcessAttempts = 1
+		r.Error = "transient"
+		r.Tags = []string{"keep"}
+		seed(ctx, t, s, r)
+
+		updatedAt := at(5)
+		fields := store.ContentFields{
+			Now:             updatedAt,
+			Title:           "Extracted title",
+			Author:          "Ada",
+			Site:            "example.com",
+			Lang:            "en",
+			WordCount:       1234,
+			ExtractionMode:  "readability",
+			ContentKey:      "readings/r1/content",
+			RawKey:          "readings/r1/raw",
+			Summary:         "A concise summary.",
+			SummaryJSON:     []byte(`{"tags":["go"]}`),
+			SimilarJSON:     []byte(`[{"id":"r2","score":0.9}]`),
+			DiagnosticsJSON: []byte(`{"source":"web"}`),
+		}
+		if err := s.UpdateContent(ctx, r.ID, fields); err != nil {
+			t.Fatalf("UpdateContent: %v", err)
+		}
+
+		got, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+
+		if got.Title != fields.Title || got.Author != fields.Author || got.Site != fields.Site || got.Lang != fields.Lang {
+			t.Fatalf("content text fields = %q/%q/%q/%q, want %q/%q/%q/%q",
+				got.Title, got.Author, got.Site, got.Lang, fields.Title, fields.Author, fields.Site, fields.Lang)
+		}
+		if got.WordCount != fields.WordCount || got.ExtractionMode != fields.ExtractionMode {
+			t.Fatalf("word_count/extraction_mode = %d/%q, want %d/%q", got.WordCount, got.ExtractionMode, fields.WordCount, fields.ExtractionMode)
+		}
+		if got.ContentKey != fields.ContentKey || got.RawKey != fields.RawKey || got.Summary != fields.Summary {
+			t.Fatalf("keys/summary = %q/%q/%q, want %q/%q/%q", got.ContentKey, got.RawKey, got.Summary, fields.ContentKey, fields.RawKey, fields.Summary)
+		}
+		// Compare JSON semantically: a jsonb-backed adapter canonicalizes whitespace
+		// and key order on read, so byte equality is not a valid cross-backend check.
+		assertJSONEqual(t, "SummaryJSON", fields.SummaryJSON, got.SummaryJSON)
+		assertJSONEqual(t, "SimilarJSON", fields.SimilarJSON, got.SimilarJSON)
+		assertJSONEqual(t, "DiagnosticsJSON", fields.DiagnosticsJSON, got.DiagnosticsJSON)
+		if !got.UpdatedAt.Equal(updatedAt) {
+			t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, updatedAt)
+		}
+
+		// UpdateContent must not disturb lifecycle status, timestamps, error,
+		// attempt count, or tags — those belong to UpdateStatus/ReplaceTags.
+		if got.Status != reading.Running {
+			t.Fatalf("Status = %q, want unchanged running", got.Status)
+		}
+		if got.StartedAt == nil || !got.StartedAt.Equal(startedAt) {
+			t.Fatalf("StartedAt = %v, want unchanged %v", got.StartedAt, startedAt)
+		}
+		if got.ProcessAttempts != 1 {
+			t.Fatalf("ProcessAttempts = %d, want unchanged 1", got.ProcessAttempts)
+		}
+		if got.Error != "transient" {
+			t.Fatalf("Error = %q, want unchanged 'transient'", got.Error)
+		}
+		if !slices.Equal(got.Tags, []string{"keep"}) {
+			t.Fatalf("Tags = %v, want unchanged [keep]", got.Tags)
+		}
+
+		// Mutating the caller's JSON slices after the write must not corrupt the
+		// stored value (the store must copy in, like SaveReading/the read path).
+		fields.SummaryJSON[0] = 'X'
+		fields.SimilarJSON[0] = 'X'
+		fields.DiagnosticsJSON[0] = 'X'
+		afterMutate, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID after caller mutation: %v", err)
+		}
+		assertJSONEqual(t, "SummaryJSON after caller mutation", []byte(`{"tags":["go"]}`), afterMutate.SummaryJSON)
+
+		// Use a fresh, valid value here: the slices above were mutated to invalid
+		// JSON to prove the defensive copy, and a jsonb-backed adapter binds the
+		// parameters before it can report the missing row.
+		if err := s.UpdateContent(ctx, "missing", store.ContentFields{Now: updatedAt}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("UpdateContent missing error = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("ReplaceTags", func(t *testing.T) {
 		t.Parallel()
 
@@ -540,6 +660,23 @@ func RunContract(t *testing.T, newStore Factory) {
 			t.Fatalf("stored StartedAt mutated through returned pointer: %v, want %v", again.StartedAt, startedAt)
 		}
 	})
+}
+
+// assertJSONEqual compares two JSON payloads by decoded value, tolerating the
+// whitespace/key-order canonicalization a jsonb-backed adapter applies on read.
+func assertJSONEqual(t *testing.T, label string, want, got json.RawMessage) {
+	t.Helper()
+
+	var wantVal, gotVal any
+	if err := json.Unmarshal(want, &wantVal); err != nil {
+		t.Fatalf("%s: unmarshal want %q: %v", label, want, err)
+	}
+	if err := json.Unmarshal(got, &gotVal); err != nil {
+		t.Fatalf("%s: unmarshal got %q: %v", label, got, err)
+	}
+	if diff := cmp.Diff(wantVal, gotVal); diff != "" {
+		t.Fatalf("%s mismatch (-want +got):\n%s", label, diff)
+	}
 }
 
 func assertOrder(t *testing.T, s store.Store, sort store.SortMode, want []string) {
