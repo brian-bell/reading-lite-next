@@ -1,10 +1,12 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 3 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 4 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
-readings metadata store behind a shared conformance suite, and the in-process dispatcher
-with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep.
+readings metadata store behind a shared conformance suite, the in-process dispatcher
+with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
+and the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summarize`,
+`notify`, `blobs`) with their in-memory fakes — no real network/SDK code yet.
 
 ## Structure
 
@@ -26,6 +28,16 @@ with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recove
   drains an in-memory channel and persists each run's lifecycle outcome, and a startup
   `Sweep` that re-dispatches readings left non-terminal by a crash, resuming each at its
   stored attempt count.
+- `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
+  `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
+  `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
+  `extract` consumes a `fetch.Resource`; the production HTTP/SDK adapters land in later phases.
+- `internal/blobs/` defines the `Blobs` content-blob port and `blobs.Memory`, an in-memory
+  store of raw and extracted payloads keyed by server-derived key.
+- `internal/vector/` defines the `Index` similarity port (the VectorIndex port; renamed from
+  `VectorIndex` to avoid a revive stutter), `vector.Memory` (a real cosine-similarity index),
+  and `vectortest.RunContract` — the backend-neutral suite both `vector.Memory` and the future
+  pgvector adapter must satisfy.
 - `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -65,7 +77,12 @@ The project targets Go 1.26.
   read them.
 - Keep integration tests behind `//go:build integration`.
 - Add store behavior to `internal/store/storetest` first, then make `store.Memory` and
-  `store.Postgres` satisfy the same contract.
+  `store.Postgres` satisfy the same contract. Likewise, add vector-index behavior to
+  `internal/vector/vectortest` first, then make `vector.Memory` and the pgvector adapter
+  satisfy it.
+- Scriptable port fakes expose their configured response/error as fields set before use and
+  guard call recording behind a mutex; return defensive copies so callers cannot corrupt the
+  script.
 - Keep retry/backoff logic in pure functions (`dispatch.decide`, `dispatch.Classify`) and run
   delays through the injected `dispatch.Delayer` seam so retry, backoff, rate-limit, and
   recovery semantics test deterministically without real goroutines, timers, or sleeps.
