@@ -21,10 +21,13 @@ package acceptance_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,6 +75,14 @@ var (
 	_ notify.Notifier      = (*notify.Fake)(nil)
 	_ vector.Index         = (*vector.Memory)(nil)
 
+	// Phase 6 real adapters: each production adapter satisfies the same port as its fake.
+	_ fetch.Fetcher        = (*fetch.HTTP)(nil)
+	_ embed.Embedder       = (*embed.OpenAI)(nil)
+	_ summarize.Summarizer = (*summarize.Anthropic)(nil)
+	_ notify.Notifier      = (*notify.Resend)(nil)
+	_ vector.Index         = (*vector.Postgres)(nil)
+	_ blobs.Blobs          = (*blobs.R2)(nil)
+
 	// Phase 5 pipeline: the memory store satisfies the pipeline's narrow Store
 	// port, and Pipeline.Process has the dispatcher's Handler signature.
 	_ pipeline.Store                                = (*store.Memory)(nil)
@@ -97,10 +108,12 @@ func TestStaticAnalysis_GoVet(t *testing.T) {
 }
 
 func TestStaticAnalysis_GoVetIntegrationTag(t *testing.T) {
-	// Proves the integration-tagged store tests still compile (plan step A5).
+	// Proves every integration-tagged test still compiles under the integration
+	// build tag (plan step A5): the store contract, the Phase 6 vector.Postgres
+	// contract, and the Phase 6 blobs.R2 MinIO round-trip.
 	root, goBin := repoRoot(t), goBin(t)
-	if out, err := runTool(t, root, goBin, "vet", "-tags", "integration", "./internal/store/"); err != nil {
-		t.Fatalf("go vet -tags integration ./internal/store/ failed: %v\n%s", err, out)
+	if out, err := runTool(t, root, goBin, "vet", "-tags", "integration", "./..."); err != nil {
+		t.Fatalf("go vet -tags integration ./... failed: %v\n%s", err, out)
 	}
 }
 
@@ -731,6 +744,104 @@ func pipelineUnitVec() []float32 {
 	v := make([]float32, embed.Dim)
 	v[0] = 1
 	return v
+}
+
+// TestAcceptance_RealAdapters proves the Phase 6 production HTTP adapters through
+// their public surfaces against httptest upstreams (PLAN §8): each composes the
+// right request and maps an upstream failure to the SAME dispatch.Classify outcome
+// the pipeline relies on, so the dispatcher and pipeline route real-world failures
+// identically. The DB/object-store adapters (vector.Postgres, blobs.R2) carry no
+// httptest surface — they are proven by their own contract / round-trip suites
+// under -tags integration, plus the compile-time port conformance above.
+func TestAcceptance_RealAdapters(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("EmbedClassifiesUpstreamErrors", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			status  int
+			header  http.Header
+			outcome dispatch.Outcome
+		}{
+			{"rate limit requeues", http.StatusTooManyRequests, http.Header{"Retry-After": {"30"}}, dispatch.Requeue},
+			{"client error fails", http.StatusBadRequest, nil, dispatch.Fail},
+			{"server error retries", http.StatusBadGateway, nil, dispatch.Retry},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					for k, vs := range c.header {
+						for _, v := range vs {
+							w.Header().Set(k, v)
+						}
+					}
+					w.WriteHeader(c.status)
+				}))
+				defer srv.Close()
+
+				_, err := embed.NewOpenAI("k", embed.WithBaseURL(srv.URL)).Embed(ctx, "x")
+				if got := dispatch.Classify(err).Outcome; got != c.outcome {
+					t.Fatalf("Classify(embed %d) = %v, want %v", c.status, got, c.outcome)
+				}
+			})
+		}
+	})
+
+	t.Run("SummarizeForcedToolUse", func(t *testing.T) {
+		var forced bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				ToolChoice struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				} `json:"tool_choice"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			forced = body.ToolChoice.Type == "tool" && body.ToolChoice.Name == "emit_reading"
+			_, _ = w.Write([]byte(`{"content":[{"type":"tool_use","name":"emit_reading","input":{"title":"T","summary":"S","tags":["go"]}}]}`))
+		}))
+		defer srv.Close()
+
+		out, err := summarize.NewAnthropic("k", summarize.WithBaseURL(srv.URL)).Summarize(ctx, summarize.SummaryInput{Markdown: "body"})
+		if err != nil {
+			t.Fatalf("Summarize: %v", err)
+		}
+		if !forced {
+			t.Fatal("request did not force emit_reading tool use")
+		}
+		if out.Title != "T" || out.Summary != "S" || len(out.Tags) != 1 {
+			t.Fatalf("summary = %+v, want fields parsed from the tool_use input", out)
+		}
+	})
+
+	t.Run("NotifyErrorIsSwallowable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		if err := notify.NewResend("k", notify.WithBaseURL(srv.URL)).Notify(ctx, notify.Email{To: "x@example.com"}); err == nil {
+			t.Fatal("non-2xx notify = nil error, want an error (the pipeline swallows it, but the adapter must report it)")
+		}
+	})
+
+	t.Run("FetchGuardsSchemeAndSize", func(t *testing.T) {
+		if _, err := fetch.NewHTTP().Get(ctx, "ftp://example.com/x"); !errors.Is(err, fetch.ErrUnsupportedScheme) {
+			t.Fatalf("ftp scheme = %v, want ErrUnsupportedScheme", err)
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(strings.Repeat("x", 100)))
+		}))
+		defer srv.Close()
+		_, err := fetch.NewHTTP(fetch.WithMaxBytes(10)).Get(ctx, srv.URL)
+		if !errors.Is(err, fetch.ErrBodyTooLarge) {
+			t.Fatalf("oversize body = %v, want ErrBodyTooLarge", err)
+		}
+		// An oversized body is permanent: the dispatcher must fail it, not retry it.
+		if got := dispatch.Classify(err).Outcome; got != dispatch.Fail {
+			t.Fatalf("Classify(oversize body) = %v, want Fail", got)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
