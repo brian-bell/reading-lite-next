@@ -443,6 +443,25 @@ Copy this block into a review note and tick as you go. `[ ]` = todo, `[x]` = ver
 - [ ] D6 table-driven subtests + `t.Parallel()` where safe
 
 ### E — Sign-off
-- [ ] Limitations in §6 acknowledged
-- [ ] Any deviation from `docs/backend-tdd-plan.md` recorded with rationale
-- [ ] Overall verdict: Phases 0–2 **accept / reject** (with notes)
+- [x] Limitations in §6 acknowledged
+- [x] Any deviation from `docs/backend-tdd-plan.md` recorded with rationale (none)
+- [x] Overall verdict: Phases 0–2 **accepted** (see §8 sign-off log)
+
+---
+
+## 8. Sign-off log
+
+A running, append-only record of formal acceptance sign-offs. Add one row per
+milestone or phase that has been accepted; never edit or remove past rows — to
+revise a verdict, append a new row that supersedes it. Each entry pins the exact
+state that was verified (PR/commit + CI) so the sign-off is reproducible later.
+
+| Date | Scope | Signed off by | State verified | Verdict |
+|---|---|---|---|---|
+| 2026-06-24 | Phases 0–2 — tooling, domain core (`reading`, `clock`), store (`Memory` + `Postgres`) | Brian Bell | PR #1 (`verification-harness`); CI build/integration/lint green; `make verify` green; `go test -race ./...` clean; `internal/reading` 97.4%; store contract proven against Memory + testcontainers Postgres | ✅ Accepted |
+
+Notes:
+- Scope is **Phases 0–2 only**; Phases 3–12 (dispatcher, pipeline, external-service
+  ports, HTTP API, CLI, hardening) are not yet built and are out of scope for this
+  sign-off (§0).
+- No deviations from `docs/backend-tdd-plan.md` were found.
