@@ -1,19 +1,23 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 6 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 7 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
 the external-service ports (`fetch`, `extract`, `embed`, `vector`, `summarize`,
 `notify`, `blobs`) with their in-memory fakes, the processing pipeline that wires
-them together (fetch→extract→blobs→embed→vector→summarize→notify), and the real
+them together (fetch→extract→blobs→embed→vector→summarize→notify), the real
 production adapters behind those ports — `fetch.HTTP`, `embed.OpenAI`,
 `summarize.Anthropic` (forced `emit_reading` tool use), `notify.Resend`, `vector.Postgres`
 (pgvector), and `blobs.R2` (S3-compatible) — each pinned by a contract test (`httptest`
 upstreams for the HTTP adapters; testcontainers Postgres/MinIO under `//go:build integration`
-for the DB/object-store adapters). The extraction internals (Phase 7), HTTP API, and `main`
-wiring are still pending: nothing constructs these adapters from `main` yet.
+for the DB/object-store adapters), and the extraction internals — `extract.Readability`
+(the readability→raw_dom→raw_only salvage ladder over go-readability + html-to-markdown,
+fixture- and golden-driven), the `extract.YouTube` oEmbed floor (title/author) with a
+best-effort timed-text transcript, and the canonical `extract.RedditGuidance` constant.
+The HTTP API and `main` wiring are still pending: nothing constructs these adapters from
+`main` yet.
 
 ## Structure
 
@@ -41,19 +45,32 @@ wiring are still pending: nothing constructs these adapters from `main` yet.
 - `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
   `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
-  `extract` consumes a `fetch.Resource`. Each (except `extract`, whose readability adapter is
-  Phase 7) now also ships its real adapter: `fetch.HTTP` (UA, timeout, body-size cap,
-  redirect→`FinalURL`, non-http(s) scheme rejection, and a 429→`dispatch.RateLimitError`
-  requeue — the private-IP SSRF guard is deferred to Phase 11), `embed.OpenAI`
-  (`/v1/embeddings`, `text-embedding-3-small`), `summarize.Anthropic`
+  `extract` consumes a `fetch.Resource`. Each now also ships its real adapter: `fetch.HTTP`
+  (UA, timeout, body-size cap, redirect→`FinalURL`, non-http(s) scheme rejection, and a
+  429→`dispatch.RateLimitError` requeue — the private-IP SSRF guard is deferred to Phase 11),
+  `embed.OpenAI` (`/v1/embeddings`, `text-embedding-3-small`), `summarize.Anthropic`
   (Messages API with forced `emit_reading` tool use), and `notify.Resend` (`/emails`). The HTTP
   adapters take a `WithBaseURL` option so a contract test can point them at an `httptest`
   upstream, and classify upstream failures through `internal/httpx`.
+- `internal/extract/` additionally holds the Phase 7 extraction internals. `extract.Readability`
+  is the production `Extractor`: a three-tier salvage ladder over fetched HTML — `readability`
+  (go-readability when the page is readerable, then html-to-markdown), `raw_dom` (whole-DOM
+  markdown salvage when it is not), and the `raw_only` floor (every text node — script/style
+  included — collected from the parsed body; a contentless body fails the extraction
+  permanently) — each tier carrying the matching `extract.Mode`. The ladder ordering and the
+  sufficiency gate live in the pure, white-box-tested `selectTier`/`sufficient` helpers, kept
+  separate from the HTML libraries; the tiers are pinned by HTML fixtures + golden markdown in
+  `internal/extract/testdata/` (regenerate with `go test ./internal/extract -run TestReadability
+  -update`). `extract.YouTube` is a separate oEmbed client (not an `Extractor`, since it takes a
+  video URL and makes its own requests): it fetches the title/author floor from `/oembed`,
+  folds in a best-effort `/api/timedtext` transcript, reports `ModeRawOnly`, and classifies an
+  oEmbed failure through `internal/httpx`. `extract.RedditGuidance` is the canonical
+  operator-facing message for the unfetchable Reddit source; the pipeline reuses it.
 - `internal/httpx/` holds helpers shared by the HTTP service adapters: `ClassifyResponse` maps a
   non-2xx response to a dispatcher-classified error (429 → `dispatch.RateLimitError` honoring
   `Retry-After`, other 4xx → `dispatch.ErrPermanent`, 5xx → transient), and `RetryAfter` parses
-  the header. This keeps `embed.OpenAI` and `summarize.Anthropic` error semantics identical to
-  `dispatch.Classify`.
+  the header. This keeps `embed.OpenAI`, `summarize.Anthropic`, and `extract.YouTube`'s oEmbed
+  error semantics identical to `dispatch.Classify`.
 - `internal/blobs/` defines the `Blobs` content-blob port, `blobs.Memory` (in-memory), and
   `blobs.R2` — the production S3-compatible adapter (aws-sdk-go-v2, path-style, custom endpoint;
   maps a missing key to `blobs.ErrNotFound`). `R2` is exercised by an `httptest` S3 stub
@@ -65,7 +82,7 @@ wiring are still pending: nothing constructs these adapters from `main` yet.
   (`vector.Memory` on every run, `vector.Postgres` under `//go:build integration`).
 - `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
   `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
-  Reddit fails permanently with guidance; everything else fetches + extracts), embeds and
+  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches + extracts), embeds and
   upserts a vector, snapshots similar readings, summarizes once, optionally notifies
   (a notify failure never fails the reading), and persists the content via `store.UpdateContent`
   + `ReplaceTags`. It returns a `dispatch.Result` (the dispatcher owns lifecycle status; the
@@ -128,6 +145,11 @@ The project targets Go 1.26.
 - Keep retry/backoff logic in pure functions (`dispatch.decide`, `dispatch.Classify`) and run
   delays through the injected `dispatch.Delayer` seam so retry, backoff, rate-limit, and
   recovery semantics test deterministically without real goroutines, timers, or sleeps.
+- Keep the extraction tier selection (`extract.selectTier`/`sufficient`) pure and white-box
+  tested, separate from the HTML libraries, and pin each tier with an HTML fixture + golden
+  markdown under `internal/extract/testdata/` (regenerate goldens with `-update`). Justified
+  white-box test files (`decide_test.go`, `ladder_test.go`) are listed in the acceptance
+  harness's `whiteboxAllowed` allowlist; every other `_test.go` stays a black-box `_test` package.
 - Keep the pipeline's status/content split: the dispatcher owns lifecycle status (it marks
   running/ready/failed/pending), the pipeline owns content. `Pipeline.Process` maps step errors
   to outcomes through the shared `dispatch.Classify`, and persists a content checkpoint before

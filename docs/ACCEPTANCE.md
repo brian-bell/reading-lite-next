@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–6)
+# reading-lite — Manual Verification Plan (Phases 0–7)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -31,7 +31,11 @@
 > `summarize.Anthropic`, `notify.Resend`) against `httptest` upstreams — proving request
 > shape, the forced `emit_reading` tool path, and that upstream errors classify through
 > `dispatch.Classify` — and compile-time `var _ Port = (*Adapter)(nil)` assertions pin every
-> production adapter to its port. Tool- and
+> production adapter to its port. The Phase 7 extraction internals (C13) are automated as well:
+> `TestAcceptance_Extraction` drives `extract.Readability` over inline HTML to prove the
+> readability→raw_dom→raw_only tier selection, drives `extract.YouTube` against an `httptest`
+> oEmbed upstream for the title/author floor (with its 404→`Fail` classification), and asserts
+> the canonical `extract.RedditGuidance` is the one string the pipeline reuses. Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
@@ -44,8 +48,10 @@
 The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core),
 **Phase 2** (readings metadata store), **Phase 3** (in-process dispatcher),
 **Phase 4** (external-service ports & in-memory fakes), **Phase 5** (the
-processing pipeline, fakes only), and **Phase 6** (the real production adapters
-behind the Phase 4 ports, contract-tested via `httptest`/testcontainers):
+processing pipeline, fakes only), **Phase 6** (the real production adapters
+behind the Phase 4 ports, contract-tested via `httptest`/testcontainers), and
+**Phase 7** (the extraction internals: the readability tier ladder, the YouTube
+oEmbed client, and the Reddit guidance, fixture- and contract-tested):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -76,6 +82,10 @@ behind the Phase 4 ports, contract-tested via `httptest`/testcontainers):
 | Shared HTTP error classification (`ClassifyResponse`/`RetryAfter`) | `internal/httpx/httpx.go` | 6 |
 | pgvector similarity adapter | `internal/vector/postgres.go` | 6 |
 | R2/S3 blob adapter (aws-sdk-go-v2) | `internal/blobs/r2.go` | 6 |
+| Readability tier ladder (`Extractor`) + pure tier selection | `internal/extract/readability.go` | 7 |
+| YouTube oEmbed floor + best-effort transcript client | `internal/extract/youtube.go` | 7 |
+| Reddit guidance constant | `internal/extract/reddit.go` | 7 |
+| Extraction HTML fixtures + golden markdown | `internal/extract/testdata/` | 7 |
 
 ### Out of scope (do not expect these to work yet)
 
@@ -88,10 +98,14 @@ adapter from `main` yet (that lands with the HTTP API and `main` lifecycle in Ph
 The Phase 5 pipeline still drives the ports through their in-memory fakes in tests; the real
 adapters are exercised only by their own contract tests (`httptest` upstreams, and
 testcontainers Postgres/MinIO under `//go:build integration`).
-The remaining Phases 7–12 are **not** implemented: the extraction internals and salvage tiers
-(Phase 7), the HTTP API, the operator CLI subcommands, config loading, and observability.
-`reader-api` and `readerctl` are intentionally empty `main(){}` placeholders. Verifying "the
-service runs and ingests a URL" is **premature** and not part of this plan.
+The Phase 7 extraction internals (`extract.Readability`, `extract.YouTube`, `extract.RedditGuidance`)
+now exist and are contract-/fixture-tested (C13), but, like the Phase 6 adapters, are **not yet
+wired into the binaries** — nothing constructs `extract.Readability` from `main` or routes a
+YouTube URL through `extract.YouTube` yet (that lands with the HTTP API and `main` lifecycle).
+The remaining Phases 8–12 are **not** implemented: the HTTP API, the operator CLI subcommands,
+config loading, and observability. `reader-api` and `readerctl` are intentionally empty
+`main(){}` placeholders. Verifying "the service runs and ingests a URL" is **premature** and not
+part of this plan.
 
 ---
 
@@ -549,8 +563,8 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
   one summarizer call and one notify.
 - [ ] **Extraction tiers thread through.** `TestPipeline_ExtractionFallback` (raw_dom, raw_only):
   the pipeline records whatever `Article.Mode` the extractor reports and still embeds +
-  summarizes the salvaged text to ready. (The tier *ladder* itself lives in the Phase 7
-  extractor adapter; Phase 5 only threads the mode.)
+  summarizes the salvaged text to ready. (The tier *ladder* itself lives in the `extract.Readability`
+  adapter — see C13; Phase 5 only threads the mode.)
 - [ ] **Source special-casing.** `TestPipeline_Reddit_FailsWithGuidance` (no fetch; permanent
   `Fail`; error contains `pipeline.RedditGuidance`), `TestPipeline_Markdown_SkipsFetchExtract`
   (fetcher + extractor uncalled; body read from the stored blob; still embeds/summarizes), and
@@ -577,11 +591,10 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
 
 ### C12. Phase 6 — real adapters (`internal/{fetch,embed,summarize,notify,vector,blobs}`, `internal/httpx`)
 
-Phase 6 implements the production adapter behind each Phase 4 port (except `extract`, whose
-readability adapter is Phase 7) and verifies each against a faithful upstream — `httptest` for
-the HTTP adapters, testcontainers for the DB/object-store adapters — with **no live network**.
-Read each adapter against TDD plan §8 and confirm the request shape, the happy parse, and the
-error mapping.
+Phase 6 implements the production adapter behind each Phase 4 port (the `extract` adapters are
+Phase 7 — see C13) and verifies each against a faithful upstream — `httptest` for the HTTP
+adapters, testcontainers for the DB/object-store adapters — with **no live network**. Read each
+adapter against TDD plan §8 and confirm the request shape, the happy parse, and the error mapping.
 
 - [ ] `go test -race ./internal/fetch/ ./internal/embed/ ./internal/summarize/ ./internal/notify/
   ./internal/blobs/ ./internal/httpx/` passes clean (the HTTP adapters' contract tests run in the
@@ -627,9 +640,54 @@ error mapping.
   `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
   `vector.Postgres`/`blobs.R2` integration tests always compile.
 
-> Note: these adapters are not yet wired into `main` (Phase 8/11), and `extract.Readability` is
-> Phase 7. Do not flag either as a gap. New runtime dependency: `aws-sdk-go-v2` (S3 client) for
-> `blobs.R2`; the HTTP adapters are stdlib-only.
+> Note: these adapters are not yet wired into `main` (Phase 8/11). Do not flag that as a gap.
+> New runtime dependency: `aws-sdk-go-v2` (S3 client) for `blobs.R2`; the HTTP adapters are
+> stdlib-only.
+
+### C13. Phase 7 — extraction internals (`internal/extract/`)
+
+Phase 7 implements the real `extract.Readability` tier ladder, the `extract.YouTube` oEmbed
+client, and the canonical `extract.RedditGuidance`, fixture- and contract-tested with **no live
+network**. Read each against TDD plan §9 and confirm the tier selection, the oEmbed floor, and
+the source guidance.
+
+- [ ] `go test -race ./internal/extract/` passes clean, and `go test -cover` reports the package
+  ≥ 75% (PLAN §2 adapter gate).
+- [ ] **Tier ladder (`extract.Readability`).** A three-tier salvage ladder over fetched HTML:
+  `readability` (go-readability when `Check` reports the page readerable, then html-to-markdown),
+  `raw_dom` (whole-DOM markdown salvage when it is not), and the `raw_only` floor (every text node,
+  script/style bodies included, collected from the parsed body; a contentless body fails the
+  extraction permanently — `dispatch.ErrPermanent`). Each tier carries the matching `extract.Mode`.
+  Tests: `TestReadability_ExtractsArticle` (a blog fixture → title/author/`mode=readability`, body
+  matched against committed golden markdown), `TestReadability_RawDOMSalvage` (a comment/sidebar
+  page that defeats readability → `raw_dom`), `TestReadability_RawOnly` (a JS-only SPA shell →
+  `raw_only`, keeping the script body verbatim including its bare `<`), and
+  `TestReadability_EmptyBodyIsPermanentError`.
+- [ ] **Pure tier selection.** `selectTier`/`sufficient`/`rawText` are tested white-box
+  (`ladder_test.go`), separately from the HTML libraries: first-sufficient-tier wins, the floor is
+  always accepted, and a later tier is never evaluated after an earlier one succeeds (PLAN §9
+  "tier selection logic pure and separately tested").
+- [ ] **YouTube oEmbed floor (`extract.YouTube`).** Fetches `/oembed?url=…&format=json` for the
+  title/author floor, folds in a best-effort `/api/timedtext` transcript (a transcript failure is
+  swallowed — the floor stands), reports `ModeRawOnly`, and classifies an oEmbed failure through
+  `internal/httpx` (404 → permanent). It is **not** an `Extractor` (it takes a video URL and makes
+  its own requests). Tests: `TestYouTube_OEmbed` (transcript-present and -absent variants),
+  `TestYouTube_OEmbedErrorIsPermanent`.
+- [ ] **Reddit guidance.** `extract.RedditGuidance` is the canonical operator-facing message for the
+  unfetchable Reddit source; `pipeline.RedditGuidance` aliases it (one source of truth). Test:
+  `TestReddit_Guidance` (the classifier routes Reddit host variants to `SourceReddit` and the exact
+  string is stable).
+- [ ] **Determinism.** Golden markdown lives in `internal/extract/testdata/`; regenerate with
+  `go test ./internal/extract -run TestReadability -update`. Re-running without `-update` must stay
+  green (tiers deterministic across runs).
+- [ ] **Automated (B/§make verify):** `TestAcceptance_Extraction` re-proves the tier selection over
+  inline HTML, the YouTube oEmbed floor + 404→`Fail` classification through an `httptest` upstream,
+  and that `pipeline.RedditGuidance == extract.RedditGuidance`; a compile-time
+  `var _ extract.Extractor = (*extract.Readability)(nil)` assertion pins the adapter to its port.
+
+> Note: the extractor is not yet constructed from `main` and the pipeline still drives the
+> `extract.Fake`, not `extract.Readability` (that wiring is Phase 8/11). New runtime dependencies:
+> `github.com/go-shiori/go-readability` and `github.com/JohannesKaufmann/html-to-markdown/v2`.
 
 ---
 
@@ -682,12 +740,13 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    `dispatch` 93.0%, `pipeline` 91.5% (B3). The store's 48.8% is a build-tag artifact, not a
    gap. No domain coverage finding is currently open; B4 is the method to use if one reopens.
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
-   dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), and
-   the Phase 6 real adapters (C12) are all complete and verified, but **not yet wired into
-   them**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an
-   adapter from `main` (that lands with the HTTP API and `main` lifecycle in Phases 8/11). The
-   Phase 5 pipeline still drives the ports through their fakes in tests. The HTTP API, config,
-   CLI subcommands, and `extract.Readability` (Phase 7) do not exist yet (Phases 7–12).
+   dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), the
+   Phase 6 real adapters (C12), and the Phase 7 extraction internals (`internal/extract`, C13)
+   are all complete and verified, but **not yet wired into them**: nothing calls
+   `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an adapter / extractor from
+   `main` (that lands with the HTTP API and `main` lifecycle in Phases 8/11). The Phase 5
+   pipeline still drives the ports through their fakes in tests. The HTTP API, config, CLI
+   subcommands, and observability do not exist yet (Phases 8–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
@@ -769,12 +828,18 @@ skipped/blocked (write why).
   integration **and** the harness's pgvector backend), `blobs.R2` (httptest round-trip + MinIO under
   integration); compile-time port conformance + `TestAcceptance_RealAdapters` green; SSRF private-IP
   guard deferred to Phase 11
+- [ ] C13 extraction internals: `extract.Readability` tier ladder selects readability/raw_dom/raw_only
+  by readerability (fixtures + golden markdown), pure `selectTier`/`rawText` white-box tested;
+  `extract.YouTube` oEmbed floor (title/author) + best-effort transcript, 404→Fail via `internal/httpx`;
+  `extract.RedditGuidance` canonical and aliased by `pipeline.RedditGuidance`; ≥75% coverage;
+  compile-time `Extractor` conformance + `TestAcceptance_Extraction` green
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
   `dispatch` retry logic pure + delays through the `Delayer` seam
 - [ ] D2 `internal/reading` stdlib-only (`go list -deps`)
-- [ ] D3 black-box `_test` packages (only `dispatch/decide_test.go` white-box, allow-listed)
+- [ ] D3 black-box `_test` packages (only `dispatch/decide_test.go` and `extract/ladder_test.go`
+  white-box, allow-listed)
 - [ ] D4 integration behind `//go:build integration` only
 - [ ] D5 fakes co-located with ports and race-safe (`clock.Fake`, `store.Memory`, `dispatch.FakeDelayer`)
 - [ ] D6 table-driven subtests + `t.Parallel()` where safe
