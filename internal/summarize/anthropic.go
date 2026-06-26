@@ -18,6 +18,7 @@ import (
 const (
 	anthropicDefaultBaseURL = "https://api.anthropic.com"
 	anthropicMessagesPath   = "/v1/messages"
+	anthropicBatchesPath    = "/v1/messages/batches"
 	anthropicVersion        = "2023-06-01"
 	// Sonnet (not Opus) is the default: summarization is a structured-extraction
 	// task well within Sonnet's reach, and it is the cheaper choice for a personal
@@ -127,17 +128,7 @@ type anthropicResponse struct {
 // Summarize sends the article context to Anthropic with forced emit_reading tool
 // use and returns the structured summary.
 func (a *Anthropic) Summarize(ctx context.Context, in SummaryInput) (Summary, error) {
-	reqBody, err := json.Marshal(anthropicRequest{
-		Model:     a.model,
-		MaxTokens: a.maxTokens,
-		Messages:  []anthropicMessage{{Role: "user", Content: buildPrompt(in)}},
-		Tools: []anthropicTool{{
-			Name:        toolName,
-			Description: "Emit the structured summary of the article as a reading.",
-			InputSchema: emitReadingSchema,
-		}},
-		ToolChoice: anthropicToolChoice{Type: "tool", Name: toolName},
-	})
+	reqBody, err := json.Marshal(a.messageRequest(in))
 	if err != nil {
 		return Summary{}, fmt.Errorf("summarize: marshal request: %w", err)
 	}
@@ -146,9 +137,7 @@ func (a *Anthropic) Summarize(ctx context.Context, in SummaryInput) (Summary, er
 	if err != nil {
 		return Summary{}, fmt.Errorf("summarize: build request: %w", err)
 	}
-	req.Header.Set("x-api-key", a.apiKey)
-	req.Header.Set("anthropic-version", a.version)
-	req.Header.Set("Content-Type", "application/json")
+	a.setHeaders(req)
 
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -165,6 +154,26 @@ func (a *Anthropic) Summarize(ctx context.Context, in SummaryInput) (Summary, er
 		return Summary{}, fmt.Errorf("summarize: decode response: %w", err)
 	}
 	return parseToolUse(parsed)
+}
+
+func (a *Anthropic) messageRequest(in SummaryInput) anthropicRequest {
+	return anthropicRequest{
+		Model:     a.model,
+		MaxTokens: a.maxTokens,
+		Messages:  []anthropicMessage{{Role: "user", Content: buildPrompt(in)}},
+		Tools: []anthropicTool{{
+			Name:        toolName,
+			Description: "Emit the structured summary of the article as a reading.",
+			InputSchema: emitReadingSchema,
+		}},
+		ToolChoice: anthropicToolChoice{Type: "tool", Name: toolName},
+	}
+}
+
+func (a *Anthropic) setHeaders(req *http.Request) {
+	req.Header.Set("x-api-key", a.apiKey)
+	req.Header.Set("anthropic-version", a.version)
+	req.Header.Set("Content-Type", "application/json")
 }
 
 // parseToolUse extracts the emit_reading tool input from the response and maps it

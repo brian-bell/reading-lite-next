@@ -1,7 +1,8 @@
 // Package summarize defines the article-summarization port and an in-memory fake.
 //
 // The production adapter is Anthropic with a forced emit_reading tool call
-// (Phase 6); [Fake] is the scriptable double used by pipeline tests.
+// (Phase 6) and an Anthropic Message Batches client for operator batch workflows;
+// [Fake] is the scriptable double used by pipeline tests.
 package summarize
 
 import (

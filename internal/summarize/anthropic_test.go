@@ -74,8 +74,8 @@ func TestAnthropic_ForcedToolRequestAndParse(t *testing.T) {
 	if gotAPIKey != "test-key" {
 		t.Errorf("x-api-key = %q, want test-key", gotAPIKey)
 	}
-	if gotVersion == "" {
-		t.Errorf("anthropic-version header missing")
+	if gotVersion != "2023-06-01" {
+		t.Errorf("anthropic-version = %q, want 2023-06-01", gotVersion)
 	}
 	if gotPath != "/v1/messages" {
 		t.Errorf("path = %q, want /v1/messages", gotPath)

@@ -90,7 +90,7 @@ core and shared bookmark parser):
 | Processing pipeline (orchestration) | `internal/pipeline/pipeline.go` | 5 |
 | HTTP fetch adapter (UA/timeout/size-cap/redirect/scheme) | `internal/fetch/http.go` | 6 |
 | OpenAI embeddings adapter | `internal/embed/openai.go` | 6 |
-| Anthropic summarizer (forced `emit_reading` tool use) | `internal/summarize/anthropic.go` | 6 |
+| Anthropic summarizer + Message Batches client (forced `emit_reading` tool use) | `internal/summarize/anthropic.go`, `internal/summarize/anthropic_batch.go` | 6 |
 | Resend notification adapter | `internal/notify/resend.go` | 6 |
 | Shared HTTP error classification (`ClassifyResponse`/`RetryAfter`) | `internal/httpx/httpx.go` | 6 |
 | pgvector similarity adapter | `internal/vector/postgres.go` | 6 |
@@ -642,7 +642,11 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
 - [ ] **`summarize.Anthropic`.** POSTs `/v1/messages` with `x-api-key`/`anthropic-version`, a single
   `emit_reading` tool, and `tool_choice={type:tool,name:emit_reading}` (**forced tool use**); parses
   the `tool_use` block's `input` into `Summary` (raw input preserved as `summary_json`). A response
-  missing the tool_use block is an **error**. 429 → `RateLimitError`. Tests: `TestAnthropic_*`.
+  missing the tool_use block is an **error**. It also implements `summarize.BatchClient` for
+  Anthropic Message Batches: create/get/results use the same auth, base URL, HTTP client, and
+  forced-tool request builder; result JSONL is validated by expected `custom_id` and returns
+  `succeeded`, `errored`, `canceled`, and `expired` outcomes in request order. 429 →
+  `RateLimitError`. Tests: `TestAnthropic_*`, `TestAnthropicBatch_*`, `TestParseBatchResults_*`.
 - [ ] **`notify.Resend`.** POSTs `/emails` (`from`/`to`/`subject`/`html`) with `Bearer` auth; any
   non-2xx is an error (the pipeline swallows it — no retry classification needed). Tests: `TestResend_*`.
 - [ ] **`vector.Postgres`** (integration). `Upsert`/`Query`/`Delete` over `reading_vectors`, ranking

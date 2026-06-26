@@ -77,12 +77,13 @@ var (
 	_ vector.Index         = (*vector.Memory)(nil)
 
 	// Phase 6 real adapters: each production adapter satisfies the same port as its fake.
-	_ fetch.Fetcher        = (*fetch.HTTP)(nil)
-	_ embed.Embedder       = (*embed.OpenAI)(nil)
-	_ summarize.Summarizer = (*summarize.Anthropic)(nil)
-	_ notify.Notifier      = (*notify.Resend)(nil)
-	_ vector.Index         = (*vector.Postgres)(nil)
-	_ blobs.Blobs          = (*blobs.R2)(nil)
+	_ fetch.Fetcher         = (*fetch.HTTP)(nil)
+	_ embed.Embedder        = (*embed.OpenAI)(nil)
+	_ summarize.Summarizer  = (*summarize.Anthropic)(nil)
+	_ summarize.BatchClient = (*summarize.Anthropic)(nil)
+	_ notify.Notifier       = (*notify.Resend)(nil)
+	_ vector.Index          = (*vector.Postgres)(nil)
+	_ blobs.Blobs           = (*blobs.R2)(nil)
 
 	// Phase 7 real extractor: the readability tier ladder satisfies the Extractor
 	// port. (extract.YouTube is intentionally not an Extractor — its oEmbed floor

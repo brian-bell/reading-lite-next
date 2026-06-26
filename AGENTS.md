@@ -55,8 +55,9 @@ production config.
   `fetch.HTTP` (user agent, timeout, body-size cap, redirect tracking to `FinalURL`,
   non-http(s) scheme rejection, and a 429 to `dispatch.RateLimitError` requeue),
   `embed.OpenAI` (`/v1/embeddings`, `text-embedding-3-small`),
-  `summarize.Anthropic` (Messages API with forced `emit_reading` tool use), and
-  `notify.Resend` (`/emails`). The HTTP adapters take a `WithBaseURL` option so contract
+  `summarize.Anthropic` (Messages API with forced `emit_reading` tool use, plus a Message
+  Batches client for create/get/results and JSONL result parsing), and `notify.Resend`
+  (`/emails`). The HTTP adapters take `WithBaseURL` and `WithHTTPClient` options so contract
   tests can point them at `httptest` upstreams, and classify upstream failures through
   `internal/httpx`. A private-IP SSRF guard is not implemented in `fetch.HTTP`.
 - `internal/extract/` also holds the extraction internals. `extract.Readability` is the
