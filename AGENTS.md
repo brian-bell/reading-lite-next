@@ -1,7 +1,7 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 8 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 9 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
@@ -20,8 +20,10 @@ HTTP API surface in `internal/httpapi` (health, bearer auth, URL ingest idempote
 markdown/bookmark imports, list/search, detail with read-time stale annotation, content/raw blob
 streaming, reprocess, and the shared JSON error model), and the `internal/readingops`
 command service that owns the multi-resource ingest/import/reprocess workflows behind that
-HTTP surface. `main` wiring is still pending: nothing constructs these adapters or starts the
-HTTP server from `main` yet.
+HTTP surface, plus the Phase 9 end-to-end HTTP stories in `internal/httpapi/e2e_test.go`
+that compose `store.Memory`, `blobs.Memory`, `vector.Memory`, the real dispatcher, the real
+pipeline, and fake external services through `httpapi.Server.Routes`. `main` wiring is still
+pending: nothing constructs these adapters or starts the HTTP server from `main` yet.
 
 ## Structure
 
@@ -113,7 +115,10 @@ HTTP server from `main` yet.
   opaque cursor encoding over `store.Cursor`, and DTO mapping that avoids exposing internal
   blob/url-key columns. Ingest/import/reprocess handlers delegate to `internal/readingops`.
   Tests drive it through `httptest` against `store.Memory`, `blobs.Memory`, a fake clock, and a
-  submitter seam; `*dispatch.Dispatcher` satisfies that seam.
+  submitter seam; `*dispatch.Dispatcher` satisfies that seam. `internal/httpapi/e2e_test.go`
+  adds the Phase 9 end-to-end layer: URL ingest/read/content, similarity across two readings,
+  failed→reprocess, retry exhaustion, rate-limit requeue, and restart recovery, all via HTTP
+  with the real dispatcher and pipeline over in-memory backends and fake external ports.
 - `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
