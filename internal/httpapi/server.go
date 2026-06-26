@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -30,10 +31,7 @@ const maxBodyBytes = 1 << 20
 // Dispatcher is the queue surface the HTTP layer needs.
 type Dispatcher interface {
 	Submit(id string)
-}
-
-type forceDispatcher interface {
-	ForceSubmit(id string)
+	ForceSubmitAfter(id string, beforeQueue func() error) error
 }
 
 // Server wires the HTTP API to the core ports.
@@ -183,13 +181,22 @@ func (s *Server) reprocess(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: got.Status})
 		return
 	}
-	force := got.Status == reading.Running && annotated.Status == reading.Failed
+	force := (got.Status == reading.Pending || got.Status == reading.Running) && annotated.Status == reading.Failed
 
-	if err := s.markPending(r.Context(), id); err != nil {
-		s.writeError(w, err)
-		return
+	if force {
+		if err := s.Dispatcher.ForceSubmitAfter(id, func() error {
+			return s.markPending(r.Context(), id)
+		}); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	} else {
+		if err := s.markPending(r.Context(), id); err != nil {
+			s.writeError(w, err)
+			return
+		}
+		s.Dispatcher.Submit(id)
 	}
-	s.submit(id, force)
 	writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: reading.Pending})
 }
 
@@ -236,16 +243,6 @@ func (s *Server) ingestURL(ctx context.Context, rawURL string) (statusResponse, 
 	}
 	s.Dispatcher.Submit(id)
 	return statusResponse{ID: id, Status: reading.Pending}, http.StatusCreated, nil
-}
-
-func (s *Server) submit(id string, force bool) {
-	if force {
-		if d, ok := s.Dispatcher.(forceDispatcher); ok {
-			d.ForceSubmit(id)
-			return
-		}
-	}
-	s.Dispatcher.Submit(id)
 }
 
 func urlIngestSourceKind(key string) reading.SourceKind {
@@ -406,12 +403,18 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		}
 		token := strings.TrimPrefix(header, "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(token), []byte(s.Token)) != 1 {
+		if !tokenEqual(token, s.Token) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func tokenEqual(got, want string) bool {
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
 }
 
 func (s *Server) now() time.Time {

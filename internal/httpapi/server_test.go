@@ -32,8 +32,12 @@ func (s *submitter) Submit(id string) {
 	s.ids = append(s.ids, id)
 }
 
-func (s *submitter) ForceSubmit(id string) {
+func (s *submitter) ForceSubmitAfter(id string, beforeQueue func() error) error {
+	if err := beforeQueue(); err != nil {
+		return err
+	}
 	s.forcedIDs = append(s.forcedIDs, id)
+	return nil
 }
 
 type harness struct {
@@ -722,6 +726,46 @@ func TestReprocess_PendingIsIdempotent(t *testing.T) {
 	}
 	if len(h.submitter.ids) != 0 {
 		t.Fatalf("submitted ids = %v, want none", h.submitter.ids)
+	}
+}
+
+func TestReprocess_StalePendingForceReenqueues(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	seedReading(t, h, reading.Reading{
+		ID:              "r1",
+		URL:             "https://example.com/post",
+		Status:          reading.Pending,
+		ProcessAttempts: 2,
+		CreatedAt:       testNow.Add(-10 * time.Minute),
+		UpdatedAt:       testNow.Add(-10 * time.Minute),
+	})
+
+	rr := h.authed(t, http.MethodPost, "/api/readings/r1/reprocess", nil)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rr.Code, rr.Body.String())
+	}
+	got := decodeJSON[struct {
+		Status reading.Status `json:"status"`
+	}](t, rr)
+	if got.Status != reading.Pending {
+		t.Fatalf("response status = %q, want pending", got.Status)
+	}
+	stored, err := h.store.GetByID(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if stored.Status != reading.Pending || stored.ProcessAttempts != 0 {
+		t.Fatalf("stored lifecycle = status %q attempts %d, want reset pending",
+			stored.Status, stored.ProcessAttempts)
+	}
+	if len(h.submitter.ids) != 0 {
+		t.Fatalf("submitted ids = %v, want none", h.submitter.ids)
+	}
+	if diff := cmp.Diff([]string{"r1"}, h.submitter.forcedIDs); diff != "" {
+		t.Fatalf("force-submitted ids mismatch (-want +got):\n%s", diff)
 	}
 }
 

@@ -1017,6 +1017,14 @@ func (s *acceptanceSubmitter) Submit(id string) {
 	s.ids = append(s.ids, id)
 }
 
+func (s *acceptanceSubmitter) ForceSubmitAfter(id string, beforeQueue func() error) error {
+	if err := beforeQueue(); err != nil {
+		return err
+	}
+	s.ids = append(s.ids, id)
+	return nil
+}
+
 // TestAcceptance_HTTPAPI proves the Phase 8 HTTP surface through its exported
 // server (PLAN §10): health skips auth, protected routes require the bearer
 // token, ingest persists an idempotent pending reading and submits it, and detail

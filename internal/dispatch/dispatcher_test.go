@@ -117,6 +117,25 @@ func getReading(t *testing.T, st *store.Memory, id string) reading.Reading {
 	return r
 }
 
+func waitStatus(t *testing.T, st *store.Memory, id string, status reading.Status) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		got := getReading(t, st, id)
+		if got.Status == status {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("status for %q = %q, want %q", id, got.Status, status)
+		case <-tick.C:
+		}
+	}
+}
+
 func always(o dispatch.Outcome) func(int, string) dispatch.Result {
 	return func(int, string) dispatch.Result { return dispatch.Result{Outcome: o} }
 }
@@ -701,6 +720,7 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 		entered <- call
 		if call == 0 {
 			<-firstProceed
+			return dispatch.Result{Outcome: dispatch.Fail}
 		}
 		return dispatch.Result{Outcome: dispatch.Done}
 	}}
@@ -722,6 +742,7 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 	if got := <-entered; got != 1 {
 		t.Fatalf("forced handler call = %d, want 1", got)
 	}
+	waitStatus(t, st, "r1", reading.Ready)
 	close(firstProceed)
 
 	cancel()
@@ -733,6 +754,9 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 
 	if got := h.count(); got != 2 {
 		t.Fatalf("handler ran %d times, want forced replacement run", got)
+	}
+	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
+		t.Fatalf("status = %q, want replacement ready to survive stale failure", got.Status)
 	}
 }
 

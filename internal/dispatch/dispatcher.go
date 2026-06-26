@@ -57,7 +57,13 @@ type Dispatcher struct {
 	ch     chan item
 
 	inflightMu sync.Mutex
-	inflight   map[string]bool
+	inflight   map[string]claim
+	nextToken  uint64
+}
+
+type claim struct {
+	token  uint64
+	cancel context.CancelFunc
 }
 
 // claim takes single-process ownership of a reading id. Ownership is held from the
@@ -67,25 +73,56 @@ type Dispatcher struct {
 // or in flight) is dropped instead of running the pipeline a second time and
 // overwriting the winner's terminal status. This single-instance guard matches the
 // process topology; a multi-instance deployment would need a store-level claim.
-func (d *Dispatcher) claim(id string) bool {
+func (d *Dispatcher) claim(it item) (item, bool) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
-	if d.inflight[id] {
-		return false
+	if _, ok := d.inflight[it.id]; ok {
+		return item{}, false
 	}
 	if d.inflight == nil {
-		d.inflight = map[string]bool{}
+		d.inflight = map[string]claim{}
 	}
-	d.inflight[id] = true
-	return true
+	d.nextToken++
+	it.token = d.nextToken
+	d.inflight[it.id] = claim{token: it.token}
+	return it, true
 }
 
-func (d *Dispatcher) release(id string) {
+func (d *Dispatcher) release(it item) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
-	delete(d.inflight, id)
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+	if current.cancel != nil {
+		current.cancel()
+	}
+	delete(d.inflight, it.id)
+}
+
+func (d *Dispatcher) active(it item) bool {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	return ok && current.token == it.token
+}
+
+func (d *Dispatcher) beginRun(ctx context.Context, it item) (context.Context, context.CancelFunc, bool) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return nil, nil, false
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	current.cancel = cancel
+	d.inflight[it.id] = current
+	return runCtx, cancel, true
 }
 
 func (d *Dispatcher) ensureCh() {
@@ -104,10 +141,11 @@ func (d *Dispatcher) ensureCh() {
 // backstopped meanwhile by read-time stale annotation plus on-demand reprocess
 // (PLAN.md §1.4).
 func (d *Dispatcher) Submit(id string) {
-	if !d.claim(id) {
+	it, ok := d.claim(item{id: id})
+	if !ok {
 		return // already queued or in flight: drop the duplicate
 	}
-	d.queueClaimed(item{id: id})
+	d.queueClaimed(it)
 }
 
 // ForceSubmit enqueues id at attempt 0 even if this process still considers it
@@ -115,24 +153,45 @@ func (d *Dispatcher) Submit(id string) {
 // running work; ordinary ingest and retry paths should use [Dispatcher.Submit]
 // so the duplicate guard remains intact.
 func (d *Dispatcher) ForceSubmit(id string) {
-	d.forceClaim(id)
-	d.queueClaimed(item{id: id})
+	_ = d.ForceSubmitAfter(id, func() error { return nil })
 }
 
-func (d *Dispatcher) forceClaim(id string) {
+// ForceSubmitAfter cancels and replaces any existing in-process claim, runs
+// beforeQueue while the new claim is reserved, then enqueues id at attempt 0.
+// If beforeQueue fails, the replacement claim is released and no work is queued.
+func (d *Dispatcher) ForceSubmitAfter(id string, beforeQueue func() error) error {
+	it := d.forceClaim(item{id: id})
+	if err := beforeQueue(); err != nil {
+		d.release(it)
+		return err
+	}
+	d.queueClaimed(it)
+	return nil
+}
+
+func (d *Dispatcher) forceClaim(it item) item {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
 	if d.inflight == nil {
-		d.inflight = map[string]bool{}
+		d.inflight = map[string]claim{}
 	}
-	d.inflight[id] = true
+	if current, ok := d.inflight[it.id]; ok && current.cancel != nil {
+		current.cancel()
+	}
+	d.nextToken++
+	it.token = d.nextToken
+	d.inflight[it.id] = claim{token: it.token}
+	return it
 }
 
 // queueClaimed dispatches an item whose id is already claimed — the live path for
 // Submit and for re-dispatch. On a full-channel drop it releases the claim, since
 // the item will not run; the recovery Sweep re-dispatches the still-pending reading.
 func (d *Dispatcher) queueClaimed(it item) {
+	if !d.active(it) {
+		return
+	}
 	if d.Inline {
 		// Re-dispatch is decoupled from any originating request context; the async
 		// worker pool (Run) scopes work to the run context instead, and inline is
@@ -147,7 +206,7 @@ func (d *Dispatcher) queueClaimed(it item) {
 	default:
 		// Buffer full: drop and relinquish ownership. The default buffer is sized
 		// so this is a rare overload backstop, not a normal occurrence.
-		d.release(it.id)
+		d.release(it)
 	}
 }
 
@@ -162,9 +221,11 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !d.claim(it.id) {
+	claimed, ok := d.claim(it)
+	if !ok {
 		return nil // already queued or in flight: not an error, just a no-op
 	}
+	it = claimed
 	if d.Inline {
 		d.handle(ctx, it)
 		return nil
@@ -173,7 +234,7 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	d.ensureCh()
 	select {
 	case <-ctx.Done():
-		d.release(it.id)
+		d.release(it)
 		return ctx.Err()
 	case d.ch <- it:
 		return nil
@@ -217,7 +278,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 					// relinquish ownership so the sweep can re-dispatch it.
 					select {
 					case <-ctx.Done():
-						d.release(it.id)
+						d.release(it)
 						return
 					default:
 					}
@@ -239,9 +300,15 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // re-dispatch, so the id stays owned for its whole retry chain. It is the only
 // method that touches the Store and the Delayer.
 func (d *Dispatcher) handle(ctx context.Context, it item) {
+	runCtx, cancel, ok := d.beginRun(ctx, it)
+	if !ok {
+		return
+	}
+	defer cancel()
+
 	now := d.Clock.Now()
 	attempt := it.attempt
-	if err := d.Store.UpdateStatus(ctx, it.id, reading.Running, store.StatusFields{
+	if err := d.Store.UpdateStatus(runCtx, it.id, reading.Running, store.StatusFields{
 		Now:             now,
 		StartedAt:       &now,
 		ProcessAttempts: &attempt,
@@ -249,7 +316,7 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 	}); err != nil {
 		// Could not even start; relinquish ownership (the reading is unchanged) so
 		// the recovery sweep can re-dispatch it.
-		d.release(it.id)
+		d.release(it)
 		return
 	}
 
@@ -258,7 +325,10 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 		maxAttempts = defaultMaxAttempts
 	}
 
-	res := d.Handler(ctx, it.id)
+	res := d.Handler(runCtx, it.id)
+	if !d.active(it) {
+		return
+	}
 	act := decide(res, attempt, maxAttempts)
 
 	// The terminal/redispatch writes below are best-effort: their error is
@@ -267,14 +337,31 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 	// which the stale-running/pending sweep and read-time annotation recover.
 	switch {
 	case act.MarkFailed:
-		d.markFailed(ctx, it.id, attempt, res)
-		d.release(it.id)
+		d.finish(it, func() {
+			d.markFailed(runCtx, it.id, attempt, res)
+		})
 	case act.Redispatch:
-		d.redispatch(ctx, it.id, act) // keeps ownership across the delay
+		d.redispatch(runCtx, it, act) // keeps ownership across the delay
 	default:
-		d.markReady(ctx, it.id)
-		d.release(it.id)
+		d.finish(it, func() {
+			d.markReady(runCtx, it.id)
+		})
 	}
+}
+
+func (d *Dispatcher) finish(it item, write func()) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+	write()
+	if current.cancel != nil {
+		current.cancel()
+	}
+	delete(d.inflight, it.id)
 }
 
 func (d *Dispatcher) markReady(ctx context.Context, id string) {
@@ -315,17 +402,26 @@ func failureMessage(res Result, attempt int) string {
 	return "processing failed"
 }
 
-func (d *Dispatcher) redispatch(ctx context.Context, id string, act Action) {
+func (d *Dispatcher) redispatch(ctx context.Context, it item, act Action) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+
 	now := d.Clock.Now()
 	next := act.NextAttempt
-	_ = d.Store.UpdateStatus(ctx, id, reading.Pending, store.StatusFields{
+	_ = d.Store.UpdateStatus(ctx, it.id, reading.Pending, store.StatusFields{
 		Now:             now,
 		ProcessAttempts: &next,
 	})
 	d.Delay.After(act.Delay, func() {
 		// Ownership is retained from the first enqueue through every retry, so the
 		// continuation requeues WITHOUT re-claiming.
-		d.queueClaimed(item{id: id, attempt: next})
+		it.attempt = next
+		d.queueClaimed(it)
 	})
 }
 
