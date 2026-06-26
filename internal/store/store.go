@@ -67,6 +67,11 @@ type Pending struct {
 type ContentFields struct {
 	// Now is the updated_at timestamp to record (falls back to wall clock when zero).
 	Now time.Time
+	// ExpectedStartedAt, when set, fences the write to the run that started at
+	// this timestamp. The write succeeds only while the row is still running with
+	// that same started_at, preventing stale in-flight handlers from overwriting
+	// replacement content after a manual reprocess.
+	ExpectedStartedAt *time.Time
 	// Title is the extracted or refined article title.
 	Title string
 	// Author is the extracted article author.
@@ -93,11 +98,40 @@ type ContentFields struct {
 	DiagnosticsJSON json.RawMessage
 }
 
+// ImportFields carries the metadata for replacing a failed reading with a
+// user-supplied markdown import while preserving its stable id/url_key.
+type ImportFields struct {
+	Now        time.Time
+	SourceKind reading.SourceKind
+	Title      string
+	RawKey     string
+	Tags       []string
+}
+
+// ReprocessFields carries the metadata for an operator-requested reprocess.
+// RawKey and Title are preserved only for sources, such as markdown imports,
+// whose original body and user-provided title must remain available to the
+// pipeline.
+type ReprocessFields struct {
+	Now    time.Time
+	RawKey string
+	Title  string
+}
+
+// TagFields carries optional metadata for replacing tags.
+type TagFields struct {
+	Now time.Time
+	// ExpectedStartedAt has the same lease semantics as ContentFields.
+	ExpectedStartedAt *time.Time
+}
+
 // StatusFields carries optional metadata to apply during UpdateStatus.
 type StatusFields struct {
 	Now             time.Time
 	StartedAt       *time.Time
+	ClearStartedAt  bool
 	FinishedAt      *time.Time
+	ClearFinishedAt bool
 	Error           *string
 	ClearError      bool
 	ProcessAttempts *int
@@ -110,7 +144,9 @@ type Store interface {
 	GetByURLKey(ctx context.Context, key string) (reading.Reading, error)
 	UpdateStatus(ctx context.Context, id string, status reading.Status, fields StatusFields) error
 	UpdateContent(ctx context.Context, id string, fields ContentFields) error
-	ReplaceTags(ctx context.Context, id string, tags []string) error
+	UpdateImport(ctx context.Context, id string, fields ImportFields) error
+	Reprocess(ctx context.Context, id string, fields ReprocessFields) error
+	ReplaceTags(ctx context.Context, id string, tags []string, fields TagFields) error
 	Search(ctx context.Context, q Query) (Page, error)
 	ListNonTerminal(ctx context.Context, runningCutoff time.Time) ([]Pending, error)
 	Delete(ctx context.Context, id string) error

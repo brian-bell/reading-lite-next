@@ -1,7 +1,7 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 7 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 8 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
@@ -15,14 +15,18 @@ upstreams for the HTTP adapters; testcontainers Postgres/MinIO under `//go:build
 for the DB/object-store adapters), and the extraction internals — `extract.Readability`
 (the readability→raw_dom→raw_only salvage ladder over go-readability + html-to-markdown,
 fixture- and golden-driven), the `extract.YouTube` oEmbed floor (title/author) with a
-best-effort timed-text transcript, and the canonical `extract.RedditGuidance` constant.
-The HTTP API and `main` wiring are still pending: nothing constructs these adapters from
-`main` yet.
+best-effort timed-text transcript, the canonical `extract.RedditGuidance` constant, and the
+HTTP API surface in `internal/httpapi` (health, bearer auth, URL ingest idempotency,
+markdown/bookmark imports, list/search, detail with read-time stale annotation, content/raw blob
+streaming, reprocess, and the shared JSON error model), and the `internal/readingops`
+command service that owns the multi-resource ingest/import/reprocess workflows behind that
+HTTP surface. `main` wiring is still pending: nothing constructs these adapters or starts the
+HTTP server from `main` yet.
 
 ## Structure
 
 - `cmd/reader-api/` contains the API process entrypoint. It is currently a minimal placeholder
-  until the HTTP server and worker pool are implemented.
+  until production config, adapter construction, the HTTP server, and the worker pool are wired.
 - `cmd/readerctl/` contains the operator CLI entrypoint. It is currently a minimal placeholder
   until CLI subcommands are implemented.
 - `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
@@ -35,13 +39,21 @@ The HTTP API and `main` wiring are still pending: nothing constructs these adapt
   `storetest.RunContract` for backend-neutral behavior checks. `UpdateStatus` advances the
   lifecycle; `UpdateContent` overwrites the processed-content columns (title/summary/keys and
   the `summary_json`/`similar_json`/`diagnostics_json` blobs) the pipeline produces, leaving
-  status, timestamps, error, attempts, and tags alone.
+  status, timestamps, error, attempts, and tags alone. `UpdateImport` replaces a failed reading's
+  source metadata with a markdown import under the same stable id while clearing derived content.
+  `Reprocess` atomically clears derived content and marks a row pending for manual reprocessing.
 - `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
   and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
   injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
   drains an in-memory channel and persists each run's lifecycle outcome, and a startup
   `Sweep` that re-dispatches readings left non-terminal by a crash, resuming each at its
-  stored attempt count.
+  stored attempt count. It also exposes a forced-recovery seam
+  (`ForceSubmit`/`ForceSubmitAfter`) for operator reprocess of stale in-flight work: it
+  cancels and token-replaces the in-process claim, waits for the stale handler to drain —
+  bounded by `ForceWaitTTL` (scheduled through the `Delay` seam) and proceeding on timeout so a
+  handler stuck in a non-cancelable call cannot wedge forced recovery or hang the caller — then
+  runs the caller's reset and re-enqueues. Correctness against late stale writes rests on the
+  store `ExpectedStartedAt` fence and run-scoped blob keys, not on the wait.
 - `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
   `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
@@ -82,13 +94,26 @@ The HTTP API and `main` wiring are still pending: nothing constructs these adapt
   (`vector.Memory` on every run, `vector.Postgres` under `//go:build integration`).
 - `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
   `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
-  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches + extracts), embeds and
-  upserts a vector, snapshots similar readings, summarizes once, optionally notifies
+  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches + extracts), embeds,
+  snapshots similar readings, persists a guarded content checkpoint, upserts a vector, summarizes once, optionally notifies
   (a notify failure never fails the reading), and persists the content via `store.UpdateContent`
   + `ReplaceTags`. It returns a `dispatch.Result` (the dispatcher owns lifecycle status; the
   pipeline owns content). Re-entry is idempotent: a persisted `content_key` checkpoint lets a
-  retried run skip fetch/extract/embed and resume at summarize. Blob keys are derived from the
-  server-side reading id.
+  retried run skip fetch/extract and resume near summarize; it may re-embed to recover a vector
+  upsert after the guarded checkpoint. Blob keys are derived from the server-side reading id and
+  dispatcher run timestamp.
+- `internal/readingops/` defines the application command service for multi-resource HTTP
+  workflows: URL ingest, markdown import and failed-reading replacement, bookmark import, and
+  manual reprocess. It is the owner of sequencing across `store.Store`, `blobs.Blobs`, and the
+  dispatcher, including stale pending/running force requeue, markdown raw-blob staging/cleanup,
+  and `store.Reprocess` checkpoint clearing.
+- `internal/httpapi/` defines the Phase 8 HTTP API as `httpapi.Server{Store, Dispatcher, Blobs,
+  Clock, Token, TTLs, NewID}` with one `Routes() http.Handler`. It uses the stdlib
+  `http.ServeMux`, constant-time bearer-token auth (health skips auth), bounded JSON decoding,
+  opaque cursor encoding over `store.Cursor`, and DTO mapping that avoids exposing internal
+  blob/url-key columns. Ingest/import/reprocess handlers delegate to `internal/readingops`.
+  Tests drive it through `httptest` against `store.Memory`, `blobs.Memory`, a fake clock, and a
+  submitter seam; `*dispatch.Dispatcher` satisfies that seam.
 - `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -152,8 +177,16 @@ The project targets Go 1.26.
   harness's `whiteboxAllowed` allowlist; every other `_test.go` stays a black-box `_test` package.
 - Keep the pipeline's status/content split: the dispatcher owns lifecycle status (it marks
   running/ready/failed/pending), the pipeline owns content. `Pipeline.Process` maps step errors
-  to outcomes through the shared `dispatch.Classify`, and persists a content checkpoint before
-  the summarize step so a retried run resumes idempotently from the stored `content_key`.
+  to outcomes through the shared `dispatch.Classify`, and persists a guarded content checkpoint
+  before the summarize step so a retried run resumes idempotently from the stored `content_key`.
+- Keep the HTTP API thin: handlers should delegate command workflows to `internal/readingops`,
+  stale detail overlays to `reading.AnnotateStale`, queries to `store.Store`, and blob payloads
+  to `blobs.Blobs`. Preserve the single JSON error envelope
+  `{ "error": { "code": "...", "message": "..." } }`.
+  `readingops.Service.Reprocess` must use `store.Reprocess` to atomically clear content
+  checkpoints before re-enqueueing so the pipeline does not reuse stale `content_key` data. Raw
+  blob responses must not reflect upstream executable content types; serve them as downloads
+  with `nosniff`.
 - Drive pipeline tests through an inline `dispatch.Dispatcher` (`Inline: true`) with a
   `dispatch.FakeDelayer`, so a test exercises real status transitions and asserts the pipeline's
   effects on the store/blobs/vector index and its scripted port fakes.

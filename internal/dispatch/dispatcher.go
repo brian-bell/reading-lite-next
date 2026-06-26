@@ -14,6 +14,9 @@ import (
 const (
 	defaultBuffer      = 1024
 	defaultMaxAttempts = 5
+	// defaultForceWaitTTL bounds how long ForceSubmitAfter waits for a cancelled
+	// stale handler to drain before it proceeds with recovery anyway.
+	defaultForceWaitTTL = 5 * time.Second
 )
 
 // Store is the narrow persistence surface the dispatcher needs: it advances a
@@ -46,6 +49,15 @@ type Dispatcher struct {
 	Buffer int
 	// RunningTTL bounds how long a running reading may stall before Sweep recovers it.
 	RunningTTL time.Duration
+	// ForceWaitTTL caps how long ForceSubmitAfter waits for a cancelled stale
+	// handler to exit before it proceeds with recovery anyway (defaults to
+	// defaultForceWaitTTL when unset). The wait is a best-effort clean drain to
+	// avoid orphan blobs; the store ExpectedStartedAt fence makes any late stale
+	// write a no-op, so proceeding on timeout is safe and keeps a handler stuck
+	// in a non-cancelable call from wedging forced recovery. The wait is
+	// scheduled through Delay, so Delay must be set whenever a forced submit can
+	// contend with an in-flight claim (redispatch already requires it).
+	ForceWaitTTL time.Duration
 	// Inline runs the initial handle synchronously on Submit/Sweep instead of via
 	// the worker channel, for deterministic handler tests and the HTTP layer. Note
 	// that re-dispatch after a retry or rate limit still flows through the injected
@@ -57,7 +69,15 @@ type Dispatcher struct {
 	ch     chan item
 
 	inflightMu sync.Mutex
-	inflight   map[string]bool
+	inflight   map[string]claim
+	nextToken  uint64
+	forceMu    sync.Mutex
+}
+
+type claim struct {
+	token  uint64
+	cancel context.CancelFunc
+	done   <-chan struct{}
 }
 
 // claim takes single-process ownership of a reading id. Ownership is held from the
@@ -67,25 +87,58 @@ type Dispatcher struct {
 // or in flight) is dropped instead of running the pipeline a second time and
 // overwriting the winner's terminal status. This single-instance guard matches the
 // process topology; a multi-instance deployment would need a store-level claim.
-func (d *Dispatcher) claim(id string) bool {
+func (d *Dispatcher) claim(it item) (item, bool) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
-	if d.inflight[id] {
-		return false
+	if _, ok := d.inflight[it.id]; ok {
+		return item{}, false
 	}
 	if d.inflight == nil {
-		d.inflight = map[string]bool{}
+		d.inflight = map[string]claim{}
 	}
-	d.inflight[id] = true
-	return true
+	d.nextToken++
+	it.token = d.nextToken
+	d.inflight[it.id] = claim{token: it.token}
+	return it, true
 }
 
-func (d *Dispatcher) release(id string) {
+func (d *Dispatcher) release(it item) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
-	delete(d.inflight, id)
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+	if current.cancel != nil {
+		current.cancel()
+	}
+	delete(d.inflight, it.id)
+}
+
+func (d *Dispatcher) active(it item) bool {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	return ok && current.token == it.token
+}
+
+func (d *Dispatcher) beginRun(ctx context.Context, it item) (context.Context, context.CancelFunc, chan struct{}, bool) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return nil, nil, nil, false
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	current.cancel = cancel
+	current.done = done
+	d.inflight[it.id] = current
+	return runCtx, cancel, done, true
 }
 
 func (d *Dispatcher) ensureCh() {
@@ -104,16 +157,124 @@ func (d *Dispatcher) ensureCh() {
 // backstopped meanwhile by read-time stale annotation plus on-demand reprocess
 // (PLAN.md §1.4).
 func (d *Dispatcher) Submit(id string) {
-	if !d.claim(id) {
+	it, ok := d.claim(item{id: id})
+	if !ok {
 		return // already queued or in flight: drop the duplicate
 	}
-	d.queueClaimed(item{id: id})
+	d.queueClaimed(it)
+}
+
+// ForceSubmit enqueues id at attempt 0 even if this process still considers it
+// queued or in flight. It is reserved for explicit operator recovery of stale
+// running work; ordinary ingest and retry paths should use [Dispatcher.Submit]
+// so the duplicate guard remains intact.
+func (d *Dispatcher) ForceSubmit(id string) {
+	_ = d.ForceSubmitAfter(context.Background(), id, func() error { return nil })
+}
+
+// ForceSubmitAfter serializes forced submissions, checks ctx before committing
+// to recovery, cancels and replaces any existing in-process claim, waits
+// (bounded) for an already-running handler to drain, runs beforeQueue while the
+// new claim is reserved, then enqueues id at attempt 0. If beforeQueue fails,
+// the replacement claim is released and no work is queued.
+//
+// The wait is a best-effort clean drain, not a correctness gate: stale writes
+// are already neutralized by the store ExpectedStartedAt fence (content/tags),
+// run-scoped blob keys, and the vector upsert deferred behind the guarded
+// checkpoint on the fresh-acquire path. So the wait is bounded by ForceWaitTTL
+// and PROCEEDS on timeout — a stale handler stuck in a non-cancelable call
+// cannot wedge forced recovery (which is serialized on forceMu) or hang the
+// caller. ctx cancellation is a real abort: it releases the replacement claim
+// and returns ctx.Err().
+func (d *Dispatcher) ForceSubmitAfter(ctx context.Context, id string, beforeQueue func() error) error {
+	d.forceMu.Lock()
+	defer d.forceMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	it, wait := d.forceClaim(item{id: id})
+	if wait != nil {
+		if err := d.awaitStaleHandler(ctx, wait); err != nil {
+			// ctx aborted mid-wait: relinquish the replacement claim so the id is
+			// reclaimable, otherwise it stays owned with no running handler and
+			// nothing queued, dropping every future Submit. forceClaim already
+			// cancelled the stale handler, so the row may be left Running; the
+			// startup Sweep + read-time stale annotation recover it. (No production
+			// caller reaches this: ForceSubmit and readingops.Reprocess both pass a
+			// non-cancelable ctx; it is here for a future cancelable caller.)
+			d.release(it)
+			return err
+		}
+	}
+	if !d.active(it) {
+		return nil
+	}
+	if err := beforeQueue(); err != nil {
+		d.release(it)
+		return err
+	}
+	d.queueClaimed(it)
+	return nil
+}
+
+// awaitStaleHandler blocks until the cancelled stale handler exits, the
+// ForceWaitTTL budget elapses, or ctx is cancelled. A budget timeout is NOT an
+// error: the caller proceeds and relies on the store ExpectedStartedAt fence, so
+// a handler stuck in a non-cancelable call cannot wedge forced recovery. ctx
+// cancellation is a real abort and is returned to the caller. The budget rides
+// the Delay seam so the bound stays deterministic under FakeDelayer.
+func (d *Dispatcher) awaitStaleHandler(ctx context.Context, wait <-chan struct{}) error {
+	if d.Delay == nil {
+		// No delay seam wired: skip the best-effort drain and proceed immediately
+		// rather than nil-panic inside a caller's goroutine. The store
+		// ExpectedStartedAt fence still makes any late stale write a no-op.
+		return nil
+	}
+	budget := d.ForceWaitTTL
+	if budget <= 0 {
+		budget = defaultForceWaitTTL
+	}
+	timeout := make(chan struct{})
+	d.Delay.After(budget, func() { close(timeout) })
+
+	select {
+	case <-wait: // clean exit: stale handler drained, no orphan
+		return nil
+	case <-timeout: // budget elapsed: proceed; the store fence covers safety
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *Dispatcher) forceClaim(it item) (item, <-chan struct{}) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	if d.inflight == nil {
+		d.inflight = map[string]claim{}
+	}
+	var wait <-chan struct{}
+	if current, ok := d.inflight[it.id]; ok {
+		if current.cancel != nil {
+			current.cancel()
+		}
+		wait = current.done
+	}
+	d.nextToken++
+	it.token = d.nextToken
+	d.inflight[it.id] = claim{token: it.token, done: wait}
+	return it, wait
 }
 
 // queueClaimed dispatches an item whose id is already claimed — the live path for
 // Submit and for re-dispatch. On a full-channel drop it releases the claim, since
 // the item will not run; the recovery Sweep re-dispatches the still-pending reading.
 func (d *Dispatcher) queueClaimed(it item) {
+	if !d.active(it) {
+		return
+	}
 	if d.Inline {
 		// Re-dispatch is decoupled from any originating request context; the async
 		// worker pool (Run) scopes work to the run context instead, and inline is
@@ -128,7 +289,7 @@ func (d *Dispatcher) queueClaimed(it item) {
 	default:
 		// Buffer full: drop and relinquish ownership. The default buffer is sized
 		// so this is a rare overload backstop, not a normal occurrence.
-		d.release(it.id)
+		d.release(it)
 	}
 }
 
@@ -143,9 +304,11 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !d.claim(it.id) {
+	claimed, ok := d.claim(it)
+	if !ok {
 		return nil // already queued or in flight: not an error, just a no-op
 	}
+	it = claimed
 	if d.Inline {
 		d.handle(ctx, it)
 		return nil
@@ -154,7 +317,7 @@ func (d *Dispatcher) enqueueRecovered(ctx context.Context, it item) error {
 	d.ensureCh()
 	select {
 	case <-ctx.Done():
-		d.release(it.id)
+		d.release(it)
 		return ctx.Err()
 	case d.ch <- it:
 		return nil
@@ -198,7 +361,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 					// relinquish ownership so the sweep can re-dispatch it.
 					select {
 					case <-ctx.Done():
-						d.release(it.id)
+						d.release(it)
 						return
 					default:
 					}
@@ -220,9 +383,18 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // re-dispatch, so the id stays owned for its whole retry chain. It is the only
 // method that touches the Store and the Delayer.
 func (d *Dispatcher) handle(ctx context.Context, it item) {
+	runCtx, cancel, done, ok := d.beginRun(ctx, it)
+	if !ok {
+		return
+	}
+	defer func() {
+		cancel()
+		close(done)
+	}()
+
 	now := d.Clock.Now()
 	attempt := it.attempt
-	if err := d.Store.UpdateStatus(ctx, it.id, reading.Running, store.StatusFields{
+	if err := d.Store.UpdateStatus(runCtx, it.id, reading.Running, store.StatusFields{
 		Now:             now,
 		StartedAt:       &now,
 		ProcessAttempts: &attempt,
@@ -230,7 +402,7 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 	}); err != nil {
 		// Could not even start; relinquish ownership (the reading is unchanged) so
 		// the recovery sweep can re-dispatch it.
-		d.release(it.id)
+		d.release(it)
 		return
 	}
 
@@ -239,7 +411,10 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 		maxAttempts = defaultMaxAttempts
 	}
 
-	res := d.Handler(ctx, it.id)
+	res := d.Handler(runCtx, it.id)
+	if !d.active(it) {
+		return
+	}
 	act := decide(res, attempt, maxAttempts)
 
 	// The terminal/redispatch writes below are best-effort: their error is
@@ -248,14 +423,31 @@ func (d *Dispatcher) handle(ctx context.Context, it item) {
 	// which the stale-running/pending sweep and read-time annotation recover.
 	switch {
 	case act.MarkFailed:
-		d.markFailed(ctx, it.id, attempt, res)
-		d.release(it.id)
+		d.finish(it, func() {
+			d.markFailed(runCtx, it.id, attempt, res)
+		})
 	case act.Redispatch:
-		d.redispatch(ctx, it.id, act) // keeps ownership across the delay
+		d.redispatch(runCtx, it, act) // keeps ownership across the delay
 	default:
-		d.markReady(ctx, it.id)
-		d.release(it.id)
+		d.finish(it, func() {
+			d.markReady(runCtx, it.id)
+		})
 	}
+}
+
+func (d *Dispatcher) finish(it item, write func()) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+	write()
+	if current.cancel != nil {
+		current.cancel()
+	}
+	delete(d.inflight, it.id)
 }
 
 func (d *Dispatcher) markReady(ctx context.Context, id string) {
@@ -296,17 +488,26 @@ func failureMessage(res Result, attempt int) string {
 	return "processing failed"
 }
 
-func (d *Dispatcher) redispatch(ctx context.Context, id string, act Action) {
+func (d *Dispatcher) redispatch(ctx context.Context, it item, act Action) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	current, ok := d.inflight[it.id]
+	if !ok || current.token != it.token {
+		return
+	}
+
 	now := d.Clock.Now()
 	next := act.NextAttempt
-	_ = d.Store.UpdateStatus(ctx, id, reading.Pending, store.StatusFields{
+	_ = d.Store.UpdateStatus(ctx, it.id, reading.Pending, store.StatusFields{
 		Now:             now,
 		ProcessAttempts: &next,
 	})
 	d.Delay.After(act.Delay, func() {
 		// Ownership is retained from the first enqueue through every retry, so the
 		// continuation requeues WITHOUT re-claiming.
-		d.queueClaimed(item{id: id, attempt: next})
+		it.attempt = next
+		d.queueClaimed(it)
 	})
 }
 

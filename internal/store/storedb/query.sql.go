@@ -293,16 +293,67 @@ const replaceReadingTags = `-- name: ReplaceReadingTags :execrows
 update readings
 set tags = $2, updated_at = $3
 where id = $1
+  and ($4::timestamptz is null or (status = 'running' and started_at = $4))
 `
 
 type ReplaceReadingTagsParams struct {
 	ID        string
 	Tags      []string
 	UpdatedAt pgtype.Timestamptz
+	Column4   pgtype.Timestamptz
 }
 
 func (q *Queries) ReplaceReadingTags(ctx context.Context, arg ReplaceReadingTagsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, replaceReadingTags, arg.ID, arg.Tags, arg.UpdatedAt)
+	result, err := q.db.Exec(ctx, replaceReadingTags,
+		arg.ID,
+		arg.Tags,
+		arg.UpdatedAt,
+		arg.Column4,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const reprocessReading = `-- name: ReprocessReading :execrows
+update readings
+set
+  status = 'pending',
+  title = nullif($3, ''),
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($2, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  started_at = null,
+  finished_at = null,
+  updated_at = $4
+where id = $1
+`
+
+type ReprocessReadingParams struct {
+	ID        string
+	Column2   interface{}
+	Column3   interface{}
+	UpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) ReprocessReading(ctx context.Context, arg ReprocessReadingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reprocessReading,
+		arg.ID,
+		arg.Column2,
+		arg.Column3,
+		arg.UpdatedAt,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -686,6 +737,7 @@ set
   diagnostics_json = $13,
   updated_at = $14
 where id = $1
+  and ($15::timestamptz is null or (status = 'running' and started_at = $15))
 `
 
 type UpdateReadingContentParams struct {
@@ -703,6 +755,7 @@ type UpdateReadingContentParams struct {
 	SimilarJson     []byte
 	DiagnosticsJson []byte
 	UpdatedAt       pgtype.Timestamptz
+	Column15        pgtype.Timestamptz
 }
 
 func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingContentParams) (int64, error) {
@@ -720,6 +773,57 @@ func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingCon
 		arg.SummaryJson,
 		arg.SimilarJson,
 		arg.DiagnosticsJson,
+		arg.UpdatedAt,
+		arg.Column15,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateReadingImport = `-- name: UpdateReadingImport :execrows
+update readings
+set
+  status = 'pending',
+  source_kind = $2,
+  title = nullif($3, ''),
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($4, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  tags = $5,
+  started_at = null,
+  finished_at = null,
+  updated_at = $6
+where id = $1
+`
+
+type UpdateReadingImportParams struct {
+	ID         string
+	SourceKind string
+	Column3    interface{}
+	Column4    interface{}
+	Tags       []string
+	UpdatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) UpdateReadingImport(ctx context.Context, arg UpdateReadingImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateReadingImport,
+		arg.ID,
+		arg.SourceKind,
+		arg.Column3,
+		arg.Column4,
+		arg.Tags,
 		arg.UpdatedAt,
 	)
 	if err != nil {

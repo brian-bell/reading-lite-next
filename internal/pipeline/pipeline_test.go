@@ -254,6 +254,7 @@ func TestPipeline_Markdown_SkipsFetchExtract(t *testing.T) {
 		URLKey:     key,
 		Status:     reading.Pending,
 		SourceKind: reading.SourceMarkdown,
+		Title:      "Imported Notes",
 		RawKey:     rk,
 		CreatedAt:  h.clock.Now(),
 		UpdatedAt:  h.clock.Now(),
@@ -285,6 +286,46 @@ func TestPipeline_Markdown_SkipsFetchExtract(t *testing.T) {
 	}
 }
 
+func TestPipeline_Markdown_PreservesImportedTitle(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.summarizer.Summary.Title = ""
+	rawURL := "https://example.com/notes.md"
+	key, err := reading.URLKey(rawURL)
+	if err != nil {
+		t.Fatalf("URLKey: %v", err)
+	}
+	rk := "imports/r-md/raw"
+	if err := h.blobs.Put(context.Background(), rk, []byte("# Imported\n\nMarkdown body."), "text/markdown"); err != nil {
+		t.Fatalf("seed markdown blob: %v", err)
+	}
+	r := reading.Reading{
+		ID:         "r-md",
+		URL:        rawURL,
+		URLKey:     key,
+		Status:     reading.Pending,
+		SourceKind: reading.SourceMarkdown,
+		Title:      "Imported Notes",
+		RawKey:     rk,
+		CreatedAt:  h.clock.Now(),
+		UpdatedAt:  h.clock.Now(),
+	}
+	if err := h.store.SaveReading(context.Background(), r); err != nil {
+		t.Fatalf("seed markdown reading: %v", err)
+	}
+
+	h.dispatcher.Submit("r-md")
+
+	got := h.get(t, "r-md")
+	if got.Status != reading.Ready {
+		t.Fatalf("status = %q, want ready", got.Status)
+	}
+	if got.Title != "Imported Notes" {
+		t.Fatalf("title = %q, want imported title", got.Title)
+	}
+}
+
 func TestPipeline_SummarizerError_RetriesNotDoubleSummarize(t *testing.T) {
 	t.Parallel()
 
@@ -310,8 +351,9 @@ func TestPipeline_SummarizerError_RetriesNotDoubleSummarize(t *testing.T) {
 		t.Fatalf("scheduled retries = %d, want 1", h.delay.PendingLen())
 	}
 
-	// Second run (re-entry): summarize now succeeds. The already-done work must be
-	// skipped — no second fetch/extract/embed — and summarize runs exactly once.
+	// Second run (re-entry): summarize now succeeds. The already-done fetch/extract
+	// work must be skipped. Embedding may run again to recover a vector upsert after
+	// a guarded content checkpoint, and summarize runs exactly once per run.
 	h.summarizer.Err = nil
 	h.delay.FireAll()
 
@@ -328,8 +370,8 @@ func TestPipeline_SummarizerError_RetriesNotDoubleSummarize(t *testing.T) {
 	if h.extractor.Calls() != 1 {
 		t.Fatalf("extractor calls = %d, want 1 (re-entry must not re-extract)", h.extractor.Calls())
 	}
-	if h.embedder.Calls() != 1 {
-		t.Fatalf("embedder calls = %d, want 1 (re-entry must not re-embed)", h.embedder.Calls())
+	if h.embedder.Calls() != 2 {
+		t.Fatalf("embedder calls = %d, want 2 (re-entry re-upserts vector)", h.embedder.Calls())
 	}
 	if got.Summary != "A concise summary." {
 		t.Fatalf("summary = %q, want it filled on the successful retry", got.Summary)
@@ -679,6 +721,43 @@ func TestPipeline_MarkdownBlobMissing_Retries(t *testing.T) {
 	}
 }
 
+type staleSnapshotStore struct {
+	*store.Memory
+	snapshot reading.Reading
+}
+
+func (s staleSnapshotStore) GetByID(ctx context.Context, id string) (reading.Reading, error) {
+	if id == s.snapshot.ID {
+		return s.snapshot, nil
+	}
+	return s.Memory.GetByID(ctx, id)
+}
+
+func TestPipeline_StaleRunCannotWriteContentAfterReprocess(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	r := h.seed(t, "r1", "https://example.com/post")
+	startedAt := h.clock.Now().Add(-10 * time.Minute)
+	stale := r
+	stale.Status = reading.Running
+	stale.StartedAt = &startedAt
+	if err := h.store.Reprocess(context.Background(), "r1", store.ReprocessFields{Now: h.clock.Now()}); err != nil {
+		t.Fatalf("Reprocess: %v", err)
+	}
+	h.pipeline.Store = staleSnapshotStore{Memory: h.store, snapshot: stale}
+
+	res := h.pipeline.Process(context.Background(), "r1")
+
+	if res.Outcome != dispatch.Retry || !errors.Is(res.Err, store.ErrConflict) {
+		t.Fatalf("Process result = %+v, want retry with ErrConflict", res)
+	}
+	got := h.get(t, "r1")
+	if got.ContentKey != "" || got.Title != "" || got.Summary != "" {
+		t.Fatalf("stale content was written after reprocess: %+v", got)
+	}
+}
+
 // failReplaceTagsStore delegates everything to a real store but fails ReplaceTags
 // until failUntil successful runs have been attempted, for the post-summarize
 // retry path.
@@ -688,12 +767,12 @@ type failReplaceTagsStore struct {
 	calls     int
 }
 
-func (s *failReplaceTagsStore) ReplaceTags(ctx context.Context, id string, tags []string) error {
+func (s *failReplaceTagsStore) ReplaceTags(ctx context.Context, id string, tags []string, fields store.TagFields) error {
 	s.calls++
 	if s.calls <= s.failCalls {
 		return errors.New("tags write failed")
 	}
-	return s.Memory.ReplaceTags(ctx, id, tags)
+	return s.Memory.ReplaceTags(ctx, id, tags, fields)
 }
 
 func TestPipeline_ReplaceTagsError_Retries(t *testing.T) {
@@ -715,8 +794,9 @@ func TestPipeline_ReplaceTagsError_Retries(t *testing.T) {
 		t.Fatalf("summarizer calls after run 1 = %d, want 1", h.summarizer.Calls())
 	}
 
-	// Run 2 (re-entry from the content checkpoint): fetch/extract/embed are skipped,
-	// but summarize deliberately runs again (per-run, PLAN §7) before the now-
+	// Run 2 (re-entry from the content checkpoint): fetch/extract are skipped,
+	// vector embedding/upsert may run again, and summarize deliberately runs again
+	// (per-run, PLAN §7) before the now-
 	// succeeding tag write -> ready.
 	h.delay.FireAll()
 
@@ -724,8 +804,8 @@ func TestPipeline_ReplaceTagsError_Retries(t *testing.T) {
 	if got.Status != reading.Ready {
 		t.Fatalf("status after retry = %q, want ready", got.Status)
 	}
-	if h.fetcher.Calls() != 1 || h.embedder.Calls() != 1 {
-		t.Fatalf("fetch/embed calls = %d/%d, want 1/1 (re-entry skips acquisition)", h.fetcher.Calls(), h.embedder.Calls())
+	if h.fetcher.Calls() != 1 || h.embedder.Calls() != 2 {
+		t.Fatalf("fetch/embed calls = %d/%d, want 1/2 (re-entry skips fetch and re-upserts vector)", h.fetcher.Calls(), h.embedder.Calls())
 	}
 	if h.summarizer.Calls() != 2 {
 		t.Fatalf("summarizer calls total = %d, want 2 (re-summarized once on the retry, by design)", h.summarizer.Calls())

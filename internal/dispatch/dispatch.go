@@ -40,6 +40,7 @@ type Result struct {
 type item struct {
 	id      string
 	attempt int
+	token   uint64
 }
 
 // Action is the pure decision for what to do after a pipeline run.

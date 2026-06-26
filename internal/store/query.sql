@@ -57,12 +57,62 @@ set
   similar_json = $12,
   diagnostics_json = $13,
   updated_at = $14
+where id = $1
+  and ($15::timestamptz is null or (status = 'running' and started_at = $15));
+
+-- name: UpdateReadingImport :execrows
+update readings
+set
+  status = 'pending',
+  source_kind = $2,
+  title = nullif($3, ''),
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($4, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  tags = $5,
+  started_at = null,
+  finished_at = null,
+  updated_at = $6
+where id = $1;
+
+-- name: ReprocessReading :execrows
+update readings
+set
+  status = 'pending',
+  title = nullif($3, ''),
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($2, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  started_at = null,
+  finished_at = null,
+  updated_at = $4
 where id = $1;
 
 -- name: ReplaceReadingTags :execrows
 update readings
 set tags = $2, updated_at = $3
-where id = $1;
+where id = $1
+  and ($4::timestamptz is null or (status = 'running' and started_at = $4));
 
 -- name: CountReadings :one
 select count(*)

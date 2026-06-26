@@ -163,6 +163,7 @@ reading-lite/
 │   ├── store/             # Store port: Postgres adapter (sqlc) + Memory fake + conformance suite + migrations/
 │   ├── dispatch/          # in-process dispatcher: channel + worker pool + backoff/retry + recovery sweep
 │   ├── pipeline/          # orchestration: extract→embed→similar→summarize→notify
+│   ├── readingops/        # command workflows: ingest/import/reprocess across store/blob/dispatch
 │   ├── fetch/             # Fetcher port + HTTP adapter + fake
 │   ├── extract/           # Extractor port + readability adapter + youtube/reddit + fake
 │   ├── embed/             # Embedder port + OpenAI adapter + fake
@@ -407,7 +408,7 @@ type Store interface {
     GetByID(ctx context.Context, id string) (reading.Reading, error)
     GetByURLKey(ctx context.Context, key string) (reading.Reading, error)
     UpdateStatus(ctx context.Context, id string, s reading.Status, f StatusFields) error
-    ReplaceTags(ctx context.Context, id string, tags []string) error
+    ReplaceTags(ctx context.Context, id string, tags []string, f TagFields) error
     Search(ctx context.Context, q Query) (Page, error)                 // q, tags, status, sort, cursor, limit
     ListNonTerminal(ctx context.Context, runningCutoff time.Time) ([]Pending, error) // {id, attempts}
     Delete(ctx context.Context, id string) error
@@ -629,8 +630,9 @@ Ordered steps, each guarded and recorded into `diagnostics_json` (timings, tier,
 - `TestPipeline_RateLimited_Requeues` — Embedder returns `RateLimitError{RetryAfter:30s}` →
   outcome `Requeue{After:30s}`, reading stays `pending` (not failed). (Rate-limit awareness.)
 - `TestPipeline_SummarizerError_RetriesNotDoubleSummarize` — summarizer fails once → outcome
-  `Retry`; on the retried run, assert embed/upsert may be skipped if already done (idempotent
-  re-entry) and summarize is attempted again exactly once per run (no double-summary within a run).
+  `Retry`; on the retried run, assert fetch/extract are skipped, vector embed/upsert may be
+  retried after the content checkpoint, and summarize is attempted again exactly once per run
+  (no double-summary within a run).
 - `TestPipeline_NotifyFailureDoesNotFailReading` — Notifier errors → reading still `ready`,
   error logged in diagnostics, outcome `Done`.
 - `TestPipeline_FetchHardError_Fails` — 404/blocked → `failed` with reason; outcome by policy
@@ -640,9 +642,13 @@ Ordered steps, each guarded and recorded into `diagnostics_json` (timings, tier,
 
 Build `Pipeline` with injected ports + `Store` + `Clock` + `IDGen` + `Config`. Keep each step a
 small private method returning `(stepResult, error)`; translate errors→`dispatch.Result` in one
-`classify(err)` switch (shared with Phase 3's mapping). Idempotent re-entry: guard each
-external write so a retried `Process` skips already-completed steps (e.g. skip upsert if
-`vector_id` set) — this is what makes `Retry` safe.
+`classify(err)` switch (shared with Phase 3's mapping). Idempotent re-entry: guard content/tag
+writes with the store `ExpectedStartedAt` fence (the run lease) and use run-scoped blob keys, so
+stale forced runs cannot overwrite replacement content. That fence — not the dispatcher's
+bounded forced-recovery drain (`ForceWaitTTL`, which proceeds on timeout) — is the correctness
+backstop for a handler stuck in a non-cancelable call. Retried runs skip already-completed
+fetch/extract work and may repeat vector upsert after the content checkpoint — this is what
+makes `Retry` safe.
 
 **Refactor**: extract `acquireContent` (the source-kind switch) and `extractTiers` (the
 fallback ladder) as named, separately tested units.
@@ -778,8 +784,15 @@ be driven within a test by calling `Pipeline.Process` directly).
 
 ### 10.5 Green
 
-`httpapi.Server{ Store, Dispatcher, Blobs, Clock, Token, TTLs }` with one `Routes() http.Handler`.
-DTO structs map domain→JSON (never expose internal columns directly). Single error model:
+`readingops.Service{ Store, Dispatcher, Blobs, Clock, TTLs, NewID }` owns command sequencing for
+URL ingest, markdown/bookmark import, failed-reading markdown replacement, and reprocess. It is
+the only boundary that coordinates `store.Store`, `blobs.Blobs`, and dispatcher enqueue/force
+enqueue for those workflows.
+
+`httpapi.Server{ Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID }` with one
+`Routes() http.Handler` delegates command workflows to `readingops` and keeps request decoding,
+auth, route selection, DTO mapping, response status mapping, and error serialization in the HTTP
+package. DTO structs map domain→JSON (never expose internal columns directly). Single error model:
 
 ```json
 { "error": { "code": "invalid_url", "message": "…" } }
@@ -790,7 +803,8 @@ Helpers `writeJSON`, `writeErr(code, status, msg)`. Auth middleware uses
 `reading.AnnotateStale` before DTO mapping.
 
 **Refactor**: a `decode[T]` generic for request bodies with size limit (`http.MaxBytesReader`);
-shared pagination cursor codec.
+shared pagination cursor codec; keep multi-resource workflow ownership in `readingops` so the
+HTTP layer stays thin.
 
 **Done when**: every endpoint + the idempotency matrix + read-time stale annotation are green.
 

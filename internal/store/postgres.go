@@ -96,12 +96,16 @@ func (p *Postgres) UpdateStatus(ctx context.Context, id string, status reading.S
 	}
 	r.Status = status
 	r.UpdatedAt = now
-	if fields.StartedAt != nil {
+	if fields.ClearStartedAt {
+		r.StartedAt = nil
+	} else if fields.StartedAt != nil {
 		r.StartedAt = cloneTimePtr(fields.StartedAt)
 	} else if status == reading.Running {
 		r.StartedAt = cloneTimePtr(&now)
 	}
-	if fields.FinishedAt != nil {
+	if fields.ClearFinishedAt {
+		r.FinishedAt = nil
+	} else if fields.FinishedAt != nil {
 		r.FinishedAt = cloneTimePtr(fields.FinishedAt)
 	} else if status.IsTerminal() {
 		r.FinishedAt = cloneTimePtr(&now)
@@ -155,6 +159,58 @@ func (p *Postgres) UpdateContent(ctx context.Context, id string, fields ContentF
 		SimilarJson:     fields.SimilarJSON,
 		DiagnosticsJson: fields.DiagnosticsJSON,
 		UpdatedAt:       timestamptz(now),
+		Column15:        timestamptzPtr(fields.ExpectedStartedAt),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		if fields.ExpectedStartedAt != nil {
+			if _, getErr := p.GetByID(ctx, id); getErr == nil {
+				return ErrConflict
+			}
+		}
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateImport replaces a reading's source metadata with a user-supplied import
+// and clears derived content so the next pipeline run starts from that import.
+func (p *Postgres) UpdateImport(ctx context.Context, id string, fields ImportFields) error {
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := p.queries.UpdateReadingImport(ctx, storedb.UpdateReadingImportParams{
+		ID:         id,
+		SourceKind: string(fields.SourceKind),
+		Column3:    fields.Title,
+		Column4:    fields.RawKey,
+		Tags:       normalizeTags(fields.Tags),
+		UpdatedAt:  timestamptz(now),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Reprocess atomically clears derived content and marks a reading pending for a
+// fresh operator-requested run.
+func (p *Postgres) Reprocess(ctx context.Context, id string, fields ReprocessFields) error {
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := p.queries.ReprocessReading(ctx, storedb.ReprocessReadingParams{
+		ID:        id,
+		Column2:   fields.RawKey,
+		Column3:   fields.Title,
+		UpdatedAt: timestamptz(now),
 	})
 	if err != nil {
 		return err
@@ -166,16 +222,26 @@ func (p *Postgres) UpdateContent(ctx context.Context, id string, fields ContentF
 }
 
 // ReplaceTags replaces a reading's tag set.
-func (p *Postgres) ReplaceTags(ctx context.Context, id string, tags []string) error {
+func (p *Postgres) ReplaceTags(ctx context.Context, id string, tags []string, fields TagFields) error {
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	rows, err := p.queries.ReplaceReadingTags(ctx, storedb.ReplaceReadingTagsParams{
 		ID:        id,
 		Tags:      normalizeTags(tags),
-		UpdatedAt: timestamptz(time.Now().UTC()),
+		UpdatedAt: timestamptz(now),
+		Column4:   timestamptzPtr(fields.ExpectedStartedAt),
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
+		if fields.ExpectedStartedAt != nil {
+			if _, getErr := p.GetByID(ctx, id); getErr == nil {
+				return ErrConflict
+			}
+		}
 		return ErrNotFound
 	}
 	return nil

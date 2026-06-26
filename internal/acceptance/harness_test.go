@@ -45,6 +45,7 @@ import (
 	"github.com/bbell/reading-lite/internal/embed"
 	"github.com/bbell/reading-lite/internal/extract"
 	"github.com/bbell/reading-lite/internal/fetch"
+	"github.com/bbell/reading-lite/internal/httpapi"
 	"github.com/bbell/reading-lite/internal/notify"
 	"github.com/bbell/reading-lite/internal/pipeline"
 	"github.com/bbell/reading-lite/internal/reading"
@@ -92,6 +93,11 @@ var (
 	// port, and Pipeline.Process has the dispatcher's Handler signature.
 	_ pipeline.Store                                = (*store.Memory)(nil)
 	_ func(context.Context, string) dispatch.Result = (&pipeline.Pipeline{}).Process
+
+	// Phase 8 HTTP API: the in-process dispatcher satisfies the API's submitter
+	// seam, and Server.Routes returns a standard http.Handler.
+	_ httpapi.Dispatcher = (*dispatch.Dispatcher)(nil)
+	_ http.Handler       = (&httpapi.Server{}).Routes()
 )
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1007,102 @@ scalable choice tomorrow.</p>
 			t.Fatalf("ClassifySource = %q, want reddit", got)
 		}
 	})
+}
+
+type acceptanceSubmitter struct {
+	ids []string
+}
+
+func (s *acceptanceSubmitter) Submit(id string) {
+	s.ids = append(s.ids, id)
+}
+
+func (s *acceptanceSubmitter) ForceSubmitAfter(_ context.Context, id string, beforeQueue func() error) error {
+	if err := beforeQueue(); err != nil {
+		return err
+	}
+	s.ids = append(s.ids, id)
+	return nil
+}
+
+// TestAcceptance_HTTPAPI proves the Phase 8 HTTP surface through its exported
+// server (PLAN §10): health skips auth, protected routes require the bearer
+// token, ingest persists an idempotent pending reading and submits it, and detail
+// reads map the stored domain record to a JSON DTO.
+func TestAcceptance_HTTPAPI(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMemory()
+	blobStore := blobs.NewMemory()
+	fakeClock := clock.NewFake(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
+	submitter := &acceptanceSubmitter{}
+	handler := (&httpapi.Server{
+		Store:      mem,
+		Blobs:      blobStore,
+		Dispatcher: submitter,
+		Clock:      fakeClock,
+		Token:      "verify-token",
+		TTLs:       reading.TTLs{Pending: time.Minute, Running: time.Minute},
+		NewID:      func() string { return "api-r1" },
+	}).Routes()
+
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/api/healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", health.Code)
+	}
+
+	unauth := httptest.NewRecorder()
+	handler.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/readings", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth status = %d, want 401", unauth.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/readings", strings.NewReader(`{"url":"https://example.com/post?utm_source=verify"}`))
+	req.Header.Set("Authorization", "Bearer verify-token")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, req)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("ingest status = %d, want 201; body=%s", created.Code, created.Body.String())
+	}
+	var createdBody struct {
+		ID     string         `json:"id"`
+		Status reading.Status `json:"status"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
+		t.Fatalf("decode ingest response: %v", err)
+	}
+	if createdBody.ID != "api-r1" || createdBody.Status != reading.Pending {
+		t.Fatalf("ingest response = %+v, want api-r1 pending", createdBody)
+	}
+	if got, want := submitter.ids, []string{"api-r1"}; !slices.Equal(got, want) {
+		t.Fatalf("submitted ids = %v, want %v", got, want)
+	}
+	stored, err := mem.GetByID(ctx, "api-r1")
+	if err != nil {
+		t.Fatalf("GetByID(api-r1): %v", err)
+	}
+	if stored.URLKey != "https://example.com/post" || stored.SourceKind != reading.SourceWeb {
+		t.Fatalf("stored URLKey/source = %q/%q, want normalized web", stored.URLKey, stored.SourceKind)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/readings/api-r1", nil)
+	detailReq.Header.Set("Authorization", "Bearer verify-token")
+	detail := httptest.NewRecorder()
+	handler.ServeHTTP(detail, detailReq)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", detail.Code, detail.Body.String())
+	}
+	var detailBody struct {
+		ID         string             `json:"id"`
+		Status     reading.Status     `json:"status"`
+		SourceKind reading.SourceKind `json:"source_kind"`
+	}
+	if err := json.Unmarshal(detail.Body.Bytes(), &detailBody); err != nil {
+		t.Fatalf("decode detail response: %v", err)
+	}
+	if detailBody.ID != "api-r1" || detailBody.Status != reading.Pending || detailBody.SourceKind != reading.SourceWeb {
+		t.Fatalf("detail response = %+v, want pending web api-r1", detailBody)
+	}
 }
 
 // ---------------------------------------------------------------------------
