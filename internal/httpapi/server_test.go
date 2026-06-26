@@ -1187,3 +1187,23 @@ func TestImportBookmarks_AcceptsTopLevelJSONArray(t *testing.T) {
 		t.Fatalf("results = %+v, want one created r1", got.Results)
 	}
 }
+
+func TestImportBookmarks_MultipleJSONValuesPreservesErrorEnvelope(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	rr := h.rawRequest(t, http.MethodPost, "/api/readings/import/bookmarks", `[{"url":"https://example.com"}] []`, "application/json", "Bearer secret-token")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	got := decodeJSON[struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}](t, rr)
+	if got.Error.Code != "invalid_json" || got.Error.Message != "request body must contain one JSON value" {
+		t.Fatalf("error = %+v, want invalid_json one-value message", got.Error)
+	}
+}

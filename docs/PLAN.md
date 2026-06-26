@@ -843,28 +843,44 @@ fake external adapters.
 **Goal**: the spec's operator surface, each subcommand a thin shell over the same core packages,
 tested by invoking the command with fakes/in-mem store and asserting effects + output.
 
-Subcommands (with the test that defines each):
+Implemented subcommands (with representative tests that define each):
 
 - `import url <u>` / `import markdown <file>` / `import bookmarks <file>` —
-  `TestCmdImport_*` assert readings created + submitted to the dispatcher; bookmarks parser tested on a real
-  exported Netscape file fixture.
+  `TestRun_ImportURLPreflightsFailedAsReprocessedAndPrintsStatusLine`,
+  `TestRun_ImportMarkdownCreatesRawBlobAndPrintsStatusLine`, and
+  `TestRun_ImportBookmarksPrintsCreatedExistingInvalidLines` assert command output and effects.
+  Shared bookmark parsing lives in `internal/bookmarks` and is tested for Netscape/HTML,
+  JSON array, and JSON object inputs.
 - `audit` — scan corpus, report counts by status, orphaned blobs/vectors, stuck `running`;
-  `TestCmdAudit_ReportsAnomalies` against a seeded store.
+  `TestRun_AuditTextReportsStatusStaleMissingBlobAndInventoryLines` and
+  `TestRun_AuditJSONReportsCompleteSchema` cover text and JSON output against a seeded store.
 - `recover` — re-dispatch stuck/failed readings; `TestCmdRecover_ReenqueuesStuck` (dry-run default,
-  `--apply` to mutate — assert dry-run writes nothing).
+  `--apply` to mutate). `TestRun_RecoverDryRunTargetsFailedAndStaleOnlyInUnifiedScanOrder` and
+  `TestRun_RecoverApplyContinuesAfterPerIDFailure` pin target selection and per-ID failure behavior.
 - `drop <id|--all>` — delete reading + its blobs + its vector; `TestCmdDrop_RemovesAllArtifacts`
-  asserts Store + Blobs + VectorIndex all cleaned; **requires `--yes` confirmation**
-  (`TestCmdDrop_RefusesWithoutConfirm`).
+  asserts Store + Blobs + VectorIndex all cleaned; **requires `--yes` confirmation**.
+  `TestRun_DropWithoutYesIsDryRunAndDoesNotMutate`,
+  `TestRun_DropExplicitMissingIDAbortsBeforeMutation`, and
+  `TestRun_DropYesDeletesRawContentVectorThenMetadata` pin the destructive-command contract.
 - `smoke` — hit a running API's healthz + a throwaway ingest; `TestCmdSmoke_PassFail`.
+  `TestRun_SmokePostsIngestJSONAndValidatesResponse` pins request shape and success parsing,
+  while `--token-env` lets deploy/staging plans authenticate without printing a secret.
 - `deploy` / `staging {up,down,promote}` — these orchestrate environment/process; keep the
   Go-testable core (config rendering, target selection) pure and unit-tested, shell-out parts
-  behind a `Runner` port with a fake (`TestStaging_PlanComposesCorrectSteps`).
+  behind a `Runner` port with a fake
+  (`TestRun_DeployApplyRunsExactStepsAndStopsOnFailure`,
+  `TestRun_StagingDownDoesNotRequireSmokeInputs`). Deploy and staging up/promote require
+  `--smoke-token-env` so the generated smoke step can authenticate the ingest request.
 
-**Green**: structure with stdlib `flag` per subcommand (or `cobra` if preferred); every command
-takes its dependencies as parameters so tests inject fakes. **Destructive commands default to
-dry-run and demand explicit confirmation** (safety; see Phase 11).
+**Green**: `internal/readerctl.Command` takes dependencies as parameters so tests inject fakes.
+`cmd/readerctl` delegates to `readerctl.Main`, which constructs only Phase-10-safe defaults:
+smoke and dry-run deploy/staging planning can run, while stateful commands return deterministic
+configuration errors until Phase 11 production construction exists. **Destructive commands
+default to dry-run and demand explicit confirmation**.
 
-**Done when**: each subcommand has a behavior test; destructive ones have a ref-to-confirm test.
+**Done when**: each subcommand has a behavior test; destructive ones have a refuse-to-confirm
+test; `go test ./internal/bookmarks ./internal/httpapi ./internal/readerctl ./cmd/readerctl`
+and `make test` pass.
 
 ---
 
