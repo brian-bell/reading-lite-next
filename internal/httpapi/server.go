@@ -367,12 +367,15 @@ func (s *Server) markPending(ctx context.Context, id string) error {
 		return err
 	}
 	rawKey := ""
+	title := ""
 	if r.SourceKind == reading.SourceMarkdown {
 		rawKey = r.RawKey
+		title = r.Title
 	}
 	return s.Store.Reprocess(ctx, id, store.ReprocessFields{
 		Now:    s.now(),
 		RawKey: rawKey,
+		Title:  title,
 	})
 }
 

@@ -624,6 +624,38 @@ func TestReprocess_ReenqueuesAndReturns202(t *testing.T) {
 	}
 }
 
+func TestReprocess_MarkdownImportPreservesTitle(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	seedReading(t, h, reading.Reading{
+		ID:         "r1",
+		URL:        "https://example.com/notes.md",
+		Status:     reading.Ready,
+		SourceKind: reading.SourceMarkdown,
+		Title:      "Imported Notes",
+		RawKey:     "readings/r1/raw.md",
+		ContentKey: "readings/r1/content.md",
+		Summary:    "Old summary",
+	})
+
+	rr := h.authed(t, http.MethodPost, "/api/readings/r1/reprocess", nil)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rr.Code, rr.Body.String())
+	}
+	stored, err := h.store.GetByID(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if stored.Title != "Imported Notes" || stored.RawKey != "readings/r1/raw.md" {
+		t.Fatalf("stored title/raw = %q/%q, want imported title and raw key", stored.Title, stored.RawKey)
+	}
+	if stored.ContentKey != "" || stored.Summary != "" {
+		t.Fatalf("stored derived content = %q/%q, want cleared", stored.ContentKey, stored.Summary)
+	}
+}
+
 func TestReprocess_OldReadingDoesNotStayStale(t *testing.T) {
 	t.Parallel()
 

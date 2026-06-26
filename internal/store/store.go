@@ -104,11 +104,13 @@ type ImportFields struct {
 }
 
 // ReprocessFields carries the metadata for an operator-requested reprocess.
-// RawKey is preserved only for sources, such as markdown imports, whose original
-// body already lives in blobs and must remain available to the pipeline.
+// RawKey and Title are preserved only for sources, such as markdown imports,
+// whose original body and user-provided title must remain available to the
+// pipeline.
 type ReprocessFields struct {
 	Now    time.Time
 	RawKey string
+	Title  string
 }
 
 // StatusFields carries optional metadata to apply during UpdateStatus.

@@ -203,6 +203,7 @@ func (p *Postgres) Reprocess(ctx context.Context, id string, fields ReprocessFie
 	rows, err := p.queries.ReprocessReading(ctx, storedb.ReprocessReadingParams{
 		ID:        id,
 		Column2:   fields.RawKey,
+		Column3:   fields.Title,
 		UpdatedAt: timestamptz(now),
 	})
 	if err != nil {

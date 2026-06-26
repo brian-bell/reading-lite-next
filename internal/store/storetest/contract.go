@@ -641,6 +641,7 @@ func RunContract(t *testing.T, newStore Factory) {
 		if err := s.Reprocess(ctx, r.ID, store.ReprocessFields{
 			Now:    at(4),
 			RawKey: "readings/r1/raw",
+			Title:  "Imported title",
 		}); err != nil {
 			t.Fatalf("Reprocess: %v", err)
 		}
@@ -655,7 +656,10 @@ func RunContract(t *testing.T, newStore Factory) {
 		if got.RawKey != "readings/r1/raw" {
 			t.Fatalf("RawKey = %q, want preserved raw", got.RawKey)
 		}
-		if got.Title != "" || got.Author != "" || got.Site != "" || got.Lang != "" || got.WordCount != 0 ||
+		if got.Title != "Imported title" {
+			t.Fatalf("Title = %q, want preserved import title", got.Title)
+		}
+		if got.Author != "" || got.Site != "" || got.Lang != "" || got.WordCount != 0 ||
 			got.ExtractionMode != "" || got.ContentKey != "" || got.Summary != "" ||
 			len(got.SummaryJSON) != 0 || len(got.SimilarJSON) != 0 || len(got.DiagnosticsJSON) != 0 {
 			t.Fatalf("derived fields not cleared: %+v", got)

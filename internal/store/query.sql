@@ -88,7 +88,7 @@ where id = $1;
 update readings
 set
   status = 'pending',
-  title = null,
+  title = nullif($3, ''),
   author = null,
   site = null,
   lang = null,
@@ -104,7 +104,7 @@ set
   process_attempts = 0,
   started_at = null,
   finished_at = null,
-  updated_at = $3
+  updated_at = $4
 where id = $1;
 
 -- name: ReplaceReadingTags :execrows

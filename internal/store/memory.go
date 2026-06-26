@@ -235,7 +235,7 @@ func (m *Memory) Reprocess(ctx context.Context, id string, fields ReprocessField
 	}
 
 	r.Status = reading.Pending
-	r.Title = ""
+	r.Title = fields.Title
 	r.Author = ""
 	r.Site = ""
 	r.Lang = ""
