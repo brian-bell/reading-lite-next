@@ -93,11 +93,31 @@ type ContentFields struct {
 	DiagnosticsJSON json.RawMessage
 }
 
+// ImportFields carries the metadata for replacing a failed reading with a
+// user-supplied markdown import while preserving its stable id/url_key.
+type ImportFields struct {
+	Now        time.Time
+	SourceKind reading.SourceKind
+	Title      string
+	RawKey     string
+	Tags       []string
+}
+
+// ReprocessFields carries the metadata for an operator-requested reprocess.
+// RawKey is preserved only for sources, such as markdown imports, whose original
+// body already lives in blobs and must remain available to the pipeline.
+type ReprocessFields struct {
+	Now    time.Time
+	RawKey string
+}
+
 // StatusFields carries optional metadata to apply during UpdateStatus.
 type StatusFields struct {
 	Now             time.Time
 	StartedAt       *time.Time
+	ClearStartedAt  bool
 	FinishedAt      *time.Time
+	ClearFinishedAt bool
 	Error           *string
 	ClearError      bool
 	ProcessAttempts *int
@@ -110,6 +130,8 @@ type Store interface {
 	GetByURLKey(ctx context.Context, key string) (reading.Reading, error)
 	UpdateStatus(ctx context.Context, id string, status reading.Status, fields StatusFields) error
 	UpdateContent(ctx context.Context, id string, fields ContentFields) error
+	UpdateImport(ctx context.Context, id string, fields ImportFields) error
+	Reprocess(ctx context.Context, id string, fields ReprocessFields) error
 	ReplaceTags(ctx context.Context, id string, tags []string) error
 	Search(ctx context.Context, q Query) (Page, error)
 	ListNonTerminal(ctx context.Context, runningCutoff time.Time) ([]Pending, error)

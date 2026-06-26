@@ -1,7 +1,7 @@
 # reading-lite
 
 `reading-lite` is being rebuilt as a Go backend for a personal reading service. The current
-checkout has completed Phase 7 of `docs/PLAN.md`: project tooling, CI conventions,
+checkout has completed Phase 8 of `docs/PLAN.md`: project tooling, CI conventions,
 placeholder binaries, deterministic clock support, the pure reading domain core, the
 readings metadata store behind a shared conformance suite, the in-process dispatcher
 with retry/backoff, rate-limit re-dispatch, retry-exhaustion, and a crash-recovery sweep,
@@ -15,14 +15,16 @@ upstreams for the HTTP adapters; testcontainers Postgres/MinIO under `//go:build
 for the DB/object-store adapters), and the extraction internals — `extract.Readability`
 (the readability→raw_dom→raw_only salvage ladder over go-readability + html-to-markdown,
 fixture- and golden-driven), the `extract.YouTube` oEmbed floor (title/author) with a
-best-effort timed-text transcript, and the canonical `extract.RedditGuidance` constant.
-The HTTP API and `main` wiring are still pending: nothing constructs these adapters from
-`main` yet.
+best-effort timed-text transcript, the canonical `extract.RedditGuidance` constant, and the
+HTTP API surface in `internal/httpapi` (health, bearer auth, URL ingest idempotency,
+markdown/bookmark imports, list/search, detail with read-time stale annotation, content/raw blob
+streaming, reprocess, and the shared JSON error model). `main` wiring is still pending: nothing
+constructs these adapters or starts the HTTP server from `main` yet.
 
 ## Structure
 
 - `cmd/reader-api/` contains the API process entrypoint. It is currently a minimal placeholder
-  until the HTTP server and worker pool are implemented.
+  until production config, adapter construction, the HTTP server, and the worker pool are wired.
 - `cmd/readerctl/` contains the operator CLI entrypoint. It is currently a minimal placeholder
   until CLI subcommands are implemented.
 - `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
@@ -35,7 +37,9 @@ The HTTP API and `main` wiring are still pending: nothing constructs these adapt
   `storetest.RunContract` for backend-neutral behavior checks. `UpdateStatus` advances the
   lifecycle; `UpdateContent` overwrites the processed-content columns (title/summary/keys and
   the `summary_json`/`similar_json`/`diagnostics_json` blobs) the pipeline produces, leaving
-  status, timestamps, error, attempts, and tags alone.
+  status, timestamps, error, attempts, and tags alone. `UpdateImport` replaces a failed reading's
+  source metadata with a markdown import under the same stable id while clearing derived content.
+  `Reprocess` atomically clears derived content and marks a row pending for manual reprocessing.
 - `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
   and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
   injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
@@ -89,6 +93,12 @@ The HTTP API and `main` wiring are still pending: nothing constructs these adapt
   pipeline owns content). Re-entry is idempotent: a persisted `content_key` checkpoint lets a
   retried run skip fetch/extract/embed and resume at summarize. Blob keys are derived from the
   server-side reading id.
+- `internal/httpapi/` defines the Phase 8 HTTP API as `httpapi.Server{Store, Dispatcher, Blobs,
+  Clock, Token, TTLs, NewID}` with one `Routes() http.Handler`. It uses the stdlib
+  `http.ServeMux`, constant-time bearer-token auth (health skips auth), bounded JSON decoding,
+  opaque cursor encoding over `store.Cursor`, and DTO mapping that avoids exposing internal
+  blob/url-key columns. Tests drive it through `httptest` against `store.Memory`, `blobs.Memory`,
+  a fake clock, and a submitter seam; `*dispatch.Dispatcher` satisfies that seam.
 - `docs/PLAN.md` is the implementation contract for the backend phases.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the Phase 0 toolchain
   conventions.
@@ -154,6 +164,13 @@ The project targets Go 1.26.
   running/ready/failed/pending), the pipeline owns content. `Pipeline.Process` maps step errors
   to outcomes through the shared `dispatch.Classify`, and persists a content checkpoint before
   the summarize step so a retried run resumes idempotently from the stored `content_key`.
+- Keep the HTTP API thin: handlers should delegate normalization to `reading.URLKey`, lifecycle
+  writes to `store.Store`/`dispatch.Dispatcher`, stale overlays to `reading.AnnotateStale`, and
+  blob payloads to `blobs.Blobs`. Preserve the single JSON error envelope
+  `{ "error": { "code": "...", "message": "..." } }`.
+  Manual reprocess must use `store.Reprocess` to atomically clear content checkpoints before
+  re-enqueueing so the pipeline does not reuse stale `content_key` data. Raw blob responses must
+  not reflect upstream executable content types; serve them as downloads with `nosniff`.
 - Drive pipeline tests through an inline `dispatch.Dispatcher` (`Inline: true`) with a
   `dispatch.FakeDelayer`, so a test exercises real status transitions and asserts the pipeline's
   effects on the store/blobs/vector index and its scripted port fakes.

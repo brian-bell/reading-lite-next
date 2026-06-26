@@ -285,6 +285,7 @@ func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, diag 
 	}
 
 	c := content{
+		title:      r.Title,
 		markdown:   string(data),
 		contentKey: contentKey(r.ID),
 		rawKey:     r.RawKey,

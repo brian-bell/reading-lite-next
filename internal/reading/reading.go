@@ -63,7 +63,7 @@ type Reading struct {
 
 // TTLs controls when non-terminal readings are reported as stale.
 type TTLs struct {
-	// Pending is the maximum age before an unstarted reading is stale.
+	// Pending is the maximum age before an enqueued reading is stale.
 	Pending time.Duration
 	// Running is the maximum processing duration before a running reading is stale.
 	Running time.Duration
@@ -73,7 +73,7 @@ type TTLs struct {
 func AnnotateStale(r Reading, now time.Time, ttls TTLs) Reading {
 	switch r.Status {
 	case Pending:
-		if ttls.Pending > 0 && now.Sub(r.CreatedAt) > ttls.Pending {
+		if ttls.Pending > 0 && now.Sub(pendingSince(r)) > ttls.Pending {
 			r.Status = Failed
 			r.StaleReason = fmt.Sprintf("timed out before processing after %s", ttls.Pending)
 		}
@@ -85,4 +85,11 @@ func AnnotateStale(r Reading, now time.Time, ttls TTLs) Reading {
 	}
 
 	return r
+}
+
+func pendingSince(r Reading) time.Time {
+	if r.UpdatedAt.After(r.CreatedAt) {
+		return r.UpdatedAt
+	}
+	return r.CreatedAt
 }

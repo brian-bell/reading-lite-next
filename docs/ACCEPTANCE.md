@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–7)
+# reading-lite — Manual Verification Plan (Phases 0–8)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -35,7 +35,11 @@
 > `TestAcceptance_Extraction` drives `extract.Readability` over inline HTML to prove the
 > readability→raw_dom→raw_only tier selection, drives `extract.YouTube` against an `httptest`
 > oEmbed upstream for the title/author floor (with its 404→`Fail` classification), and asserts
-> the canonical `extract.RedditGuidance` is the one string the pipeline reuses. Tool- and
+> the canonical `extract.RedditGuidance` is the one string the pipeline reuses. The Phase 8
+> HTTP API (C14) is automated too: `TestAcceptance_HTTPAPI` drives `httpapi.Server.Routes`
+> through `httptest` against the in-memory store/blob backends, a fake clock, and the submitter
+> seam to prove health, auth, ingest, URL normalization, dispatch submission, and detail DTOs.
+> Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
@@ -51,7 +55,8 @@ The checkout has completed **Phase 0** (tooling), **Phase 1** (pure domain core)
 processing pipeline, fakes only), **Phase 6** (the real production adapters
 behind the Phase 4 ports, contract-tested via `httptest`/testcontainers), and
 **Phase 7** (the extraction internals: the readability tier ladder, the YouTube
-oEmbed client, and the Reddit guidance, fixture- and contract-tested):
+oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
+**Phase 8** (the HTTP API surface, tested through `httptest` with in-memory ports):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -86,26 +91,28 @@ oEmbed client, and the Reddit guidance, fixture- and contract-tested):
 | YouTube oEmbed floor + best-effort transcript client | `internal/extract/youtube.go` | 7 |
 | Reddit guidance constant | `internal/extract/reddit.go` | 7 |
 | Extraction HTML fixtures + golden markdown | `internal/extract/testdata/` | 7 |
+| HTTP API server, auth, DTOs, cursor/error helpers | `internal/httpapi/server.go` | 8 |
 
 ### Out of scope (do not expect these to work yet)
 
 The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together and is
-verified by its own race-tested package tests and the C11 blackbox checks here, and the
-Phase 6 real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
-`vector.Postgres`, `blobs.R2`) now exist behind those ports — but neither is **wired into the
-binaries**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an
-adapter from `main` yet (that lands with the HTTP API and `main` lifecycle in Phases 8/11).
+verified by its own race-tested package tests and the C11 blackbox checks here, the Phase 6
+real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
+`vector.Postgres`, `blobs.R2`) now exist behind those ports, and the Phase 8 HTTP API
+(`internal/httpapi`) now exists — but these are **not wired into the binaries**: nothing calls
+`Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter, or starts
+`httpapi.Server.Routes` from `main` yet (that lands with the `main` lifecycle/config work in
+Phase 11).
 The Phase 5 pipeline still drives the ports through their in-memory fakes in tests; the real
 adapters are exercised only by their own contract tests (`httptest` upstreams, and
 testcontainers Postgres/MinIO under `//go:build integration`).
 The Phase 7 extraction internals (`extract.Readability`, `extract.YouTube`, `extract.RedditGuidance`)
-now exist and are contract-/fixture-tested (C13), but, like the Phase 6 adapters, are **not yet
-wired into the binaries** — nothing constructs `extract.Readability` from `main` or routes a
-YouTube URL through `extract.YouTube` yet (that lands with the HTTP API and `main` lifecycle).
-The remaining Phases 8–12 are **not** implemented: the HTTP API, the operator CLI subcommands,
-config loading, and observability. `reader-api` and `readerctl` are intentionally empty
-`main(){}` placeholders. Verifying "the service runs and ingests a URL" is **premature** and not
-part of this plan.
+now exist and are contract-/fixture-tested (C13), but, like the Phase 6 adapters and Phase 8 API,
+are **not yet wired into the binaries** — nothing constructs `extract.Readability` from `main` or
+routes a YouTube URL through `extract.YouTube` yet. The remaining Phases 9–12 are **not**
+implemented: end-to-end main wiring, operator CLI subcommands, config loading, and
+observability. `reader-api` and `readerctl` are intentionally empty `main(){}` placeholders.
+Verifying "the service runs and ingests a URL" is **premature** and not part of this plan.
 
 ---
 
@@ -357,8 +364,9 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
     mentions "stalled".
   - `ready`/`failed` never annotated; fresh rows pass through unchanged.
   - A zero TTL disables that check (guarded by `> 0`).
-- [ ] Confirm it reads `CreatedAt` for pending and `StartedAt` for running, and that
-  a `nil StartedAt` running row is left alone.
+- [ ] Confirm it reads `CreatedAt` for newly created pending rows, the newer `UpdatedAt` for
+  requeued/reprocessed pending rows, and `StartedAt` for running rows, and that a `nil StartedAt`
+  running row is left alone.
 
 ### C6. Phase 2 — Store port & Memory fake (`store.go`, `memory.go`)
 
@@ -385,8 +393,8 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
   `RoundTrip`, `URLKeyIdempotency`, `SearchFTS` (incl. adversarial query
   `'AND OR " 🧪` that must not error), `TagFilterAND`, `StatusFilterAndSortModes`,
   `KeysetPagination` (25 rows, no dup/skip, correct total), `UpdateStatus…`,
-  `ReplaceTags`, `ListNonTerminal`, `Delete`, `ConcurrentSaves`. Confirm the extra
-  hardening cases too (`SortTitlePagination`, `RankedSearchPagination`,
+  `UpdateImport`, `Reprocess`, `ReplaceTags`, `ListNonTerminal`, `Delete`, `ConcurrentSaves`.
+  Confirm the extra hardening cases too (`SortTitlePagination`, `RankedSearchPagination`,
   `DefensiveCopies`, `SaveReadingAcceptsNilTags`, `UpdateStatusErrorSemantics`).
 - [ ] Confirm the suite is **backend-neutral**: it takes a `Factory` and is the single
   source invoked by both `memory_test.go` and `postgres_test.go`. This is the
@@ -586,8 +594,8 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
   dispatcher's `Handler` signature.
 
 > Note: the pipeline runs only against the in-memory fakes here; it is not yet constructed from
-> `main` (that is Phase 8/11). The real external adapters now exist (C12) but the pipeline does
-> not yet use them. Do not flag either as a gap.
+> `main` (that is later main/config lifecycle work). The real external adapters now exist (C12)
+> but the pipeline does not yet use them from a running binary. Do not flag either as a gap.
 
 ### C12. Phase 6 — real adapters (`internal/{fetch,embed,summarize,notify,vector,blobs}`, `internal/httpx`)
 
@@ -640,7 +648,8 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
   `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
   `vector.Postgres`/`blobs.R2` integration tests always compile.
 
-> Note: these adapters are not yet wired into `main` (Phase 8/11). Do not flag that as a gap.
+> Note: these adapters are not yet wired into `main` (later main/config lifecycle work). Do not
+> flag that as a gap.
 > New runtime dependency: `aws-sdk-go-v2` (S3 client) for `blobs.R2`; the HTTP adapters are
 > stdlib-only.
 
@@ -686,8 +695,60 @@ the source guidance.
   `var _ extract.Extractor = (*extract.Readability)(nil)` assertion pins the adapter to its port.
 
 > Note: the extractor is not yet constructed from `main` and the pipeline still drives the
-> `extract.Fake`, not `extract.Readability` (that wiring is Phase 8/11). New runtime dependencies:
+> `extract.Fake`, not `extract.Readability` from a running binary (that wiring is later
+> main/config lifecycle work). New runtime dependencies:
 > `github.com/go-shiori/go-readability` and `github.com/JohannesKaufmann/html-to-markdown/v2`.
+
+### C14. Phase 8 — HTTP API (`internal/httpapi/`)
+
+Phase 8 implements the read/browse/ingest API behind `httpapi.Server.Routes()`, using the
+standard library `http.ServeMux`, bearer auth, injected ports, and the shared domain/store/blob
+contracts. It is tested through `httptest` with `store.Memory`, `blobs.Memory`, a fake clock, and
+a submitter seam that `*dispatch.Dispatcher` satisfies.
+
+- [ ] `go test -race ./internal/httpapi/` passes clean.
+- [ ] **Auth and liveness.** `GET /api/healthz` is public; every other route requires
+  `Authorization: Bearer <token>`, checked with `subtle.ConstantTimeCompare`. Tests:
+  `TestAuth_MissingTokenRejected`, `TestAuth_WrongTokenRejected`, `TestAuth_HealthzSkipsAuth`,
+  and `TestAuth_ValidTokenPasses`.
+- [ ] **Ingest idempotency.** `POST /api/readings` normalizes with `reading.URLKey` before lookup,
+  persists new readings as `pending`, returns 201 for new and 200 for existing, does not duplicate
+  pending/ready submissions, and reprocesses failed readings in place. Tests cover the full matrix:
+  new URL, existing ready, existing pending, failed reprocess, UTM normalization, and invalid URL.
+- [ ] **Read and browse.** `GET /api/readings` maps query parameters (`q`, `tags`, `status`, `sort`,
+  `cursor`, `limit`) to `store.Query` and returns `total` plus an opaque `next_cursor`.
+  `GET /api/readings/{id}` applies `reading.AnnotateStale` at read time without mutating the
+  stored row.
+- [ ] **Blob-backed content.** `GET /api/readings/{id}/content` and `/raw` load through
+  `blobs.Blobs`, stay auth-gated, and return the shared 404 error envelope when the reading or
+  blob is missing. Extracted content streams with its stored content type; raw content is served
+  as an `application/octet-stream` attachment with `X-Content-Type-Options: nosniff` so fetched
+  upstream HTML cannot execute under the API origin.
+- [ ] **Imports and reprocess.** Markdown imports store the supplied body as a raw markdown blob,
+  force `SourceMarkdown`, persist tags/title, and submit the ID; the imported title is carried
+  through the markdown pipeline unless the summarizer returns a refined title, while tags remain
+  summary-owned after processing and imported tags act as pre-processing seed metadata. Importing
+  markdown for an existing `failed` URL uses the store's import update path to replace that row in
+  place under the same ID with a fresh raw blob key so blocked sources such as Reddit can be
+  recovered through the import flow. Bookmark imports accept JSON bookmark arrays either as a
+  top-level array or a `{bookmarks:[...]}` wrapper (and Netscape-style HTML via `href` parsing),
+  returning per-URL `created|existing|invalid` results with duplicate URLs collapsed through the
+  same URL key.
+  `POST /api/readings/{id}/reprocess` returns 202; `ready`/`failed` rows and stale-annotated
+  `pending`/`running` rows flip to `pending` through the atomic store `Reprocess` operation, clear
+  lifecycle metadata and stale content checkpoints, reset the attempt count, refresh `updated_at`
+  as the pending-staleness anchor, and submit the ID, while fresh `pending`/`running` rows are
+  idempotent no-ops that return their existing status without duplicate submission.
+- [ ] **Error model and DTO boundary.** All JSON errors use
+  `{ "error": { "code": "...", "message": "..." } }`. Reading DTOs expose client-facing summary,
+  similar, diagnostics, tags, status, and timestamps without leaking `url_key` or blob keys.
+- [ ] **Automated (B/`make verify`):** `TestAcceptance_HTTPAPI` proves the exported route surface
+  with health, auth, ingest, URL normalization, submitter invocation, and detail DTO mapping; the
+  acceptance harness also asserts `*dispatch.Dispatcher` satisfies `httpapi.Dispatcher`.
+
+> Note: `cmd/reader-api` still does not construct `httpapi.Server`, adapters, the pipeline, or a
+> worker pool. That runtime wiring belongs to the later main/config lifecycle work, so do not flag
+> the placeholder binary as a Phase 8 API-package gap.
 
 ---
 
@@ -741,12 +802,12 @@ Record these so a reviewer doesn't waste time or raise false bugs:
    gap. No domain coverage finding is currently open; B4 is the method to use if one reopens.
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
    dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), the
-   Phase 6 real adapters (C12), and the Phase 7 extraction internals (`internal/extract`, C13)
-   are all complete and verified, but **not yet wired into them**: nothing calls
-   `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, or constructs an adapter / extractor from
-   `main` (that lands with the HTTP API and `main` lifecycle in Phases 8/11). The Phase 5
-   pipeline still drives the ports through their fakes in tests. The HTTP API, config, CLI
-   subcommands, and observability do not exist yet (Phases 8–12).
+   Phase 6 real adapters (C12), the Phase 7 extraction internals (`internal/extract`, C13), and
+   the Phase 8 HTTP API (`internal/httpapi`, C14) are all complete and verified, but **not yet
+   wired into them**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an
+   adapter / extractor, or starts `httpapi.Server.Routes` from `main`. The Phase 5 pipeline still
+   drives the ports through their fakes in tests. End-to-end main wiring, config, CLI subcommands,
+   and observability do not exist yet (Phases 9–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment

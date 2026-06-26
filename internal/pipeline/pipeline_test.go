@@ -254,6 +254,7 @@ func TestPipeline_Markdown_SkipsFetchExtract(t *testing.T) {
 		URLKey:     key,
 		Status:     reading.Pending,
 		SourceKind: reading.SourceMarkdown,
+		Title:      "Imported Notes",
 		RawKey:     rk,
 		CreatedAt:  h.clock.Now(),
 		UpdatedAt:  h.clock.Now(),
@@ -282,6 +283,46 @@ func TestPipeline_Markdown_SkipsFetchExtract(t *testing.T) {
 	}
 	if got.ContentKey == "" {
 		t.Fatalf("content_key empty, want the extracted markdown blob set")
+	}
+}
+
+func TestPipeline_Markdown_PreservesImportedTitle(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.summarizer.Summary.Title = ""
+	rawURL := "https://example.com/notes.md"
+	key, err := reading.URLKey(rawURL)
+	if err != nil {
+		t.Fatalf("URLKey: %v", err)
+	}
+	rk := "imports/r-md/raw"
+	if err := h.blobs.Put(context.Background(), rk, []byte("# Imported\n\nMarkdown body."), "text/markdown"); err != nil {
+		t.Fatalf("seed markdown blob: %v", err)
+	}
+	r := reading.Reading{
+		ID:         "r-md",
+		URL:        rawURL,
+		URLKey:     key,
+		Status:     reading.Pending,
+		SourceKind: reading.SourceMarkdown,
+		Title:      "Imported Notes",
+		RawKey:     rk,
+		CreatedAt:  h.clock.Now(),
+		UpdatedAt:  h.clock.Now(),
+	}
+	if err := h.store.SaveReading(context.Background(), r); err != nil {
+		t.Fatalf("seed markdown reading: %v", err)
+	}
+
+	h.dispatcher.Submit("r-md")
+
+	got := h.get(t, "r-md")
+	if got.Status != reading.Ready {
+		t.Fatalf("status = %q, want ready", got.Status)
+	}
+	if got.Title != "Imported Notes" {
+		t.Fatalf("title = %q, want imported title", got.Title)
 	}
 }
 

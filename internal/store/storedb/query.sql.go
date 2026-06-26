@@ -309,6 +309,44 @@ func (q *Queries) ReplaceReadingTags(ctx context.Context, arg ReplaceReadingTags
 	return result.RowsAffected(), nil
 }
 
+const reprocessReading = `-- name: ReprocessReading :execrows
+update readings
+set
+  status = 'pending',
+  title = null,
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($2, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  started_at = null,
+  finished_at = null,
+  updated_at = $3
+where id = $1
+`
+
+type ReprocessReadingParams struct {
+	ID        string
+	Column2   interface{}
+	UpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) ReprocessReading(ctx context.Context, arg ReprocessReadingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reprocessReading, arg.ID, arg.Column2, arg.UpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const searchReadingsNewest = `-- name: SearchReadingsNewest :many
 select
   id, url, url_key, status, source_kind, title, author, site, lang, word_count,
@@ -720,6 +758,56 @@ func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingCon
 		arg.SummaryJson,
 		arg.SimilarJson,
 		arg.DiagnosticsJson,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateReadingImport = `-- name: UpdateReadingImport :execrows
+update readings
+set
+  status = 'pending',
+  source_kind = $2,
+  title = nullif($3, ''),
+  author = null,
+  site = null,
+  lang = null,
+  word_count = null,
+  extraction_mode = null,
+  content_key = null,
+  raw_key = nullif($4, ''),
+  summary = null,
+  summary_json = null,
+  similar_json = null,
+  diagnostics_json = null,
+  error = null,
+  process_attempts = 0,
+  tags = $5,
+  started_at = null,
+  finished_at = null,
+  updated_at = $6
+where id = $1
+`
+
+type UpdateReadingImportParams struct {
+	ID         string
+	SourceKind string
+	Column3    interface{}
+	Column4    interface{}
+	Tags       []string
+	UpdatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) UpdateReadingImport(ctx context.Context, arg UpdateReadingImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateReadingImport,
+		arg.ID,
+		arg.SourceKind,
+		arg.Column3,
+		arg.Column4,
+		arg.Tags,
 		arg.UpdatedAt,
 	)
 	if err != nil {

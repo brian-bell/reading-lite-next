@@ -405,6 +405,34 @@ func RunContract(t *testing.T, newStore Factory) {
 		}
 	})
 
+	t.Run("UpdateStatusClearsTimestampsWhenRequested", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s := newStore(t)
+		startedAt := at(2)
+		finishedAt := at(3)
+		r := sampleReading("r1", "https://example.com/one", at(1), reading.Ready)
+		r.StartedAt = &startedAt
+		r.FinishedAt = &finishedAt
+		seed(ctx, t, s, r)
+
+		if err := s.UpdateStatus(ctx, r.ID, reading.Pending, store.StatusFields{
+			Now:             at(4),
+			ClearStartedAt:  true,
+			ClearFinishedAt: true,
+		}); err != nil {
+			t.Fatalf("UpdateStatus clear timestamps: %v", err)
+		}
+		got, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID after clear: %v", err)
+		}
+		if got.StartedAt != nil || got.FinishedAt != nil {
+			t.Fatalf("timestamps = %v/%v, want both nil", got.StartedAt, got.FinishedAt)
+		}
+	})
+
 	t.Run("SaveReadingPersistsJSON", func(t *testing.T) {
 		t.Parallel()
 
@@ -521,6 +549,122 @@ func RunContract(t *testing.T, newStore Factory) {
 		// parameters before it can report the missing row.
 		if err := s.UpdateContent(ctx, "missing", store.ContentFields{Now: updatedAt}); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("UpdateContent missing error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpdateImport", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s := newStore(t)
+		r := sampleReading("r1", "https://example.com/one", at(1), reading.Failed)
+		r.SourceKind = reading.SourceReddit
+		r.Title = "Old title"
+		r.Author = "Old author"
+		r.Site = "old.example"
+		r.Lang = "en"
+		r.WordCount = 100
+		r.ExtractionMode = "readability"
+		r.ContentKey = "readings/r1/content"
+		r.RawKey = "readings/r1/raw"
+		r.Summary = "Old summary"
+		r.SummaryJSON = []byte(`{"old":true}`)
+		r.SimilarJSON = []byte(`[{"id":"old"}]`)
+		r.DiagnosticsJSON = []byte(`{"source":"reddit"}`)
+		r.Tags = []string{"old"}
+		seed(ctx, t, s, r)
+
+		if err := s.UpdateImport(ctx, r.ID, store.ImportFields{
+			Now:        at(4),
+			SourceKind: reading.SourceMarkdown,
+			Title:      "Imported title",
+			RawKey:     "readings/r1/import.md",
+			Tags:       []string{"imported"},
+		}); err != nil {
+			t.Fatalf("UpdateImport: %v", err)
+		}
+		got, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+
+		if got.Status != reading.Pending || got.Error != "" || got.ProcessAttempts != 0 || got.StartedAt != nil || got.FinishedAt != nil {
+			t.Fatalf("lifecycle = status %q error %q attempts %d started %v finished %v, want reset pending",
+				got.Status, got.Error, got.ProcessAttempts, got.StartedAt, got.FinishedAt)
+		}
+		if got.SourceKind != reading.SourceMarkdown || got.Title != "Imported title" || got.RawKey != "readings/r1/import.md" {
+			t.Fatalf("import fields = source %q title %q raw %q, want markdown/imported title/import raw",
+				got.SourceKind, got.Title, got.RawKey)
+		}
+		if got.Author != "" || got.Site != "" || got.Lang != "" || got.WordCount != 0 ||
+			got.ExtractionMode != "" || got.ContentKey != "" || got.Summary != "" ||
+			len(got.SummaryJSON) != 0 || len(got.SimilarJSON) != 0 || len(got.DiagnosticsJSON) != 0 {
+			t.Fatalf("derived fields not cleared: %+v", got)
+		}
+		if !slices.Equal(got.Tags, []string{"imported"}) {
+			t.Fatalf("Tags = %v, want [imported]", got.Tags)
+		}
+		if !got.UpdatedAt.Equal(at(4)) {
+			t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, at(4))
+		}
+		if err := s.UpdateImport(ctx, "missing", store.ImportFields{Now: at(5)}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("UpdateImport missing error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("Reprocess", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s := newStore(t)
+		startedAt := at(2)
+		finishedAt := at(3)
+		r := sampleReading("r1", "https://example.com/one", at(1), reading.Ready)
+		r.Title = "Old title"
+		r.Author = "Old author"
+		r.Site = "old.example"
+		r.Lang = "en"
+		r.WordCount = 100
+		r.ExtractionMode = "readability"
+		r.ContentKey = "readings/r1/content"
+		r.RawKey = "readings/r1/raw"
+		r.Summary = "Old summary"
+		r.SummaryJSON = []byte(`{"old":true}`)
+		r.SimilarJSON = []byte(`[{"id":"old"}]`)
+		r.DiagnosticsJSON = []byte(`{"source":"web"}`)
+		r.Error = "old error"
+		r.ProcessAttempts = 3
+		r.StartedAt = &startedAt
+		r.FinishedAt = &finishedAt
+		seed(ctx, t, s, r)
+
+		if err := s.Reprocess(ctx, r.ID, store.ReprocessFields{
+			Now:    at(4),
+			RawKey: "readings/r1/raw",
+		}); err != nil {
+			t.Fatalf("Reprocess: %v", err)
+		}
+		got, err := s.GetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+		if got.Status != reading.Pending || got.Error != "" || got.ProcessAttempts != 0 || got.StartedAt != nil || got.FinishedAt != nil {
+			t.Fatalf("lifecycle = status %q error %q attempts %d started %v finished %v, want reset pending",
+				got.Status, got.Error, got.ProcessAttempts, got.StartedAt, got.FinishedAt)
+		}
+		if got.RawKey != "readings/r1/raw" {
+			t.Fatalf("RawKey = %q, want preserved raw", got.RawKey)
+		}
+		if got.Title != "" || got.Author != "" || got.Site != "" || got.Lang != "" || got.WordCount != 0 ||
+			got.ExtractionMode != "" || got.ContentKey != "" || got.Summary != "" ||
+			len(got.SummaryJSON) != 0 || len(got.SimilarJSON) != 0 || len(got.DiagnosticsJSON) != 0 {
+			t.Fatalf("derived fields not cleared: %+v", got)
+		}
+		if !got.UpdatedAt.Equal(at(4)) {
+			t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, at(4))
+		}
+		if err := s.Reprocess(ctx, "missing", store.ReprocessFields{Now: at(5)}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("Reprocess missing error = %v, want ErrNotFound", err)
 		}
 	})
 

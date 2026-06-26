@@ -41,6 +41,16 @@ func TestAnnotateStale(t *testing.T) {
 	}{
 		{"fresh pending unchanged", mk(reading.Pending, now.Add(-1*time.Minute)), reading.Pending, ""},
 		{"expired pending -> failed", mk(reading.Pending, now.Add(-11*time.Minute)), reading.Failed, "timed out before processing"},
+		{
+			name: "refreshed pending uses updated_at",
+			in: reading.Reading{
+				ID:        "reading-1",
+				Status:    reading.Pending,
+				CreatedAt: now.Add(-99 * time.Hour),
+				UpdatedAt: now.Add(-1 * time.Minute),
+			},
+			want: reading.Pending,
+		},
 		{"fresh running unchanged", mkRun(reading.Running, now.Add(-5*time.Minute)), reading.Running, ""},
 		{"stuck running -> failed", mkRun(reading.Running, now.Add(-31*time.Minute)), reading.Failed, "stalled"},
 		{"ready never annotated", mk(reading.Ready, now.Add(-99*time.Hour)), reading.Ready, ""},

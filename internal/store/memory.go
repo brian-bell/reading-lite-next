@@ -104,12 +104,16 @@ func (m *Memory) UpdateStatus(ctx context.Context, id string, status reading.Sta
 
 	r.Status = status
 	r.UpdatedAt = now
-	if fields.StartedAt != nil {
+	if fields.ClearStartedAt {
+		r.StartedAt = nil
+	} else if fields.StartedAt != nil {
 		r.StartedAt = cloneTimePtr(fields.StartedAt)
 	} else if status == reading.Running {
 		r.StartedAt = cloneTimePtr(&now)
 	}
-	if fields.FinishedAt != nil {
+	if fields.ClearFinishedAt {
+		r.FinishedAt = nil
+	} else if fields.FinishedAt != nil {
 		r.FinishedAt = cloneTimePtr(fields.FinishedAt)
 	} else if status.IsTerminal() {
 		r.FinishedAt = cloneTimePtr(&now)
@@ -159,6 +163,94 @@ func (m *Memory) UpdateContent(ctx context.Context, id string, fields ContentFie
 	r.SummaryJSON = fields.SummaryJSON
 	r.SimilarJSON = fields.SimilarJSON
 	r.DiagnosticsJSON = fields.DiagnosticsJSON
+	r.UpdatedAt = now
+
+	m.byID[id] = cloneReading(r)
+	return nil
+}
+
+// UpdateImport replaces a reading's source metadata with a user-supplied import
+// and clears derived content so the next pipeline run starts from that import.
+func (m *Memory) UpdateImport(ctx context.Context, id string, fields ImportFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.byID[id]
+	if !ok {
+		return ErrNotFound
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	r.Status = reading.Pending
+	r.SourceKind = fields.SourceKind
+	r.Title = fields.Title
+	r.Author = ""
+	r.Site = ""
+	r.Lang = ""
+	r.WordCount = 0
+	r.ExtractionMode = ""
+	r.ContentKey = ""
+	r.RawKey = fields.RawKey
+	r.Summary = ""
+	r.SummaryJSON = nil
+	r.SimilarJSON = nil
+	r.DiagnosticsJSON = nil
+	r.Error = ""
+	r.StartedAt = nil
+	r.FinishedAt = nil
+	r.ProcessAttempts = 0
+	r.Tags = normalizeTags(fields.Tags)
+	r.UpdatedAt = now
+
+	m.byID[id] = cloneReading(r)
+	return nil
+}
+
+// Reprocess atomically clears derived content and marks a reading pending for a
+// fresh operator-requested run.
+func (m *Memory) Reprocess(ctx context.Context, id string, fields ReprocessFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.byID[id]
+	if !ok {
+		return ErrNotFound
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	r.Status = reading.Pending
+	r.Title = ""
+	r.Author = ""
+	r.Site = ""
+	r.Lang = ""
+	r.WordCount = 0
+	r.ExtractionMode = ""
+	r.ContentKey = ""
+	r.RawKey = fields.RawKey
+	r.Summary = ""
+	r.SummaryJSON = nil
+	r.SimilarJSON = nil
+	r.DiagnosticsJSON = nil
+	r.Error = ""
+	r.StartedAt = nil
+	r.FinishedAt = nil
+	r.ProcessAttempts = 0
 	r.UpdatedAt = now
 
 	m.byID[id] = cloneReading(r)
