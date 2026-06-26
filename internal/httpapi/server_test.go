@@ -286,6 +286,24 @@ func TestIngest_NewURLCreatesPending(t *testing.T) {
 	}
 }
 
+func TestIngest_MarkdownURLCreatesFetchableWebReading(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	rr := h.authed(t, http.MethodPost, "/api/readings", map[string]string{"url": "https://example.com/notes.md"})
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	stored, err := h.store.GetByID(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if stored.SourceKind != reading.SourceWeb || stored.RawKey != "" {
+		t.Fatalf("stored source/raw = %q/%q, want web with no raw key", stored.SourceKind, stored.RawKey)
+	}
+}
+
 func TestIngest_ExistingReadyReturnsSame(t *testing.T) {
 	t.Parallel()
 
@@ -1009,6 +1027,28 @@ func TestImportBookmarks_BulkResult(t *testing.T) {
 	}
 	if !slices.Equal(h.submitter.ids, []string{"r1"}) {
 		t.Fatalf("submitted ids = %v, want only new reading r1", h.submitter.ids)
+	}
+}
+
+func TestImportBookmarks_MarkdownURLCreatesFetchableWebReading(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	rr := h.authed(t, http.MethodPost, "/api/readings/import/bookmarks", map[string]any{
+		"bookmarks": []map[string]string{
+			{"url": "https://example.com/export.markdown"},
+		},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	stored, err := h.store.GetByID(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if stored.SourceKind != reading.SourceWeb || stored.RawKey != "" {
+		t.Fatalf("stored source/raw = %q/%q, want web with no raw key", stored.SourceKind, stored.RawKey)
 	}
 }
 

@@ -216,7 +216,7 @@ func (s *Server) ingestURL(ctx context.Context, rawURL string) (statusResponse, 
 		URL:        strings.TrimSpace(rawURL),
 		URLKey:     key,
 		Status:     reading.Pending,
-		SourceKind: reading.ClassifySource(key),
+		SourceKind: urlIngestSourceKind(key),
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
@@ -231,6 +231,14 @@ func (s *Server) ingestURL(ctx context.Context, rawURL string) (statusResponse, 
 	}
 	s.Dispatcher.Submit(id)
 	return statusResponse{ID: id, Status: reading.Pending}, http.StatusCreated, nil
+}
+
+func urlIngestSourceKind(key string) reading.SourceKind {
+	kind := reading.ClassifySource(key)
+	if kind == reading.SourceMarkdown {
+		return reading.SourceWeb
+	}
+	return kind
 }
 
 func (s *Server) importMarkdownReading(ctx context.Context, rawURL, markdown, title string, tags []string) (statusResponse, int, error) {
