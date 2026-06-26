@@ -50,6 +50,7 @@ type BatchRequestCounts struct {
 // BatchResultType is the terminal outcome of one Anthropic batch item.
 type BatchResultType string
 
+// Batch result types returned by Anthropic Message Batches.
 const (
 	BatchResultSucceeded BatchResultType = "succeeded"
 	BatchResultErrored   BatchResultType = "errored"
