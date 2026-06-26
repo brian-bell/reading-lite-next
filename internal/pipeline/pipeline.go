@@ -129,6 +129,13 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 		if err != nil {
 			return dispatch.Classify(err)
 		}
+		// Unlike the fresh path below, this re-entry upsert is not gated by a
+		// guarded content checkpoint, so against a forced reprocess it is fenced
+		// only by ctx cancellation: forceClaim cancels the stale runCtx, and both
+		// vector adapters honor it (vector.Memory checks ctx.Err; vector.Postgres
+		// runs pool.Exec(ctx)), so a cancelled stale upsert never writes. A
+		// generation-fenced Upsert that would also stop a hypothetical
+		// non-context-aware adapter is deferred follow-up.
 		if err := p.upsertVector(ctx, r, c); err != nil {
 			return dispatch.Classify(err)
 		}

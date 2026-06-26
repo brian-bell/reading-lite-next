@@ -643,9 +643,12 @@ Ordered steps, each guarded and recorded into `diagnostics_json` (timings, tier,
 Build `Pipeline` with injected ports + `Store` + `Clock` + `IDGen` + `Config`. Keep each step a
 small private method returning `(stepResult, error)`; translate errors→`dispatch.Result` in one
 `classify(err)` switch (shared with Phase 3's mapping). Idempotent re-entry: guard content/tag
-writes with the dispatcher's run lease and use run-scoped blob keys, so stale forced runs cannot
-overwrite replacement content. Retried runs skip already-completed fetch/extract work and may
-repeat vector upsert after the content checkpoint — this is what makes `Retry` safe.
+writes with the store `ExpectedStartedAt` fence (the run lease) and use run-scoped blob keys, so
+stale forced runs cannot overwrite replacement content. That fence — not the dispatcher's
+bounded forced-recovery drain (`ForceWaitTTL`, which proceeds on timeout) — is the correctness
+backstop for a handler stuck in a non-cancelable call. Retried runs skip already-completed
+fetch/extract work and may repeat vector upsert after the content checkpoint — this is what
+makes `Retry` safe.
 
 **Refactor**: extract `acquireContent` (the source-kind switch) and `extractTiers` (the
 fallback ladder) as named, separately tested units.

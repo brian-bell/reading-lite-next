@@ -47,7 +47,13 @@ HTTP server from `main` yet.
   injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
   drains an in-memory channel and persists each run's lifecycle outcome, and a startup
   `Sweep` that re-dispatches readings left non-terminal by a crash, resuming each at its
-  stored attempt count.
+  stored attempt count. It also exposes a forced-recovery seam
+  (`ForceSubmit`/`ForceSubmitAfter`) for operator reprocess of stale in-flight work: it
+  cancels and token-replaces the in-process claim, waits for the stale handler to drain —
+  bounded by `ForceWaitTTL` (scheduled through the `Delay` seam) and proceeding on timeout so a
+  handler stuck in a non-cancelable call cannot wedge forced recovery or hang the caller — then
+  runs the caller's reset and re-enqueues. Correctness against late stale writes rests on the
+  store `ExpectedStartedAt` fence and run-scoped blob keys, not on the wait.
 - `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
   `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.

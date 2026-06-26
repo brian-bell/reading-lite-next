@@ -14,6 +14,9 @@ import (
 const (
 	defaultBuffer      = 1024
 	defaultMaxAttempts = 5
+	// defaultForceWaitTTL bounds how long ForceSubmitAfter waits for a cancelled
+	// stale handler to drain before it proceeds with recovery anyway.
+	defaultForceWaitTTL = 5 * time.Second
 )
 
 // Store is the narrow persistence surface the dispatcher needs: it advances a
@@ -46,6 +49,15 @@ type Dispatcher struct {
 	Buffer int
 	// RunningTTL bounds how long a running reading may stall before Sweep recovers it.
 	RunningTTL time.Duration
+	// ForceWaitTTL caps how long ForceSubmitAfter waits for a cancelled stale
+	// handler to exit before it proceeds with recovery anyway (defaults to
+	// defaultForceWaitTTL when unset). The wait is a best-effort clean drain to
+	// avoid orphan blobs; the store ExpectedStartedAt fence makes any late stale
+	// write a no-op, so proceeding on timeout is safe and keeps a handler stuck
+	// in a non-cancelable call from wedging forced recovery. The wait is
+	// scheduled through Delay, so Delay must be set whenever a forced submit can
+	// contend with an in-flight claim (redispatch already requires it).
+	ForceWaitTTL time.Duration
 	// Inline runs the initial handle synchronously on Submit/Sweep instead of via
 	// the worker channel, for deterministic handler tests and the HTTP layer. Note
 	// that re-dispatch after a retry or rate limit still flows through the injected
@@ -161,12 +173,19 @@ func (d *Dispatcher) ForceSubmit(id string) {
 }
 
 // ForceSubmitAfter serializes forced submissions, checks ctx before committing
-// to recovery, cancels and replaces any existing in-process claim, waits for an
-// already-running handler to exit, runs beforeQueue while the new claim is
-// reserved, then enqueues id at attempt 0. Waiting before beforeQueue ensures a
-// stale handler cannot write content blobs or vectors after the replacement
-// reset has started. If beforeQueue fails, the replacement claim is released and
-// no work is queued.
+// to recovery, cancels and replaces any existing in-process claim, waits
+// (bounded) for an already-running handler to drain, runs beforeQueue while the
+// new claim is reserved, then enqueues id at attempt 0. If beforeQueue fails,
+// the replacement claim is released and no work is queued.
+//
+// The wait is a best-effort clean drain, not a correctness gate: stale writes
+// are already neutralized by the store ExpectedStartedAt fence (content/tags),
+// run-scoped blob keys, and the vector upsert deferred behind the guarded
+// checkpoint on the fresh-acquire path. So the wait is bounded by ForceWaitTTL
+// and PROCEEDS on timeout — a stale handler stuck in a non-cancelable call
+// cannot wedge forced recovery (which is serialized on forceMu) or hang the
+// caller. ctx cancellation is a real abort: it releases the replacement claim
+// and returns ctx.Err().
 func (d *Dispatcher) ForceSubmitAfter(ctx context.Context, id string, beforeQueue func() error) error {
 	d.forceMu.Lock()
 	defer d.forceMu.Unlock()
@@ -176,7 +195,17 @@ func (d *Dispatcher) ForceSubmitAfter(ctx context.Context, id string, beforeQueu
 	}
 	it, wait := d.forceClaim(item{id: id})
 	if wait != nil {
-		<-wait
+		if err := d.awaitStaleHandler(ctx, wait); err != nil {
+			// ctx aborted mid-wait: relinquish the replacement claim so the id is
+			// reclaimable, otherwise it stays owned with no running handler and
+			// nothing queued, dropping every future Submit. forceClaim already
+			// cancelled the stale handler, so the row may be left Running; the
+			// startup Sweep + read-time stale annotation recover it. (No production
+			// caller reaches this: ForceSubmit and readingops.Reprocess both pass a
+			// non-cancelable ctx; it is here for a future cancelable caller.)
+			d.release(it)
+			return err
+		}
 	}
 	if !d.active(it) {
 		return nil
@@ -187,6 +216,36 @@ func (d *Dispatcher) ForceSubmitAfter(ctx context.Context, id string, beforeQueu
 	}
 	d.queueClaimed(it)
 	return nil
+}
+
+// awaitStaleHandler blocks until the cancelled stale handler exits, the
+// ForceWaitTTL budget elapses, or ctx is cancelled. A budget timeout is NOT an
+// error: the caller proceeds and relies on the store ExpectedStartedAt fence, so
+// a handler stuck in a non-cancelable call cannot wedge forced recovery. ctx
+// cancellation is a real abort and is returned to the caller. The budget rides
+// the Delay seam so the bound stays deterministic under FakeDelayer.
+func (d *Dispatcher) awaitStaleHandler(ctx context.Context, wait <-chan struct{}) error {
+	if d.Delay == nil {
+		// No delay seam wired: skip the best-effort drain and proceed immediately
+		// rather than nil-panic inside a caller's goroutine. The store
+		// ExpectedStartedAt fence still makes any late stale write a no-op.
+		return nil
+	}
+	budget := d.ForceWaitTTL
+	if budget <= 0 {
+		budget = defaultForceWaitTTL
+	}
+	timeout := make(chan struct{})
+	d.Delay.After(budget, func() { close(timeout) })
+
+	select {
+	case <-wait: // clean exit: stale handler drained, no orphan
+		return nil
+	case <-timeout: // budget elapsed: proceed; the store fence covers safety
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (d *Dispatcher) forceClaim(it item) (item, <-chan struct{}) {

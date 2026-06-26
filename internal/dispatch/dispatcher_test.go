@@ -140,6 +140,29 @@ func always(o dispatch.Outcome) func(int, string) dispatch.Result {
 	return func(int, string) dispatch.Result { return dispatch.Result{Outcome: o} }
 }
 
+// waitForPending spins until the FakeDelayer holds want scheduled-but-unfired
+// delays. The forced-recovery budget is scheduled inside awaitStaleHandler only
+// after forceClaim runs, so PendingLen()==1 is a rendezvous proving the forcing
+// goroutine has reached the bounded-wait select — letting a test fire the budget
+// (or cancel) deterministically rather than racing on a sleep.
+func waitForPending(t *testing.T, delay *dispatch.FakeDelayer, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if delay.PendingLen() == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("pending delays = %d, want %d (force budget never scheduled)", delay.PendingLen(), want)
+		case <-tick.C:
+		}
+	}
+}
+
 func TestDispatch_SubmitRunsHandlerOnce(t *testing.T) {
 	t.Parallel()
 
@@ -920,6 +943,261 @@ func TestDispatch_ConcurrentForceSubmitAfterSerializesCallbacks(t *testing.T) {
 	}
 	if got := h.count(); got != 2 {
 		t.Fatalf("handler calls = %d, want both forced replacements queued", got)
+	}
+}
+
+// TestDispatch_ForceSubmitBoundedWaitProceedsOnStuckHandler pins the PR #8 fix:
+// a stale handler stuck in a non-cancelable call must not block forced recovery
+// forever. ForceSubmitAfter waits at most ForceWaitTTL (scheduled through the
+// Delay seam) for the cancelled handler to exit, then proceeds with beforeQueue
+// + enqueue under the store ExpectedStartedAt fence.
+func TestDispatch_ForceSubmitBoundedWaitProceedsOnStuckHandler(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	entered := make(chan int, 2)
+	stuck := make(chan struct{}) // never closed: call 0 ignores ctx and blocks
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		entered <- call
+		if call == 0 {
+			<-stuck // ignore ctx entirely (simulates a non-cancelable adapter)
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	delay := &dispatch.FakeDelayer{}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: delay, Workers: 2, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(runDone)
+	}()
+
+	d.Submit("r1")
+	if got := <-entered; got != 0 {
+		t.Fatalf("first handler call = %d, want 0", got)
+	}
+
+	var beforeRan atomic.Bool
+	forced := make(chan error, 1)
+	go func() {
+		forced <- d.ForceSubmitAfter(context.Background(), "r1", func() error {
+			beforeRan.Store(true)
+			return nil
+		})
+	}()
+
+	// The forcing goroutine cancels the stale handler (which ignores it) and then
+	// blocks in the bounded wait: the budget is scheduled but not yet fired.
+	waitForPending(t, delay, 1)
+	if beforeRan.Load() {
+		t.Fatal("beforeQueue ran before the wait budget fired")
+	}
+	select {
+	case got := <-entered:
+		t.Fatalf("replacement handler started before the wait budget fired: call %d", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Fire the budget: the wait gives up on the stuck handler and proceeds.
+	delay.FireAll()
+
+	select {
+	case err := <-forced:
+		if err != nil {
+			t.Fatalf("ForceSubmitAfter after budget = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceSubmitAfter did not return after the wait budget fired (unbounded wait?)")
+	}
+	if !beforeRan.Load() {
+		t.Fatal("beforeQueue did not run after the wait budget fired")
+	}
+	select {
+	case got := <-entered:
+		if got != 1 {
+			t.Fatalf("replacement handler call = %d, want 1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement handler did not start after forced recovery proceeded")
+	}
+	waitStatus(t, st, "r1", reading.Ready)
+
+	close(stuck) // release the stale handler for clean shutdown
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+// TestDispatch_ForceSubmitAfterCtxCanceledMidWaitReleasesClaim pins the
+// ctx-aware half of the bound: cancelling ctx while the bounded wait is blocked
+// aborts the force, runs no beforeQueue, queues nothing, and — critically —
+// releases the replacement claim so a later Submit is not silently dropped.
+func TestDispatch_ForceSubmitAfterCtxCanceledMidWaitReleasesClaim(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	entered := make(chan int, 2)
+	stuck := make(chan struct{}) // call 0 ignores ctx and blocks
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		entered <- call
+		if call == 0 {
+			<-stuck
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	delay := &dispatch.FakeDelayer{}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: delay, Workers: 2, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(runDone)
+	}()
+
+	d.Submit("r1")
+	if got := <-entered; got != 0 {
+		t.Fatalf("first handler call = %d, want 0", got)
+	}
+
+	forceCtx, cancelForce := context.WithCancel(context.Background())
+	var beforeRan atomic.Bool
+	forced := make(chan error, 1)
+	go func() {
+		forced <- d.ForceSubmitAfter(forceCtx, "r1", func() error {
+			beforeRan.Store(true)
+			return nil
+		})
+	}()
+
+	// Rendezvous: the budget is scheduled only after forceClaim, so once it is
+	// pending the goroutine is provably past the top-of-function ctx.Err() early
+	// return and inside the wait select. Cancelling now exercises the mid-wait
+	// abort path (not the pre-claim early return).
+	waitForPending(t, delay, 1)
+	cancelForce()
+
+	select {
+	case err := <-forced:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ForceSubmitAfter = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceSubmitAfter did not return after mid-wait ctx cancel")
+	}
+	if beforeRan.Load() {
+		t.Fatal("beforeQueue ran for an aborted force")
+	}
+
+	// The abort released the replacement claim: a later Submit must run a fresh
+	// handler (claim not leaked). Worker 2 is free to run it even while the stale
+	// call 0 stays parked.
+	d.Submit("r1")
+	select {
+	case got := <-entered:
+		if got != 1 {
+			t.Fatalf("post-abort handler call = %d, want 1 (abort must release the claim)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-abort Submit did not run a fresh handler (claim leaked?)")
+	}
+	waitStatus(t, st, "r1", reading.Ready)
+
+	close(stuck)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+// TestDispatch_ForceSubmitStuckHandlerDoesNotWedgeOtherRecoveries proves the
+// amplification in the finding is fixed: a stuck stale handler on one reading no
+// longer holds forceMu forever, so forced recovery of a different reading still
+// completes.
+func TestDispatch_ForceSubmitStuckHandlerDoesNotWedgeOtherRecoveries(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+	seedPending(t, st, clk, "r2", 0)
+
+	entered := make(chan string, 4)
+	stuck := make(chan struct{}) // r1's first handler ignores ctx and blocks
+	var r1Stuck atomic.Bool
+	h := &recordingHandler{fn: func(_ int, id string) dispatch.Result {
+		entered <- id
+		if id == "r1" && r1Stuck.CompareAndSwap(false, true) {
+			<-stuck
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	delay := &dispatch.FakeDelayer{}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: delay, Workers: 2, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(runDone)
+	}()
+
+	d.Submit("r1")
+	if got := <-entered; got != "r1" {
+		t.Fatalf("first handler ran for %q, want r1", got)
+	}
+
+	force1 := make(chan error, 1)
+	go func() {
+		force1 <- d.ForceSubmitAfter(context.Background(), "r1", func() error { return nil })
+	}()
+	waitForPending(t, delay, 1) // r1's force is in the bounded wait, holding forceMu
+
+	force2 := make(chan error, 1)
+	go func() {
+		force2 <- d.ForceSubmitAfter(context.Background(), "r2", func() error { return nil })
+	}()
+
+	// r2's recovery cannot proceed while a stuck r1 holds forceMu.
+	select {
+	case <-force2:
+		t.Fatal("r2 forced recovery completed while a stuck r1 held forceMu")
+	case got := <-entered:
+		t.Fatalf("r2 replacement ran while forceMu was held: %q", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Firing r1's budget unblocks its wait → it proceeds and releases forceMu, so
+	// r2's recovery completes and its replacement runs.
+	delay.FireAll()
+
+	if err := <-force1; err != nil {
+		t.Fatalf("r1 ForceSubmitAfter = %v, want nil", err)
+	}
+	if err := <-force2; err != nil {
+		t.Fatalf("r2 ForceSubmitAfter = %v, want nil", err)
+	}
+	waitStatus(t, st, "r2", reading.Ready)
+
+	close(stuck)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
 	}
 }
 
