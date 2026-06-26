@@ -569,7 +569,7 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
 - [ ] `go test -race ./internal/pipeline/...` passes clean, and `go test -cover` reports the
   package at ≥ 90% (PLAN §2 gate for the domain/pipeline layer).
 - [ ] **Happy path (web).** `TestPipeline_HappyPath`: a web URL runs
-  fetch→extract→blobs(raw+content)→embed→`Vectors.Upsert`→`Vectors.Query`→summarize→ready,
+  fetch→extract→embed→`Vectors.Query`→blobs(raw+content)→guarded checkpoint→`Vectors.Upsert`→summarize→ready,
   with `extraction_mode=readability`, the summary's tags persisted via `ReplaceTags`,
   `content_key`/`raw_key` set, `similar_json` hydrated from the matched neighbor, and exactly
   one summarizer call and one notify.
@@ -589,9 +589,9 @@ against TDD plan §7 and confirm the branches, the status/content split, and ide
   recorded in `diagnostics_json`), and `TestPipeline_TransientStepErrorsRetry`.
 - [ ] **Idempotent re-entry / "summarize once".** `TestPipeline_SummarizerError_RetriesNotDoubleSummarize`:
   a summarize failure persists a content checkpoint (`content_key`), so the retried run skips
-  fetch/extract/embed (each called once across both runs) and re-summarizes exactly once.
+  fetch/extract, may re-embed to recover vector upsert, and re-summarizes exactly once.
 - [ ] **Server-derived blob keys.** Read `rawKey`/`contentKey`: both derive from the reading id
-  only (no client input), the Phase 11 path-traversal guard.
+  and dispatcher run timestamp only (no client input), the Phase 11 path-traversal guard.
 - [ ] **Automated (B/§make verify):** `TestAcceptance_PipelineProcess` drives the web→ready,
   Reddit-guidance, and rate-limit-requeue paths through an inline dispatcher, plus compile-time
   assertions that `store.Memory` satisfies `pipeline.Store` and `Pipeline.Process` matches the

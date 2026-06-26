@@ -159,11 +159,17 @@ func (p *Postgres) UpdateContent(ctx context.Context, id string, fields ContentF
 		SimilarJson:     fields.SimilarJSON,
 		DiagnosticsJson: fields.DiagnosticsJSON,
 		UpdatedAt:       timestamptz(now),
+		Column15:        timestamptzPtr(fields.ExpectedStartedAt),
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
+		if fields.ExpectedStartedAt != nil {
+			if _, getErr := p.GetByID(ctx, id); getErr == nil {
+				return ErrConflict
+			}
+		}
 		return ErrNotFound
 	}
 	return nil
@@ -216,16 +222,26 @@ func (p *Postgres) Reprocess(ctx context.Context, id string, fields ReprocessFie
 }
 
 // ReplaceTags replaces a reading's tag set.
-func (p *Postgres) ReplaceTags(ctx context.Context, id string, tags []string) error {
+func (p *Postgres) ReplaceTags(ctx context.Context, id string, tags []string, fields TagFields) error {
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	rows, err := p.queries.ReplaceReadingTags(ctx, storedb.ReplaceReadingTagsParams{
 		ID:        id,
 		Tags:      normalizeTags(tags),
-		UpdatedAt: timestamptz(time.Now().UTC()),
+		UpdatedAt: timestamptz(now),
+		Column4:   timestamptzPtr(fields.ExpectedStartedAt),
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
+		if fields.ExpectedStartedAt != nil {
+			if _, getErr := p.GetByID(ctx, id); getErr == nil {
+				return ErrConflict
+			}
+		}
 		return ErrNotFound
 	}
 	return nil

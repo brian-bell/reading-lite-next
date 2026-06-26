@@ -57,7 +57,8 @@ set
   similar_json = $12,
   diagnostics_json = $13,
   updated_at = $14
-where id = $1;
+where id = $1
+  and ($15::timestamptz is null or (status = 'running' and started_at = $15));
 
 -- name: UpdateReadingImport :execrows
 update readings
@@ -110,7 +111,8 @@ where id = $1;
 -- name: ReplaceReadingTags :execrows
 update readings
 set tags = $2, updated_at = $3
-where id = $1;
+where id = $1
+  and ($4::timestamptz is null or (status = 'running' and started_at = $4));
 
 -- name: CountReadings :one
 select count(*)

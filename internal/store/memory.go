@@ -145,6 +145,9 @@ func (m *Memory) UpdateContent(ctx context.Context, id string, fields ContentFie
 	if !ok {
 		return ErrNotFound
 	}
+	if fields.ExpectedStartedAt != nil && (r.Status != reading.Running || r.StartedAt == nil || !r.StartedAt.Equal(*fields.ExpectedStartedAt)) {
+		return ErrConflict
+	}
 
 	now := fields.Now
 	if now.IsZero() {
@@ -258,7 +261,7 @@ func (m *Memory) Reprocess(ctx context.Context, id string, fields ReprocessField
 }
 
 // ReplaceTags replaces a reading's tag set.
-func (m *Memory) ReplaceTags(ctx context.Context, id string, tags []string) error {
+func (m *Memory) ReplaceTags(ctx context.Context, id string, tags []string, fields TagFields) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -270,8 +273,15 @@ func (m *Memory) ReplaceTags(ctx context.Context, id string, tags []string) erro
 	if !ok {
 		return ErrNotFound
 	}
+	if fields.ExpectedStartedAt != nil && (r.Status != reading.Running || r.StartedAt == nil || !r.StartedAt.Equal(*fields.ExpectedStartedAt)) {
+		return ErrConflict
+	}
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	r.Tags = normalizeTags(tags)
-	r.UpdatedAt = time.Now().UTC()
+	r.UpdatedAt = now
 	m.byID[id] = cloneReading(r)
 	return nil
 }

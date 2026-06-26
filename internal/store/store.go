@@ -67,6 +67,11 @@ type Pending struct {
 type ContentFields struct {
 	// Now is the updated_at timestamp to record (falls back to wall clock when zero).
 	Now time.Time
+	// ExpectedStartedAt, when set, fences the write to the run that started at
+	// this timestamp. The write succeeds only while the row is still running with
+	// that same started_at, preventing stale in-flight handlers from overwriting
+	// replacement content after a manual reprocess.
+	ExpectedStartedAt *time.Time
 	// Title is the extracted or refined article title.
 	Title string
 	// Author is the extracted article author.
@@ -113,6 +118,13 @@ type ReprocessFields struct {
 	Title  string
 }
 
+// TagFields carries optional metadata for replacing tags.
+type TagFields struct {
+	Now time.Time
+	// ExpectedStartedAt has the same lease semantics as ContentFields.
+	ExpectedStartedAt *time.Time
+}
+
 // StatusFields carries optional metadata to apply during UpdateStatus.
 type StatusFields struct {
 	Now             time.Time
@@ -134,7 +146,7 @@ type Store interface {
 	UpdateContent(ctx context.Context, id string, fields ContentFields) error
 	UpdateImport(ctx context.Context, id string, fields ImportFields) error
 	Reprocess(ctx context.Context, id string, fields ReprocessFields) error
-	ReplaceTags(ctx context.Context, id string, tags []string) error
+	ReplaceTags(ctx context.Context, id string, tags []string, fields TagFields) error
 	Search(ctx context.Context, q Query) (Page, error)
 	ListNonTerminal(ctx context.Context, runningCutoff time.Time) ([]Pending, error)
 	Delete(ctx context.Context, id string) error

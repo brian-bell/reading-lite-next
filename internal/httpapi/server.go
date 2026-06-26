@@ -3,6 +3,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -29,7 +30,7 @@ const maxBodyBytes = 1 << 20
 // Dispatcher is the queue surface the HTTP layer needs.
 type Dispatcher interface {
 	Submit(id string)
-	ForceSubmitAfter(id string, beforeQueue func() error) error
+	ForceSubmitAfter(ctx context.Context, id string, beforeQueue func() error) error
 }
 
 // Server wires the HTTP API to the core ports.

@@ -33,7 +33,7 @@ import (
 type Store interface {
 	GetByID(ctx context.Context, id string) (reading.Reading, error)
 	UpdateContent(ctx context.Context, id string, fields store.ContentFields) error
-	ReplaceTags(ctx context.Context, id string, tags []string) error
+	ReplaceTags(ctx context.Context, id string, tags []string, fields store.TagFields) error
 }
 
 // Config tunes pipeline behavior.
@@ -100,6 +100,7 @@ type content struct {
 	contentKey  string
 	rawKey      string
 	similarJSON json.RawMessage
+	vec         []float32
 }
 
 // Process runs the full pipeline for one reading and reports the outcome. The
@@ -120,12 +121,15 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 	diag := diagnostics{Source: string(r.SourceKind)}
 
 	// Idempotent re-entry: a non-empty content_key means a prior run already
-	// acquired, extracted, embedded, and indexed this reading and checkpointed
-	// the result. Resume from the stored content instead of redoing that work —
-	// this is what makes a summarize-step Retry cheap and safe.
+	// acquired/extracted this reading and checkpointed the content. Resume from
+	// the stored content instead of fetching/extracting again; vector upsert is
+	// retried after the checkpoint so a post-checkpoint failure can recover.
 	if r.ContentKey != "" {
 		c, err := p.reuse(ctx, r, &diag)
 		if err != nil {
+			return dispatch.Classify(err)
+		}
+		if err := p.upsertVector(ctx, r, c); err != nil {
 			return dispatch.Classify(err)
 		}
 		return p.summarizeAndFinish(ctx, r, c, diag)
@@ -138,8 +142,12 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 
 	// Checkpoint the acquired content before the (separately retryable)
 	// summarize step, so a summarize failure does not force re-fetching,
-	// re-extracting, and re-embedding on the retried run.
-	if err := p.Store.UpdateContent(ctx, id, p.contentFields(c, diag, summarize.Summary{})); err != nil {
+	// re-extracting on the retried run. Vector upsert happens after this guarded
+	// checkpoint so a stale forced run cannot overwrite a replacement's vector.
+	if err := p.Store.UpdateContent(ctx, id, p.contentFields(r, c, diag, summarize.Summary{})); err != nil {
+		return dispatch.Classify(err)
+	}
+	if err := p.upsertVector(ctx, r, c); err != nil {
 		return dispatch.Classify(err)
 	}
 
@@ -172,10 +180,13 @@ func (p *Pipeline) summarizeAndFinish(ctx context.Context, r reading.Reading, c 
 	// transiently the dispatcher re-dispatches the reading, so notifying earlier
 	// could send a "ready" email for a still-pending reading — and a duplicate on
 	// the retry. Notify only once the writes that gate readiness have succeeded.
-	if err := p.Store.UpdateContent(ctx, r.ID, p.contentFields(c, diag, sum)); err != nil {
+	if err := p.Store.UpdateContent(ctx, r.ID, p.contentFields(r, c, diag, sum)); err != nil {
 		return dispatch.Classify(err)
 	}
-	if err := p.Store.ReplaceTags(ctx, r.ID, sum.Tags); err != nil {
+	if err := p.Store.ReplaceTags(ctx, r.ID, sum.Tags, store.TagFields{
+		Now:               p.Clock.Now(),
+		ExpectedStartedAt: r.StartedAt,
+	}); err != nil {
 		return dispatch.Classify(err)
 	}
 
@@ -192,7 +203,7 @@ func (p *Pipeline) summarizeAndFinish(ctx context.Context, r reading.Reading, c 
 	// rare duplicate is acceptable; idempotent/exactly-once delivery belongs to the
 	// real Notifier adapter (Phase 6) and lifecycle hardening (Phase 11).
 	if p.notifyBestEffort(ctx, r, sum, &diag) {
-		_ = p.Store.UpdateContent(ctx, r.ID, p.contentFields(c, diag, sum))
+		_ = p.Store.UpdateContent(ctx, r.ID, p.contentFields(r, c, diag, sum))
 	}
 
 	return dispatch.Result{Outcome: dispatch.Done}
@@ -227,7 +238,7 @@ func (p *Pipeline) reuse(ctx context.Context, r reading.Reading, diag *diagnosti
 // YouTube) fetches and extracts. YouTube has no dedicated branch here — its
 // oEmbed floor and transcript handling live in the Phase 7 extractor adapter, so
 // in Phase 5 a YouTube URL flows through the same fetch+extract path as web (it
-// is fetchable, unlike Reddit). Both paths share the embed/upsert/query/blob
+// is fetchable, unlike Reddit). Both paths share the embed/query/blob
 // tail in index.
 func (p *Pipeline) acquire(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
 	if r.SourceKind == reading.SourceMarkdown {
@@ -259,8 +270,8 @@ func (p *Pipeline) acquireFetched(ctx context.Context, r reading.Reading, diag *
 		wordCount:  article.WordCount,
 		mode:       string(article.Mode),
 		markdown:   article.Markdown,
-		contentKey: contentKey(r.ID),
-		rawKey:     rawKey(r.ID),
+		contentKey: contentKey(r),
+		rawKey:     rawKey(r),
 	}
 	diag.ExtractionMode = c.mode
 
@@ -287,7 +298,7 @@ func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, diag 
 	c := content{
 		title:      r.Title,
 		markdown:   string(data),
-		contentKey: contentKey(r.ID),
+		contentKey: contentKey(r),
 		rawKey:     r.RawKey,
 		// A markdown import is not extracted from a fetched page, so it has no
 		// extraction tier: mode is intentionally left empty (the {readability,
@@ -299,17 +310,16 @@ func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, diag 
 	return c, nil
 }
 
-// index embeds the content, upserts and queries the vector index to find similar
-// readings, snapshots them, and writes the extracted content blob. It is the
-// shared tail of every acquire path.
+// index embeds the content, queries the vector index to find similar readings,
+// snapshots them, and writes the extracted content blob. The vector upsert is
+// deliberately deferred until after the guarded content checkpoint succeeds, so
+// a stale forced run cannot overwrite a replacement's vector.
 func (p *Pipeline) index(ctx context.Context, r reading.Reading, c *content, diag *diagnostics) error {
 	vec, err := p.Embedder.Embed(ctx, embedText(*c))
 	if err != nil {
 		return err
 	}
-	if err := p.Vectors.Upsert(ctx, r.ID, vec); err != nil {
-		return err
-	}
+	c.vec = vec
 
 	matches, err := p.Vectors.Query(ctx, vec, p.topK(), r.ID)
 	if err != nil {
@@ -326,6 +336,18 @@ func (p *Pipeline) index(ctx context.Context, r reading.Reading, c *content, dia
 	// signal). This order is load-bearing: a crash between the two leaves an orphan
 	// blob but no dangling pointer, so a retried run cleanly redoes acquisition.
 	return p.Blobs.Put(ctx, c.contentKey, []byte(c.markdown), "text/markdown")
+}
+
+func (p *Pipeline) upsertVector(ctx context.Context, r reading.Reading, c content) error {
+	vec := c.vec
+	if len(vec) == 0 {
+		var err error
+		vec, err = p.Embedder.Embed(ctx, embedText(c))
+		if err != nil {
+			return err
+		}
+	}
+	return p.Vectors.Upsert(ctx, r.ID, vec)
 }
 
 // hydrate turns vector matches into snapshot items by loading each match's
@@ -369,25 +391,26 @@ func (p *Pipeline) notifyBestEffort(ctx context.Context, r reading.Reading, sum 
 	return false
 }
 
-func (p *Pipeline) contentFields(c content, diag diagnostics, sum summarize.Summary) store.ContentFields {
+func (p *Pipeline) contentFields(r reading.Reading, c content, diag diagnostics, sum summarize.Summary) store.ContentFields {
 	title := c.title
 	if sum.Title != "" {
 		title = sum.Title
 	}
 	return store.ContentFields{
-		Now:             p.Clock.Now(),
-		Title:           title,
-		Author:          c.author,
-		Site:            c.site,
-		Lang:            c.lang,
-		WordCount:       c.wordCount,
-		ExtractionMode:  c.mode,
-		ContentKey:      c.contentKey,
-		RawKey:          c.rawKey,
-		Summary:         sum.Summary,
-		SummaryJSON:     sum.JSON,
-		SimilarJSON:     c.similarJSON,
-		DiagnosticsJSON: marshalDiagnostics(diag),
+		Now:               p.Clock.Now(),
+		ExpectedStartedAt: r.StartedAt,
+		Title:             title,
+		Author:            c.author,
+		Site:              c.site,
+		Lang:              c.lang,
+		WordCount:         c.wordCount,
+		ExtractionMode:    c.mode,
+		ContentKey:        c.contentKey,
+		RawKey:            c.rawKey,
+		Summary:           sum.Summary,
+		SummaryJSON:       sum.JSON,
+		SimilarJSON:       c.similarJSON,
+		DiagnosticsJSON:   marshalDiagnostics(diag),
 	}
 }
 
@@ -460,10 +483,17 @@ func classifyFetchStatus(status int) error {
 	}
 }
 
-func rawKey(id string) string {
-	return "readings/" + id + "/raw"
+func rawKey(r reading.Reading) string {
+	return "readings/" + r.ID + "/" + runKey(r) + "/raw"
 }
 
-func contentKey(id string) string {
-	return "readings/" + id + "/content.md"
+func contentKey(r reading.Reading) string {
+	return "readings/" + r.ID + "/" + runKey(r) + "/content.md"
+}
+
+func runKey(r reading.Reading) string {
+	if r.StartedAt == nil {
+		return "run"
+	}
+	return fmt.Sprintf("run-%d", r.StartedAt.UnixNano())
 }

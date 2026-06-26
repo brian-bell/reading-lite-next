@@ -550,6 +550,45 @@ func RunContract(t *testing.T, newStore Factory) {
 		if err := s.UpdateContent(ctx, "missing", store.ContentFields{Now: updatedAt}); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("UpdateContent missing error = %v, want ErrNotFound", err)
 		}
+
+		guarded := sampleReading("guarded", "https://example.com/guarded", at(1), reading.Running)
+		guarded.StartedAt = &startedAt
+		seed(ctx, t, s, guarded)
+		if err := s.UpdateContent(ctx, guarded.ID, store.ContentFields{
+			Now:               at(5),
+			ExpectedStartedAt: &startedAt,
+			Title:             "Guarded content",
+			ContentKey:        "readings/guarded/content",
+		}); err != nil {
+			t.Fatalf("guarded UpdateContent: %v", err)
+		}
+		gotGuarded, err := s.GetByID(ctx, guarded.ID)
+		if err != nil {
+			t.Fatalf("GetByID guarded: %v", err)
+		}
+		if gotGuarded.Title != "Guarded content" || gotGuarded.ContentKey != "readings/guarded/content" {
+			t.Fatalf("guarded content = title %q key %q, want written content",
+				gotGuarded.Title, gotGuarded.ContentKey)
+		}
+
+		if err := s.Reprocess(ctx, guarded.ID, store.ReprocessFields{Now: at(6)}); err != nil {
+			t.Fatalf("Reprocess guarded: %v", err)
+		}
+		if err := s.UpdateContent(ctx, guarded.ID, store.ContentFields{
+			Now:               at(7),
+			ExpectedStartedAt: &startedAt,
+			Title:             "Stale content",
+			ContentKey:        "readings/guarded/stale",
+		}); !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("stale guarded UpdateContent error = %v, want ErrConflict", err)
+		}
+		gotGuarded, err = s.GetByID(ctx, guarded.ID)
+		if err != nil {
+			t.Fatalf("GetByID guarded after stale write: %v", err)
+		}
+		if gotGuarded.Title == "Stale content" || gotGuarded.ContentKey == "readings/guarded/stale" {
+			t.Fatalf("stale guarded content was written: %+v", gotGuarded)
+		}
 	})
 
 	t.Run("UpdateImport", func(t *testing.T) {
@@ -682,10 +721,10 @@ func RunContract(t *testing.T, newStore Factory) {
 		r.Tags = []string{"old"}
 		seed(ctx, t, s, r)
 
-		if err := s.ReplaceTags(ctx, r.ID, []string{"go", "db"}); err != nil {
+		if err := s.ReplaceTags(ctx, r.ID, []string{"go", "db"}, store.TagFields{}); err != nil {
 			t.Fatalf("ReplaceTags first: %v", err)
 		}
-		if err := s.ReplaceTags(ctx, r.ID, []string{"go", "db"}); err != nil {
+		if err := s.ReplaceTags(ctx, r.ID, []string{"go", "db"}, store.TagFields{}); err != nil {
 			t.Fatalf("ReplaceTags idempotent: %v", err)
 		}
 		got, err := s.GetByID(ctx, r.ID)
@@ -701,6 +740,40 @@ func RunContract(t *testing.T, newStore Factory) {
 		}
 		if got := ids(page.Readings); !slices.Equal(got, []string{r.ID}) {
 			t.Fatalf("Search replaced tags ids = %v, want [%s]", got, r.ID)
+		}
+
+		startedAt := at(2)
+		guarded := sampleReading("guarded-tags", "https://example.com/guarded-tags", at(1), reading.Running)
+		guarded.StartedAt = &startedAt
+		seed(ctx, t, s, guarded)
+		if err := s.ReplaceTags(ctx, guarded.ID, []string{"fresh"}, store.TagFields{
+			Now:               at(3),
+			ExpectedStartedAt: &startedAt,
+		}); err != nil {
+			t.Fatalf("guarded ReplaceTags: %v", err)
+		}
+		gotGuarded, err := s.GetByID(ctx, guarded.ID)
+		if err != nil {
+			t.Fatalf("GetByID guarded tags: %v", err)
+		}
+		if !slices.Equal(gotGuarded.Tags, []string{"fresh"}) {
+			t.Fatalf("guarded Tags = %v, want [fresh]", gotGuarded.Tags)
+		}
+		if err := s.Reprocess(ctx, guarded.ID, store.ReprocessFields{Now: at(4)}); err != nil {
+			t.Fatalf("Reprocess guarded tags: %v", err)
+		}
+		if err := s.ReplaceTags(ctx, guarded.ID, []string{"stale"}, store.TagFields{
+			Now:               at(5),
+			ExpectedStartedAt: &startedAt,
+		}); !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("stale guarded ReplaceTags error = %v, want ErrConflict", err)
+		}
+		gotGuarded, err = s.GetByID(ctx, guarded.ID)
+		if err != nil {
+			t.Fatalf("GetByID guarded tags after stale write: %v", err)
+		}
+		if slices.Equal(gotGuarded.Tags, []string{"stale"}) {
+			t.Fatalf("stale tags were written: %v", gotGuarded.Tags)
 		}
 	})
 

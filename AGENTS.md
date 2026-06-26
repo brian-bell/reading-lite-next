@@ -88,13 +88,14 @@ HTTP server from `main` yet.
   (`vector.Memory` on every run, `vector.Postgres` under `//go:build integration`).
 - `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
   `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
-  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches + extracts), embeds and
-  upserts a vector, snapshots similar readings, summarizes once, optionally notifies
+  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches + extracts), embeds,
+  snapshots similar readings, persists a guarded content checkpoint, upserts a vector, summarizes once, optionally notifies
   (a notify failure never fails the reading), and persists the content via `store.UpdateContent`
   + `ReplaceTags`. It returns a `dispatch.Result` (the dispatcher owns lifecycle status; the
   pipeline owns content). Re-entry is idempotent: a persisted `content_key` checkpoint lets a
-  retried run skip fetch/extract/embed and resume at summarize. Blob keys are derived from the
-  server-side reading id.
+  retried run skip fetch/extract and resume near summarize; it may re-embed to recover a vector
+  upsert after the guarded checkpoint. Blob keys are derived from the server-side reading id and
+  dispatcher run timestamp.
 - `internal/readingops/` defines the application command service for multi-resource HTTP
   workflows: URL ingest, markdown import and failed-reading replacement, bookmark import, and
   manual reprocess. It is the owner of sequencing across `store.Store`, `blobs.Blobs`, and the
@@ -170,8 +171,8 @@ The project targets Go 1.26.
   harness's `whiteboxAllowed` allowlist; every other `_test.go` stays a black-box `_test` package.
 - Keep the pipeline's status/content split: the dispatcher owns lifecycle status (it marks
   running/ready/failed/pending), the pipeline owns content. `Pipeline.Process` maps step errors
-  to outcomes through the shared `dispatch.Classify`, and persists a content checkpoint before
-  the summarize step so a retried run resumes idempotently from the stored `content_key`.
+  to outcomes through the shared `dispatch.Classify`, and persists a guarded content checkpoint
+  before the summarize step so a retried run resumes idempotently from the stored `content_key`.
 - Keep the HTTP API thin: handlers should delegate command workflows to `internal/readingops`,
   stale detail overlays to `reading.AnnotateStale`, queries to `store.Store`, and blob payloads
   to `blobs.Blobs`. Preserve the single JSON error envelope

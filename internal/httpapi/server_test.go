@@ -32,7 +32,7 @@ func (s *submitter) Submit(id string) {
 	s.ids = append(s.ids, id)
 }
 
-func (s *submitter) ForceSubmitAfter(id string, beforeQueue func() error) error {
+func (s *submitter) ForceSubmitAfter(_ context.Context, id string, beforeQueue func() error) error {
 	if err := beforeQueue(); err != nil {
 		return err
 	}

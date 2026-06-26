@@ -1017,7 +1017,7 @@ func (s *acceptanceSubmitter) Submit(id string) {
 	s.ids = append(s.ids, id)
 }
 
-func (s *acceptanceSubmitter) ForceSubmitAfter(id string, beforeQueue func() error) error {
+func (s *acceptanceSubmitter) ForceSubmitAfter(_ context.Context, id string, beforeQueue func() error) error {
 	if err := beforeQueue(); err != nil {
 		return err
 	}

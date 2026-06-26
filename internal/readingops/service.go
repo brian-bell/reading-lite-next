@@ -19,7 +19,7 @@ import (
 // Dispatcher is the queue surface the command service needs.
 type Dispatcher interface {
 	Submit(id string)
-	ForceSubmitAfter(id string, beforeQueue func() error) error
+	ForceSubmitAfter(ctx context.Context, id string, beforeQueue func() error) error
 }
 
 // Service coordinates store, blob, and dispatch operations for reading commands.
@@ -192,8 +192,11 @@ func (s *Service) Reprocess(ctx context.Context, id string) (StatusResult, error
 	force := (got.Status == reading.Pending || got.Status == reading.Running) && annotated.Status == reading.Failed
 
 	if force {
-		if err := s.Dispatcher.ForceSubmitAfter(id, func() error {
-			return s.markPending(ctx, id)
+		// Once forced recovery cancels an in-flight run, the reset/enqueue must not
+		// be aborted by the client disconnecting from the HTTP request.
+		recoveryCtx := context.WithoutCancel(ctx)
+		if err := s.Dispatcher.ForceSubmitAfter(recoveryCtx, id, func() error {
+			return s.markPending(recoveryCtx, id)
 		}); err != nil {
 			return StatusResult{}, err
 		}

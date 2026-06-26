@@ -738,12 +738,33 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 		t.Fatalf("first handler call = %d, want 0", got)
 	}
 
-	d.ForceSubmit("r1")
-	if got := <-entered; got != 1 {
-		t.Fatalf("forced handler call = %d, want 1", got)
+	forced := make(chan struct{})
+	go func() {
+		d.ForceSubmit("r1")
+		close(forced)
+	}()
+
+	select {
+	case got := <-entered:
+		t.Fatalf("forced handler call started before stale handler exited: %d", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(firstProceed)
+	select {
+	case got := <-entered:
+		if got != 1 {
+			t.Fatalf("forced handler call = %d, want 1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forced handler did not start after stale handler exited")
+	}
+	select {
+	case <-forced:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceSubmit did not return after replacement queued")
 	}
 	waitStatus(t, st, "r1", reading.Ready)
-	close(firstProceed)
 
 	cancel()
 	select {
@@ -760,6 +781,61 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 	}
 }
 
+func TestDispatch_ForceSubmitAfterCanceledBeforeClaimLeavesRunAlone(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	entered := make(chan int, 1)
+	releaseFirst := make(chan struct{})
+	firstReturned := make(chan struct{})
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		entered <- call
+		<-releaseFirst
+		close(firstReturned)
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Workers: 2, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(done)
+	}()
+
+	d.Submit("r1")
+	if got := <-entered; got != 0 {
+		t.Fatalf("first handler call = %d, want 0", got)
+	}
+
+	forceCtx, cancelForce := context.WithCancel(context.Background())
+	cancelForce()
+	if err := d.ForceSubmitAfter(forceCtx, "r1", func() error {
+		t.Fatal("beforeQueue ran for canceled force")
+		return nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForceSubmitAfter error = %v, want context canceled", err)
+	}
+
+	close(releaseFirst)
+	select {
+	case <-firstReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("original handler did not return")
+	}
+	waitStatus(t, st, "r1", reading.Ready)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
 func TestDispatch_ForceSubmitAfterFailureDoesNotQueueAndReleasesClaim(t *testing.T) {
 	t.Parallel()
 
@@ -771,7 +847,7 @@ func TestDispatch_ForceSubmitAfterFailureDoesNotQueueAndReleasesClaim(t *testing
 	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true}
 	beforeErr := errors.New("store reset failed")
 
-	if err := d.ForceSubmitAfter("r1", func() error { return beforeErr }); !errors.Is(err, beforeErr) {
+	if err := d.ForceSubmitAfter(context.Background(), "r1", func() error { return beforeErr }); !errors.Is(err, beforeErr) {
 		t.Fatalf("ForceSubmitAfter error = %v, want %v", err, beforeErr)
 	}
 	if got := h.count(); got != 0 {
@@ -785,6 +861,65 @@ func TestDispatch_ForceSubmitAfterFailureDoesNotQueueAndReleasesClaim(t *testing
 	}
 	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
 		t.Fatalf("status = %q, want ready after later submit", got.Status)
+	}
+}
+
+func TestDispatch_ConcurrentForceSubmitAfterSerializesCallbacks(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	h := &recordingHandler{fn: always(dispatch.Done)}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- d.ForceSubmitAfter(context.Background(), "r1", func() error {
+			close(firstStarted)
+			<-releaseFirst
+			return nil
+		})
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first force callback did not start")
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- d.ForceSubmitAfter(context.Background(), "r1", func() error {
+			close(secondStarted)
+			return nil
+		})
+	}()
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second force callback started before first force completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first ForceSubmitAfter: %v", err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second force callback did not start after first completed")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second ForceSubmitAfter: %v", err)
+	}
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler calls = %d, want both forced replacements queued", got)
 	}
 }
 

@@ -293,16 +293,23 @@ const replaceReadingTags = `-- name: ReplaceReadingTags :execrows
 update readings
 set tags = $2, updated_at = $3
 where id = $1
+  and ($4::timestamptz is null or (status = 'running' and started_at = $4))
 `
 
 type ReplaceReadingTagsParams struct {
 	ID        string
 	Tags      []string
 	UpdatedAt pgtype.Timestamptz
+	Column4   pgtype.Timestamptz
 }
 
 func (q *Queries) ReplaceReadingTags(ctx context.Context, arg ReplaceReadingTagsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, replaceReadingTags, arg.ID, arg.Tags, arg.UpdatedAt)
+	result, err := q.db.Exec(ctx, replaceReadingTags,
+		arg.ID,
+		arg.Tags,
+		arg.UpdatedAt,
+		arg.Column4,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -730,6 +737,7 @@ set
   diagnostics_json = $13,
   updated_at = $14
 where id = $1
+  and ($15::timestamptz is null or (status = 'running' and started_at = $15))
 `
 
 type UpdateReadingContentParams struct {
@@ -747,6 +755,7 @@ type UpdateReadingContentParams struct {
 	SimilarJson     []byte
 	DiagnosticsJson []byte
 	UpdatedAt       pgtype.Timestamptz
+	Column15        pgtype.Timestamptz
 }
 
 func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingContentParams) (int64, error) {
@@ -765,6 +774,7 @@ func (q *Queries) UpdateReadingContent(ctx context.Context, arg UpdateReadingCon
 		arg.SimilarJson,
 		arg.DiagnosticsJson,
 		arg.UpdatedAt,
+		arg.Column15,
 	)
 	if err != nil {
 		return 0, err

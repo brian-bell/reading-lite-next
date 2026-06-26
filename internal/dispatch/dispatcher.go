@@ -59,11 +59,13 @@ type Dispatcher struct {
 	inflightMu sync.Mutex
 	inflight   map[string]claim
 	nextToken  uint64
+	forceMu    sync.Mutex
 }
 
 type claim struct {
 	token  uint64
 	cancel context.CancelFunc
+	done   <-chan struct{}
 }
 
 // claim takes single-process ownership of a reading id. Ownership is held from the
@@ -111,18 +113,20 @@ func (d *Dispatcher) active(it item) bool {
 	return ok && current.token == it.token
 }
 
-func (d *Dispatcher) beginRun(ctx context.Context, it item) (context.Context, context.CancelFunc, bool) {
+func (d *Dispatcher) beginRun(ctx context.Context, it item) (context.Context, context.CancelFunc, chan struct{}, bool) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
 	current, ok := d.inflight[it.id]
 	if !ok || current.token != it.token {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	current.cancel = cancel
+	current.done = done
 	d.inflight[it.id] = current
-	return runCtx, cancel, true
+	return runCtx, cancel, done, true
 }
 
 func (d *Dispatcher) ensureCh() {
@@ -153,14 +157,30 @@ func (d *Dispatcher) Submit(id string) {
 // running work; ordinary ingest and retry paths should use [Dispatcher.Submit]
 // so the duplicate guard remains intact.
 func (d *Dispatcher) ForceSubmit(id string) {
-	_ = d.ForceSubmitAfter(id, func() error { return nil })
+	_ = d.ForceSubmitAfter(context.Background(), id, func() error { return nil })
 }
 
-// ForceSubmitAfter cancels and replaces any existing in-process claim, runs
-// beforeQueue while the new claim is reserved, then enqueues id at attempt 0.
-// If beforeQueue fails, the replacement claim is released and no work is queued.
-func (d *Dispatcher) ForceSubmitAfter(id string, beforeQueue func() error) error {
-	it := d.forceClaim(item{id: id})
+// ForceSubmitAfter serializes forced submissions, checks ctx before committing
+// to recovery, cancels and replaces any existing in-process claim, waits for an
+// already-running handler to exit, runs beforeQueue while the new claim is
+// reserved, then enqueues id at attempt 0. Waiting before beforeQueue ensures a
+// stale handler cannot write content blobs or vectors after the replacement
+// reset has started. If beforeQueue fails, the replacement claim is released and
+// no work is queued.
+func (d *Dispatcher) ForceSubmitAfter(ctx context.Context, id string, beforeQueue func() error) error {
+	d.forceMu.Lock()
+	defer d.forceMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	it, wait := d.forceClaim(item{id: id})
+	if wait != nil {
+		<-wait
+	}
+	if !d.active(it) {
+		return nil
+	}
 	if err := beforeQueue(); err != nil {
 		d.release(it)
 		return err
@@ -169,20 +189,24 @@ func (d *Dispatcher) ForceSubmitAfter(id string, beforeQueue func() error) error
 	return nil
 }
 
-func (d *Dispatcher) forceClaim(it item) item {
+func (d *Dispatcher) forceClaim(it item) (item, <-chan struct{}) {
 	d.inflightMu.Lock()
 	defer d.inflightMu.Unlock()
 
 	if d.inflight == nil {
 		d.inflight = map[string]claim{}
 	}
-	if current, ok := d.inflight[it.id]; ok && current.cancel != nil {
-		current.cancel()
+	var wait <-chan struct{}
+	if current, ok := d.inflight[it.id]; ok {
+		if current.cancel != nil {
+			current.cancel()
+		}
+		wait = current.done
 	}
 	d.nextToken++
 	it.token = d.nextToken
-	d.inflight[it.id] = claim{token: it.token}
-	return it
+	d.inflight[it.id] = claim{token: it.token, done: wait}
+	return it, wait
 }
 
 // queueClaimed dispatches an item whose id is already claimed — the live path for
@@ -300,11 +324,14 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // re-dispatch, so the id stays owned for its whole retry chain. It is the only
 // method that touches the Store and the Delayer.
 func (d *Dispatcher) handle(ctx context.Context, it item) {
-	runCtx, cancel, ok := d.beginRun(ctx, it)
+	runCtx, cancel, done, ok := d.beginRun(ctx, it)
 	if !ok {
 		return
 	}
-	defer cancel()
+	defer func() {
+		cancel()
+		close(done)
+	}()
 
 	now := d.Clock.Now()
 	attempt := it.attempt
