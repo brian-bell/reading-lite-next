@@ -760,6 +760,111 @@ func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
 	}
 }
 
+func TestDispatch_ForceSubmitAfterFailureDoesNotQueueAndReleasesClaim(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	h := &recordingHandler{fn: always(dispatch.Done)}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Max: 3, Inline: true}
+	beforeErr := errors.New("store reset failed")
+
+	if err := d.ForceSubmitAfter("r1", func() error { return beforeErr }); !errors.Is(err, beforeErr) {
+		t.Fatalf("ForceSubmitAfter error = %v, want %v", err, beforeErr)
+	}
+	if got := h.count(); got != 0 {
+		t.Fatalf("handler calls after failed force = %d, want 0", got)
+	}
+
+	d.Submit("r1")
+
+	if got := h.count(); got != 1 {
+		t.Fatalf("handler calls after retry submit = %d, want 1 (failed force must release claim)", got)
+	}
+	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
+		t.Fatalf("status = %q, want ready after later submit", got.Status)
+	}
+}
+
+func TestDispatch_OldRetryContinuationCannotRequeueAfterForce(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	delay := &dispatch.FakeDelayer{}
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		if call == 0 {
+			return dispatch.Result{Outcome: dispatch.Retry}
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: delay, Max: 3, Inline: true}
+
+	d.Submit("r1")
+	if got := h.count(); got != 1 {
+		t.Fatalf("handler calls after retrying submit = %d, want 1", got)
+	}
+	if delay.PendingLen() != 1 {
+		t.Fatalf("pending delays = %d, want 1", delay.PendingLen())
+	}
+
+	d.ForceSubmit("r1")
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler calls after force = %d, want replacement run", got)
+	}
+	waitStatus(t, st, "r1", reading.Ready)
+
+	delay.FireAll()
+
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler calls after firing old retry = %d, want old continuation ignored", got)
+	}
+	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
+		t.Fatalf("status = %q, want replacement ready to survive old retry", got.Status)
+	}
+}
+
+func TestDispatch_OldRateLimitContinuationCannotRequeueAfterForce(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	delay := &dispatch.FakeDelayer{}
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		if call == 0 {
+			return dispatch.Result{Outcome: dispatch.Retry, Err: &dispatch.RateLimitError{RetryAfter: time.Minute}}
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: delay, Max: 3, Inline: true}
+
+	d.Submit("r1")
+	if delay.PendingLen() != 1 {
+		t.Fatalf("pending delays = %d, want 1", delay.PendingLen())
+	}
+
+	d.ForceSubmit("r1")
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler calls after force = %d, want replacement run", got)
+	}
+	waitStatus(t, st, "r1", reading.Ready)
+
+	delay.FireAll()
+
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler calls after firing old rate-limit delay = %d, want old continuation ignored", got)
+	}
+	if got := getReading(t, st, "r1"); got.Status != reading.Ready {
+		t.Fatalf("status = %q, want replacement ready to survive old rate-limit delay", got.Status)
+	}
+}
+
 func TestDispatch_RecoverySweepReenqueuesNonTerminal(t *testing.T) {
 	t.Parallel()
 

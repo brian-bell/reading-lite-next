@@ -3,12 +3,9 @@ package httpapi
 
 import (
 	"bytes"
-	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +20,7 @@ import (
 	"github.com/bbell/reading-lite/internal/blobs"
 	"github.com/bbell/reading-lite/internal/clock"
 	"github.com/bbell/reading-lite/internal/reading"
+	"github.com/bbell/reading-lite/internal/readingops"
 	"github.com/bbell/reading-lite/internal/store"
 )
 
@@ -71,12 +69,12 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, status, err := s.ingestURL(r.Context(), req.URL)
+	res, err := s.ops().IngestURL(r.Context(), req.URL)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	writeJSON(w, status, res)
+	writeJSON(w, createdStatus(res.Created), statusResponse{ID: res.ID, Status: res.Status})
 }
 
 func (s *Server) importMarkdown(w http.ResponseWriter, r *http.Request) {
@@ -93,12 +91,17 @@ func (s *Server) importMarkdown(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "markdown is required")
 		return
 	}
-	res, status, err := s.importMarkdownReading(r.Context(), req.URL, req.Markdown, req.Title, req.Tags)
+	res, err := s.ops().ImportMarkdown(r.Context(), readingops.MarkdownImport{
+		URL:      req.URL,
+		Markdown: req.Markdown,
+		Title:    req.Title,
+		Tags:     req.Tags,
+	})
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	writeJSON(w, status, res)
+	writeJSON(w, createdStatus(res.Created), statusResponse{ID: res.ID, Status: res.Status})
 }
 
 func (s *Server) importBookmarks(w http.ResponseWriter, r *http.Request) {
@@ -111,22 +114,12 @@ func (s *Server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := make([]bookmarkResult, 0, len(urls))
-	for _, rawURL := range urls {
-		res, status, err := s.ingestURL(r.Context(), rawURL)
-		switch {
-		case err != nil && errors.Is(err, reading.ErrInvalidURL):
-			results = append(results, bookmarkResult{URL: rawURL, Result: "invalid"})
-		case err != nil:
-			s.writeError(w, err)
-			return
-		case status == http.StatusCreated:
-			results = append(results, bookmarkResult{URL: rawURL, ID: res.ID, Result: "created"})
-		default:
-			results = append(results, bookmarkResult{URL: rawURL, ID: res.ID, Result: "existing"})
-		}
+	results, err := s.ops().ImportBookmarks(r.Context(), urls)
+	if err != nil {
+		s.writeError(w, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string][]bookmarkResult{"results": results})
+	writeJSON(w, http.StatusOK, map[string][]bookmarkResult{"results": bookmarkDTOs(results)})
 }
 
 func (s *Server) listReadings(w http.ResponseWriter, r *http.Request) {
@@ -170,173 +163,12 @@ func (s *Server) getRaw(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) reprocess(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	got, err := s.Store.GetByID(r.Context(), id)
+	res, err := s.ops().Reprocess(r.Context(), id)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-
-	annotated := reading.AnnotateStale(got, s.now(), s.TTLs)
-	if (got.Status == reading.Pending || got.Status == reading.Running) && annotated.Status != reading.Failed {
-		writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: got.Status})
-		return
-	}
-	force := (got.Status == reading.Pending || got.Status == reading.Running) && annotated.Status == reading.Failed
-
-	if force {
-		if err := s.Dispatcher.ForceSubmitAfter(id, func() error {
-			return s.markPending(r.Context(), id)
-		}); err != nil {
-			s.writeError(w, err)
-			return
-		}
-	} else {
-		if err := s.markPending(r.Context(), id); err != nil {
-			s.writeError(w, err)
-			return
-		}
-		s.Dispatcher.Submit(id)
-	}
-	writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: reading.Pending})
-}
-
-func (s *Server) ingestURL(ctx context.Context, rawURL string) (statusResponse, int, error) {
-	key, err := reading.URLKey(rawURL)
-	if err != nil {
-		return statusResponse{}, 0, fmt.Errorf("%w: %v", reading.ErrInvalidURL, err)
-	}
-
-	existing, err := s.Store.GetByURLKey(ctx, key)
-	switch {
-	case err == nil:
-		if existing.Status == reading.Failed {
-			if err := s.markPending(ctx, existing.ID); err != nil {
-				return statusResponse{}, 0, err
-			}
-			s.Dispatcher.Submit(existing.ID)
-			return statusResponse{ID: existing.ID, Status: reading.Pending}, http.StatusOK, nil
-		}
-		return statusResponse{ID: existing.ID, Status: existing.Status}, http.StatusOK, nil
-	case !errors.Is(err, store.ErrNotFound):
-		return statusResponse{}, 0, err
-	}
-
-	id := s.newID()
-	now := s.now()
-	rec := reading.Reading{
-		ID:         id,
-		URL:        strings.TrimSpace(rawURL),
-		URLKey:     key,
-		Status:     reading.Pending,
-		SourceKind: urlIngestSourceKind(key),
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := s.Store.SaveReading(ctx, rec); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			got, getErr := s.Store.GetByURLKey(ctx, key)
-			if getErr == nil {
-				return statusResponse{ID: got.ID, Status: got.Status}, http.StatusOK, nil
-			}
-		}
-		return statusResponse{}, 0, err
-	}
-	s.Dispatcher.Submit(id)
-	return statusResponse{ID: id, Status: reading.Pending}, http.StatusCreated, nil
-}
-
-func urlIngestSourceKind(key string) reading.SourceKind {
-	kind := reading.ClassifySource(key)
-	if kind == reading.SourceMarkdown {
-		return reading.SourceWeb
-	}
-	return kind
-}
-
-func (s *Server) importMarkdownReading(ctx context.Context, rawURL, markdown, title string, tags []string) (statusResponse, int, error) {
-	key, err := reading.URLKey(rawURL)
-	if err != nil {
-		return statusResponse{}, 0, fmt.Errorf("%w: %v", reading.ErrInvalidURL, err)
-	}
-	if existing, err := s.Store.GetByURLKey(ctx, key); err == nil {
-		if existing.Status == reading.Failed {
-			return s.replaceFailedWithMarkdown(ctx, existing, markdown, title, tags)
-		}
-		return statusResponse{ID: existing.ID, Status: existing.Status}, http.StatusOK, nil
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return statusResponse{}, 0, err
-	}
-
-	id := s.newID()
-	if _, err := s.Store.GetByID(ctx, id); err == nil {
-		return statusResponse{}, 0, store.ErrConflict
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return statusResponse{}, 0, err
-	}
-	rawKey := "readings/" + id + "/raw.md"
-	now := s.now()
-	rec := reading.Reading{
-		ID:         id,
-		URL:        strings.TrimSpace(rawURL),
-		URLKey:     key,
-		Status:     reading.Pending,
-		SourceKind: reading.SourceMarkdown,
-		Title:      title,
-		RawKey:     rawKey,
-		Tags:       tags,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := s.Blobs.Put(ctx, rawKey, []byte(markdown), "text/markdown"); err != nil {
-		return statusResponse{}, 0, err
-	}
-	if err := s.Store.SaveReading(ctx, rec); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			got, getErr := s.Store.GetByURLKey(ctx, key)
-			if getErr == nil {
-				_ = s.Blobs.Delete(context.Background(), rawKey)
-				return statusResponse{ID: got.ID, Status: got.Status}, http.StatusOK, nil
-			}
-			return statusResponse{}, 0, err
-		}
-		_ = s.Blobs.Delete(context.Background(), rawKey)
-		return statusResponse{}, 0, err
-	}
-	s.Dispatcher.Submit(id)
-	return statusResponse{ID: id, Status: reading.Pending}, http.StatusCreated, nil
-}
-
-func (s *Server) replaceFailedWithMarkdown(ctx context.Context, existing reading.Reading, markdown, title string, tags []string) (statusResponse, int, error) {
-	now := s.now()
-	rawKey := replacementRawKey(existing.ID, now)
-	if err := s.Blobs.Put(ctx, rawKey, []byte(markdown), "text/markdown"); err != nil {
-		return statusResponse{}, 0, err
-	}
-	if err := s.Store.UpdateImport(ctx, existing.ID, store.ImportFields{
-		Now:        now,
-		SourceKind: reading.SourceMarkdown,
-		Title:      title,
-		RawKey:     rawKey,
-		Tags:       tags,
-	}); err != nil {
-		_ = s.Blobs.Delete(context.Background(), rawKey)
-		return statusResponse{}, 0, err
-	}
-	if existing.RawKey != "" && existing.RawKey != rawKey {
-		_ = s.Blobs.Delete(context.Background(), existing.RawKey)
-	}
-	if existing.ContentKey != "" {
-		_ = s.Blobs.Delete(context.Background(), existing.ContentKey)
-	}
-	s.Dispatcher.Submit(existing.ID)
-	return statusResponse{ID: existing.ID, Status: reading.Pending}, http.StatusOK, nil
-}
-
-func replacementRawKey(id string, now time.Time) string {
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	return "readings/" + id + "/raw-" + strconv.FormatInt(now.UnixNano(), 10) + ".md"
+	writeJSON(w, http.StatusAccepted, statusResponse{ID: res.ID, Status: res.Status})
 }
 
 func (s *Server) streamBlob(w http.ResponseWriter, r *http.Request, content bool) {
@@ -373,24 +205,6 @@ func (s *Server) streamBlob(w http.ResponseWriter, r *http.Request, content bool
 	_, _ = w.Write(data)
 }
 
-func (s *Server) markPending(ctx context.Context, id string) error {
-	r, err := s.Store.GetByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	rawKey := ""
-	title := ""
-	if r.SourceKind == reading.SourceMarkdown {
-		rawKey = r.RawKey
-		title = r.Title
-	}
-	return s.Store.Reprocess(ctx, id, store.ReprocessFields{
-		Now:    s.now(),
-		RawKey: rawKey,
-		Title:  title,
-	})
-}
-
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/healthz" {
@@ -424,17 +238,6 @@ func (s *Server) now() time.Time {
 	return s.Clock.Now()
 }
 
-func (s *Server) newID() string {
-	if s.NewID != nil {
-		return s.NewID()
-	}
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 36)
-	}
-	return hex.EncodeToString(b[:])
-}
-
 func (s *Server) writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, reading.ErrInvalidURL):
@@ -455,6 +258,32 @@ type bookmarkResult struct {
 	URL    string `json:"url"`
 	ID     string `json:"id,omitempty"`
 	Result string `json:"result"`
+}
+
+func bookmarkDTOs(in []readingops.BookmarkResult) []bookmarkResult {
+	out := make([]bookmarkResult, len(in))
+	for i, res := range in {
+		out[i] = bookmarkResult{URL: res.URL, ID: res.ID, Result: res.Result}
+	}
+	return out
+}
+
+func (s *Server) ops() *readingops.Service {
+	return &readingops.Service{
+		Store:      s.Store,
+		Blobs:      s.Blobs,
+		Dispatcher: s.Dispatcher,
+		Clock:      s.Clock,
+		TTLs:       s.TTLs,
+		NewID:      s.NewID,
+	}
+}
+
+func createdStatus(created bool) int {
+	if created {
+		return http.StatusCreated
+	}
+	return http.StatusOK
 }
 
 type listResponse struct {

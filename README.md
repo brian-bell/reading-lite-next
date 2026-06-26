@@ -10,12 +10,15 @@ the deterministic `internal/clock` package, `internal/reading` for the pure doma
 migrations, SQL source/generated code, and conformance suite, `internal/dispatch` for the
 worker pool, retry/backoff, rate-limit re-dispatch, and crash-recovery sweep, the external
 service ports and fakes, the full processing pipeline, real production adapters behind those
-ports, extraction internals, and the `internal/httpapi` server surface.
+ports, extraction internals, the `internal/readingops` command service, and the
+`internal/httpapi` server surface.
 
 The API package exposes health, bearer-auth-protected ingest, markdown and bookmark imports,
 list/search, detail with read-time stale annotation, content/raw blob reads, reprocess, and the
-shared JSON error model. The production `cmd/reader-api` wiring is still pending, so the API is
-tested as a package but not yet started by `make run`.
+shared JSON error model. `internal/readingops` owns the ingest/import/reprocess sequencing across
+the store, blob backend, and dispatcher; `internal/httpapi` stays focused on transport concerns.
+The production `cmd/reader-api` wiring is still pending, so the API is tested as a package but not
+yet started by `make run`.
 
 ## Requirements
 

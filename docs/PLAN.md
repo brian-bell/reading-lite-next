@@ -163,6 +163,7 @@ reading-lite/
 │   ├── store/             # Store port: Postgres adapter (sqlc) + Memory fake + conformance suite + migrations/
 │   ├── dispatch/          # in-process dispatcher: channel + worker pool + backoff/retry + recovery sweep
 │   ├── pipeline/          # orchestration: extract→embed→similar→summarize→notify
+│   ├── readingops/        # command workflows: ingest/import/reprocess across store/blob/dispatch
 │   ├── fetch/             # Fetcher port + HTTP adapter + fake
 │   ├── extract/           # Extractor port + readability adapter + youtube/reddit + fake
 │   ├── embed/             # Embedder port + OpenAI adapter + fake
@@ -778,8 +779,15 @@ be driven within a test by calling `Pipeline.Process` directly).
 
 ### 10.5 Green
 
-`httpapi.Server{ Store, Dispatcher, Blobs, Clock, Token, TTLs }` with one `Routes() http.Handler`.
-DTO structs map domain→JSON (never expose internal columns directly). Single error model:
+`readingops.Service{ Store, Dispatcher, Blobs, Clock, TTLs, NewID }` owns command sequencing for
+URL ingest, markdown/bookmark import, failed-reading markdown replacement, and reprocess. It is
+the only boundary that coordinates `store.Store`, `blobs.Blobs`, and dispatcher enqueue/force
+enqueue for those workflows.
+
+`httpapi.Server{ Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID }` with one
+`Routes() http.Handler` delegates command workflows to `readingops` and keeps request decoding,
+auth, route selection, DTO mapping, response status mapping, and error serialization in the HTTP
+package. DTO structs map domain→JSON (never expose internal columns directly). Single error model:
 
 ```json
 { "error": { "code": "invalid_url", "message": "…" } }
@@ -790,7 +798,8 @@ Helpers `writeJSON`, `writeErr(code, status, msg)`. Auth middleware uses
 `reading.AnnotateStale` before DTO mapping.
 
 **Refactor**: a `decode[T]` generic for request bodies with size limit (`http.MaxBytesReader`);
-shared pagination cursor codec.
+shared pagination cursor codec; keep multi-resource workflow ownership in `readingops` so the
+HTTP layer stays thin.
 
 **Done when**: every endpoint + the idempotency matrix + read-time stale annotation are green.
 

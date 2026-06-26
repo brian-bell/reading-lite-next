@@ -36,9 +36,11 @@
 > readability→raw_dom→raw_only tier selection, drives `extract.YouTube` against an `httptest`
 > oEmbed upstream for the title/author floor (with its 404→`Fail` classification), and asserts
 > the canonical `extract.RedditGuidance` is the one string the pipeline reuses. The Phase 8
-> HTTP API (C14) is automated too: `TestAcceptance_HTTPAPI` drives `httpapi.Server.Routes`
-> through `httptest` against the in-memory store/blob backends, a fake clock, and the submitter
-> seam to prove health, auth, ingest, URL normalization, dispatch submission, and detail DTOs.
+> HTTP API and command-service boundary (C14) are automated too: `TestAcceptance_HTTPAPI` drives
+> `httpapi.Server.Routes` through `httptest` against the in-memory store/blob backends, a fake
+> clock, and the submitter seam to prove health, auth, ingest, URL normalization, dispatch
+> submission, and detail DTOs, while `internal/readingops` package tests pin the ingest/import/
+> reprocess workflows behind the handlers.
 > Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
@@ -91,6 +93,7 @@ oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
 | YouTube oEmbed floor + best-effort transcript client | `internal/extract/youtube.go` | 7 |
 | Reddit guidance constant | `internal/extract/reddit.go` | 7 |
 | Extraction HTML fixtures + golden markdown | `internal/extract/testdata/` | 7 |
+| Reading command workflows | `internal/readingops/service.go` | 8 |
 | HTTP API server, auth, DTOs, cursor/error helpers | `internal/httpapi/server.go` | 8 |
 
 ### Out of scope (do not expect these to work yet)
@@ -98,8 +101,9 @@ oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
 The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together and is
 verified by its own race-tested package tests and the C11 blackbox checks here, the Phase 6
 real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
-`vector.Postgres`, `blobs.R2`) now exist behind those ports, and the Phase 8 HTTP API
-(`internal/httpapi`) now exists — but these are **not wired into the binaries**: nothing calls
+`vector.Postgres`, `blobs.R2`) now exist behind those ports, and the Phase 8 command/API
+packages (`internal/readingops`, `internal/httpapi`) now exist — but these are **not wired into
+the binaries**: nothing calls
 `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter, or starts
 `httpapi.Server.Routes` from `main` yet (that lands with the `main` lifecycle/config work in
 Phase 11).
@@ -699,13 +703,17 @@ the source guidance.
 > main/config lifecycle work). New runtime dependencies:
 > `github.com/go-shiori/go-readability` and `github.com/JohannesKaufmann/html-to-markdown/v2`.
 
-### C14. Phase 8 — HTTP API (`internal/httpapi/`)
+### C14. Phase 8 — Command service and HTTP API (`internal/readingops/`, `internal/httpapi/`)
 
 Phase 8 implements the read/browse/ingest API behind `httpapi.Server.Routes()`, using the
 standard library `http.ServeMux`, bearer auth, injected ports, and the shared domain/store/blob
-contracts. It is tested through `httptest` with `store.Memory`, `blobs.Memory`, a fake clock, and
-a submitter seam that `*dispatch.Dispatcher` satisfies.
+contracts. Multi-resource ingest/import/reprocess sequencing lives in `readingops.Service`, so
+the HTTP handlers stay focused on request decoding, auth, DTOs, response statuses, and the shared
+JSON error model. HTTP is tested through `httptest` with `store.Memory`, `blobs.Memory`, a fake
+clock, and a submitter seam that `*dispatch.Dispatcher` satisfies; command-service tests pin the
+workflow semantics directly.
 
+- [ ] `go test -race ./internal/readingops/` passes clean.
 - [ ] `go test -race ./internal/httpapi/` passes clean.
 - [ ] **Auth and liveness.** `GET /api/healthz` is public; every other route requires
   `Authorization: Bearer <token>`, checked with `subtle.ConstantTimeCompare`. Tests:
@@ -739,6 +747,11 @@ a submitter seam that `*dispatch.Dispatcher` satisfies.
   lifecycle metadata and stale content checkpoints, reset the attempt count, refresh `updated_at`
   as the pending-staleness anchor, and submit the ID, while fresh `pending`/`running` rows are
   idempotent no-ops that return their existing status without duplicate submission.
+- [ ] **Workflow ownership.** `readingops.Service` owns URL ingest source classification (including
+  `.md` URL ingest staying fetchable `web`), markdown raw-blob staging and rollback, failed-row
+  markdown replacement with collision-free raw keys, bookmark bulk result mapping, stale
+  pending/running force requeue, and `store.Reprocess` checkpoint clearing. HTTP tests should not
+  duplicate every workflow branch that service tests already pin.
 - [ ] **Error model and DTO boundary.** All JSON errors use
   `{ "error": { "code": "...", "message": "..." } }`. Reading DTOs expose client-facing summary,
   similar, diagnostics, tags, status, and timestamps without leaking `url_key` or blob keys.

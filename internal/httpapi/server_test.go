@@ -1093,6 +1093,9 @@ func TestImportBookmarks_BulkResult(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
+	if strings.Contains(rr.Body.String(), `"URL"`) || strings.Contains(rr.Body.String(), `"Result"`) {
+		t.Fatalf("bookmark response used Go field names, want JSON DTO field names: %s", rr.Body.String())
+	}
 	got := decodeJSON[struct {
 		Results []struct {
 			URL    string `json:"url"`
