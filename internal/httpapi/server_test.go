@@ -24,11 +24,16 @@ import (
 var testNow = time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 
 type submitter struct {
-	ids []string
+	ids       []string
+	forcedIDs []string
 }
 
 func (s *submitter) Submit(id string) {
 	s.ids = append(s.ids, id)
+}
+
+func (s *submitter) ForceSubmit(id string) {
+	s.forcedIDs = append(s.forcedIDs, id)
 }
 
 type harness struct {
@@ -752,8 +757,8 @@ func TestReprocess_RunningIsIdempotent(t *testing.T) {
 		t.Fatalf("stored lifecycle = status %q attempts %d started %v, want unchanged running",
 			stored.Status, stored.ProcessAttempts, stored.StartedAt)
 	}
-	if len(h.submitter.ids) != 0 {
-		t.Fatalf("submitted ids = %v, want none", h.submitter.ids)
+	if len(h.submitter.ids) != 0 || len(h.submitter.forcedIDs) != 0 {
+		t.Fatalf("submitted ids = %v forced = %v, want none", h.submitter.ids, h.submitter.forcedIDs)
 	}
 }
 
@@ -789,8 +794,11 @@ func TestReprocess_StaleRunningReenqueues(t *testing.T) {
 		t.Fatalf("stored lifecycle = status %q attempts %d started %v, want reset pending",
 			stored.Status, stored.ProcessAttempts, stored.StartedAt)
 	}
-	if diff := cmp.Diff([]string{"r1"}, h.submitter.ids); diff != "" {
-		t.Fatalf("submitted ids mismatch (-want +got):\n%s", diff)
+	if len(h.submitter.ids) != 0 {
+		t.Fatalf("submitted ids = %v, want none", h.submitter.ids)
+	}
+	if diff := cmp.Diff([]string{"r1"}, h.submitter.forcedIDs); diff != "" {
+		t.Fatalf("force-submitted ids mismatch (-want +got):\n%s", diff)
 	}
 }
 

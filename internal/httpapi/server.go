@@ -32,6 +32,10 @@ type Dispatcher interface {
 	Submit(id string)
 }
 
+type forceDispatcher interface {
+	ForceSubmit(id string)
+}
+
 // Server wires the HTTP API to the core ports.
 type Server struct {
 	Store      store.Store
@@ -179,12 +183,13 @@ func (s *Server) reprocess(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: got.Status})
 		return
 	}
+	force := got.Status == reading.Running && annotated.Status == reading.Failed
 
 	if err := s.markPending(r.Context(), id); err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.Dispatcher.Submit(id)
+	s.submit(id, force)
 	writeJSON(w, http.StatusAccepted, statusResponse{ID: id, Status: reading.Pending})
 }
 
@@ -231,6 +236,16 @@ func (s *Server) ingestURL(ctx context.Context, rawURL string) (statusResponse, 
 	}
 	s.Dispatcher.Submit(id)
 	return statusResponse{ID: id, Status: reading.Pending}, http.StatusCreated, nil
+}
+
+func (s *Server) submit(id string, force bool) {
+	if force {
+		if d, ok := s.Dispatcher.(forceDispatcher); ok {
+			d.ForceSubmit(id)
+			return
+		}
+	}
+	s.Dispatcher.Submit(id)
 }
 
 func urlIngestSourceKind(key string) reading.SourceKind {

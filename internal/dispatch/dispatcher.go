@@ -110,6 +110,25 @@ func (d *Dispatcher) Submit(id string) {
 	d.queueClaimed(item{id: id})
 }
 
+// ForceSubmit enqueues id at attempt 0 even if this process still considers it
+// queued or in flight. It is reserved for explicit operator recovery of stale
+// running work; ordinary ingest and retry paths should use [Dispatcher.Submit]
+// so the duplicate guard remains intact.
+func (d *Dispatcher) ForceSubmit(id string) {
+	d.forceClaim(id)
+	d.queueClaimed(item{id: id})
+}
+
+func (d *Dispatcher) forceClaim(id string) {
+	d.inflightMu.Lock()
+	defer d.inflightMu.Unlock()
+
+	if d.inflight == nil {
+		d.inflight = map[string]bool{}
+	}
+	d.inflight[id] = true
+}
+
 // queueClaimed dispatches an item whose id is already claimed — the live path for
 // Submit and for re-dispatch. On a full-channel drop it releases the claim, since
 // the item will not run; the recovery Sweep re-dispatches the still-pending reading.

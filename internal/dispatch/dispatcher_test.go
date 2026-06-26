@@ -688,6 +688,54 @@ func TestDispatch_BufferedDuplicateRunsOnce(t *testing.T) {
 	}
 }
 
+func TestDispatch_ForceSubmitRequeuesInFlightID(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMemory()
+	clk := clock.NewFake(epoch)
+	seedPending(t, st, clk, "r1", 0)
+
+	entered := make(chan int, 2)
+	firstProceed := make(chan struct{})
+	h := &recordingHandler{fn: func(call int, _ string) dispatch.Result {
+		entered <- call
+		if call == 0 {
+			<-firstProceed
+		}
+		return dispatch.Result{Outcome: dispatch.Done}
+	}}
+	d := &dispatch.Dispatcher{Handler: h.handle, Store: st, Clock: clk, Delay: &dispatch.FakeDelayer{}, Workers: 2, Max: 3, Buffer: 8}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(done)
+	}()
+
+	d.Submit("r1")
+	if got := <-entered; got != 0 {
+		t.Fatalf("first handler call = %d, want 0", got)
+	}
+
+	d.ForceSubmit("r1")
+	if got := <-entered; got != 1 {
+		t.Fatalf("forced handler call = %d, want 1", got)
+	}
+	close(firstProceed)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+
+	if got := h.count(); got != 2 {
+		t.Fatalf("handler ran %d times, want forced replacement run", got)
+	}
+}
+
 func TestDispatch_RecoverySweepReenqueuesNonTerminal(t *testing.T) {
 	t.Parallel()
 
