@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–8)
+# reading-lite — Manual Verification Plan (Phases 0–9)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -40,7 +40,10 @@
 > `httpapi.Server.Routes` through `httptest` against the in-memory store/blob backends, a fake
 > clock, and the submitter seam to prove health, auth, ingest, URL normalization, dispatch
 > submission, and detail DTOs, while `internal/readingops` package tests pin the ingest/import/
-> reprocess workflows behind the handlers.
+> reprocess workflows behind the handlers. Phase 9's E2E layer is covered by
+> `internal/httpapi/e2e_test.go`: those tests drive the HTTP surface with the real
+> in-process dispatcher and real pipeline over `store.Memory`, `blobs.Memory`, and
+> `vector.Memory`, while external services remain fake and deterministic.
 > Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and reviewing the placeholder binaries. `make test-integration`
@@ -58,7 +61,9 @@ processing pipeline, fakes only), **Phase 6** (the real production adapters
 behind the Phase 4 ports, contract-tested via `httptest`/testcontainers), and
 **Phase 7** (the extraction internals: the readability tier ladder, the YouTube
 oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
-**Phase 8** (the HTTP API surface, tested through `httptest` with in-memory ports):
+**Phase 8** (the HTTP API surface, tested through `httptest` with in-memory ports), and
+**Phase 9** (end-to-end HTTP stories with the real dispatcher and pipeline over in-memory
+backends and fake external services):
 
 | Area | Files | Phase |
 |---|---|---|
@@ -95,6 +100,7 @@ oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
 | Extraction HTML fixtures + golden markdown | `internal/extract/testdata/` | 7 |
 | Reading command workflows | `internal/readingops/service.go` | 8 |
 | HTTP API server, auth, DTOs, cursor/error helpers | `internal/httpapi/server.go` | 8 |
+| End-to-end HTTP integration stories | `internal/httpapi/e2e_test.go` | 9 |
 
 ### Out of scope (do not expect these to work yet)
 
@@ -102,8 +108,9 @@ The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together
 verified by its own race-tested package tests and the C11 blackbox checks here, the Phase 6
 real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
 `vector.Postgres`, `blobs.R2`) now exist behind those ports, and the Phase 8 command/API
-packages (`internal/readingops`, `internal/httpapi`) now exist — but these are **not wired into
-the binaries**: nothing calls
+packages (`internal/readingops`, `internal/httpapi`) now exist, and Phase 9 proves the package
+composition end-to-end through HTTP with in-memory backends and fake externals — but these are
+**not wired into the binaries**: nothing calls
 `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter, or starts
 `httpapi.Server.Routes` from `main` yet (that lands with the `main` lifecycle/config work in
 Phase 11).
@@ -113,8 +120,8 @@ testcontainers Postgres/MinIO under `//go:build integration`).
 The Phase 7 extraction internals (`extract.Readability`, `extract.YouTube`, `extract.RedditGuidance`)
 now exist and are contract-/fixture-tested (C13), but, like the Phase 6 adapters and Phase 8 API,
 are **not yet wired into the binaries** — nothing constructs `extract.Readability` from `main` or
-routes a YouTube URL through `extract.YouTube` yet. The remaining Phases 9–12 are **not**
-implemented: end-to-end main wiring, operator CLI subcommands, config loading, and
+routes a YouTube URL through `extract.YouTube` yet. The remaining Phases 10–12 are **not**
+implemented: operator CLI subcommands, config loading, production lifecycle wiring, and
 observability. `reader-api` and `readerctl` are intentionally empty `main(){}` placeholders.
 Verifying "the service runs and ingests a URL" is **premature** and not part of this plan.
 
@@ -498,10 +505,8 @@ seam. Read it against TDD plan §5 and confirm each spec bullet maps to a named 
   `FakeDelayer`. They are part of `make verify`.
 
 > Note: the dispatcher's `Store` is a **narrow** port (`UpdateStatus` + `ListNonTerminal`)
-> distinct from the full `store.Store`; `store.Memory` satisfies both. The end-to-end
-> stories (`TestE2E_RetryExhaustionFailsRetryable`, `TestE2E_RateLimitRequeue`,
-> `TestE2E_RecoveryAfterRestart` in PLAN §16) belong to Phase 9 and are **not** in scope
-> here — they need the pipeline + HTTP surface. C9 proves the dispatcher in isolation.
+> distinct from the full `store.Store`; `store.Memory` satisfies both. C9 proves the
+> dispatcher in isolation; C15 proves the end-to-end HTTP composition with the pipeline.
 
 ### C10. Phase 4 — external-service ports & fakes (`internal/{fetch,extract,embed,summarize,notify,blobs,vector}`)
 
@@ -763,6 +768,32 @@ workflow semantics directly.
 > worker pool. That runtime wiring belongs to the later main/config lifecycle work, so do not flag
 > the placeholder binary as a Phase 8 API-package gap.
 
+### C15. Phase 9 — End-to-end HTTP integration (`internal/httpapi/e2e_test.go`)
+
+Phase 9 proves the API, command service, in-process dispatcher, processing pipeline, memory store,
+memory blob backend, and memory vector index fit together behind HTTP. External services stay fake
+and deterministic. The tests use the dispatcher's inline seam as the deterministic drain path; the
+worker-pool concurrency itself remains covered in C9.
+
+- [ ] `go test -race ./internal/httpapi/` passes clean.
+- [ ] **Ingest/read/content.** `TestE2E_IngestProcessRead` posts a URL through
+  `POST /api/readings`, uses the returned id for detail/content reads, and observes `ready`
+  status, summary JSON, diagnostics JSON, extracted markdown, tags, and notification delivery.
+- [ ] **Similarity.** `TestE2E_SimilarAcrossTwoReadings` ingests A to ready, then B with a close
+  embedding, and verifies B's HTTP detail includes A in `similar_json` with a positive score.
+- [ ] **Reprocess recovery.** `TestE2E_FailedThenReprocessSucceeds` fails during fetch, verifies the
+  failed HTTP detail, then clears the fake error and recovers through
+  `POST /api/readings/{id}/reprocess`.
+- [ ] **Retry exhaustion.** `TestE2E_RetryExhaustionFailsRetryable` drives a retryable extraction
+  error through fake-delayer backoff until the dispatcher marks the reading `failed`, with no
+  pending callbacks left.
+- [ ] **Rate-limit requeue.** `TestE2E_RateLimitRequeue` rate-limits embedding once, verifies the
+  reading remains `pending` with zero attempts consumed and a 30-second scheduled requeue, then
+  fires the fake delayer and observes `ready`.
+- [ ] **Restart recovery.** `TestE2E_RecoveryAfterRestart` submits through a non-running dispatcher,
+  discards that dispatcher, rebuilds a fresh dispatcher/server over the same memory backends, runs
+  `Sweep`, and observes the HTTP-created reading become `ready`.
+
 ---
 
 ## 5. Section D — Conventions & constraints audit (`CLAUDE.md`)
@@ -816,11 +847,12 @@ Record these so a reviewer doesn't waste time or raise false bugs:
 3. **Binaries are placeholders** — `reader-api`/`readerctl` do nothing. The Phase 3
    dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), the
    Phase 6 real adapters (C12), the Phase 7 extraction internals (`internal/extract`, C13), and
-   the Phase 8 HTTP API (`internal/httpapi`, C14) are all complete and verified, but **not yet
-   wired into them**: nothing calls `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an
-   adapter / extractor, or starts `httpapi.Server.Routes` from `main`. The Phase 5 pipeline still
-   drives the ports through their fakes in tests. End-to-end main wiring, config, CLI subcommands,
-   and observability do not exist yet (Phases 9–12).
+   the Phase 8 HTTP API (`internal/httpapi`, C14) are all complete and verified. Phase 9 also
+   proves those package pieces fit together end-to-end through HTTP against memory backends and
+   fake external ports (C15), but they are **not yet wired into the binaries**: nothing calls
+   `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter / extractor, or starts
+   `httpapi.Server.Routes` from `main`. Production main wiring, config, CLI subcommands, and
+   observability do not exist yet (Phases 10–12).
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
