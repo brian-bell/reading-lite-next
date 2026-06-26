@@ -8,17 +8,21 @@ API package, and the command service that coordinates multi-resource workflows.
 The service can ingest URLs, import markdown and bookmark files, fetch and extract source
 content, store raw and processed blobs, embed and index readings for similarity, summarize
 readings, tag them, and optionally send notifications. The HTTP API is implemented and
-tested as a package. The production `cmd/reader-api` and `cmd/readerctl` binaries are still
-minimal entrypoints: they do not yet construct adapters, start the HTTP server, or expose CLI
-subcommands.
+tested as a package. The production `cmd/reader-api` binary is still a minimal entrypoint:
+it does not yet construct adapters, start the HTTP server, or run a worker pool. The
+`cmd/readerctl` binary now delegates to the tested `internal/readerctl` command core, but
+stateful commands still need injected store/blob/vector/dispatcher dependencies; the default
+binary only supports Phase-10-safe smoke and dry-run deploy/staging planning without
+production config.
 
 ## Structure
 
 - `cmd/reader-api/` contains the API process entrypoint. It is currently a minimal
   placeholder until production config, adapter construction, the HTTP server, and the worker
   pool are wired.
-- `cmd/readerctl/` contains the operator CLI entrypoint. It is currently a minimal
-  placeholder until CLI subcommands are implemented.
+- `cmd/readerctl/` contains the operator CLI entrypoint. It delegates to
+  `internal/readerctl.Main`; production dependency construction is still deferred to
+  Phase 11 config/lifecycle wiring.
 - `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
   used by concurrent tests.
 - `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit
@@ -99,6 +103,17 @@ subcommands.
   manual reprocess. It owns sequencing across `store.Store`, `blobs.Blobs`, and the dispatcher,
   including stale pending/running force requeue, markdown raw-blob staging/cleanup, and
   `store.Reprocess` checkpoint clearing.
+- `internal/bookmarks/` defines the shared bookmark import parser used by HTTP and
+  `readerctl`: Netscape/HTML links, JSON arrays of `{ "url": ... }`, and JSON objects with
+  `bookmarks` plus optional `html`, preserving order and duplicate URLs.
+- `internal/readerctl/` defines the tested operator command core. It supports URL/markdown/
+  bookmark imports through `readingops.Service`, audit reports with stale/missing-blob and
+  optional orphan inventory checks, recover dry-runs/apply through `readingops.Reprocess`,
+  destructive drop dry-runs/apply over store/blob/vector dependencies, smoke checks against a
+  running API (`--token` or `--token-env`), and deploy/staging structured plans behind a
+  `Runner` seam. Deploy and staging up/promote require `--smoke-token-env` so generated smoke
+  steps can authenticate without printing a secret. Default `readerctl.Main` intentionally
+  constructs no store/blob/vector/dispatcher before Phase 11.
 - `internal/httpapi/` defines the JSON API as
   `httpapi.Server{Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID}` with one
   `Routes() http.Handler`. It uses the stdlib `http.ServeMux`, constant-time bearer-token
@@ -131,7 +146,8 @@ The project targets Go 1.26.
 - `make lint` checks `gofmt`, `go vet`, and `golangci-lint`.
 - `make build` runs `go build ./...`.
 - `make run` runs `cmd/reader-api`; the binary currently exits immediately.
-- `make migrate` runs `cmd/readerctl migrate`; the CLI currently exits immediately.
+- `make migrate` is a reserved target that currently invokes unsupported `readerctl migrate`;
+  migrations-at-startup and production CLI migration wiring are Phase 11 work.
 - `make sqlc` runs `sqlc generate`.
 
 ## Conventions

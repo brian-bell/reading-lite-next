@@ -10,9 +10,11 @@ blob reads, reprocess, and a shared JSON error model. `internal/readingops` owns
 ingest/import/reprocess workflows across the store, blob backend, and dispatcher;
 `internal/httpapi` stays focused on transport concerns.
 
-Production process wiring is not in place yet. `cmd/reader-api` and `cmd/readerctl` exist so
-the project builds, but they currently exit immediately instead of starting the API server or
-running operator commands.
+Production API process wiring is not in place yet. `cmd/reader-api` exists so the project
+builds, but it still exits immediately instead of starting the API server. `cmd/readerctl`
+now delegates to the tested `internal/readerctl` operator command core; commands that need
+store/blob/vector/dispatcher dependencies still require injected construction and return a
+configuration error from the default binary until Phase 11 wiring exists.
 
 ## Requirements
 
@@ -47,9 +49,15 @@ make test-integration
 The store integration tests use `DATABASE_URL` when it is set. Otherwise they fall back to
 testcontainers with a `pgvector/pgvector` Postgres image and skip when Docker is unavailable.
 
-The service and CLI entrypoints currently build but do not perform useful work:
+The API entrypoint currently builds but does not perform useful work:
 
 ```sh
 make run
-make migrate
 ```
+
+`readerctl` supports `smoke` and dry-run `deploy`/`staging` planning from the default binary.
+Smoke can authenticate with `--token` or `--token-env`; deploy/staging smoke plans use
+`--smoke-token-env` so secrets stay out of rendered step arguments. Stateful commands such as
+`import`, `audit`, `recover`, and `drop` are tested in `internal/readerctl` with injected
+dependencies; the default binary refuses them until production configuration and adapter
+construction land.

@@ -16,9 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/html"
-
 	"github.com/bbell/reading-lite/internal/blobs"
+	"github.com/bbell/reading-lite/internal/bookmarks"
 	"github.com/bbell/reading-lite/internal/clock"
 	"github.com/bbell/reading-lite/internal/reading"
 	"github.com/bbell/reading-lite/internal/readingops"
@@ -434,84 +433,16 @@ func bookmarkURLsFromRequest(w http.ResponseWriter, r *http.Request) ([]string, 
 		return nil, false
 	}
 
-	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "text/html") || trimmed[0] == '<' {
-		return bookmarkHREFs(string(data)), true
-	}
-
-	type bookmarkInput struct {
-		URL string `json:"url"`
-	}
-	if trimmed[0] == '[' {
-		var bookmarks []bookmarkInput
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&bookmarks); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid_json", "invalid JSON request body")
-			return nil, false
-		}
-		if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	urls, err := bookmarks.Parse(data, r.Header.Get("Content-Type"))
+	if err != nil {
+		if errors.Is(err, bookmarks.ErrMultipleJSONValues) {
 			writeErr(w, http.StatusBadRequest, "invalid_json", "request body must contain one JSON value")
 			return nil, false
 		}
-		urls := make([]string, 0, len(bookmarks))
-		for _, b := range bookmarks {
-			urls = append(urls, b.URL)
-		}
-		return urls, true
-	}
-
-	var req struct {
-		HTML      string          `json:"html"`
-		Bookmarks []bookmarkInput `json:"bookmarks"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_json", "invalid JSON request body")
 		return nil, false
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusBadRequest, "invalid_json", "request body must contain one JSON value")
-		return nil, false
-	}
-
-	urls := make([]string, 0, len(req.Bookmarks))
-	for _, b := range req.Bookmarks {
-		urls = append(urls, b.URL)
-	}
-	if req.HTML != "" {
-		urls = append(urls, bookmarkHREFs(req.HTML)...)
-	}
 	return urls, true
-}
-
-func bookmarkHREFs(raw string) []string {
-	tokenizer := html.NewTokenizer(strings.NewReader(raw))
-	var out []string
-	for {
-		switch tokenizer.Next() {
-		case html.ErrorToken:
-			if errors.Is(tokenizer.Err(), io.EOF) {
-				return out
-			}
-			return out
-		case html.StartTagToken, html.SelfClosingTagToken:
-			name, hasAttr := tokenizer.TagName()
-			if string(name) != "a" || !hasAttr {
-				continue
-			}
-			for {
-				key, val, more := tokenizer.TagAttr()
-				if string(key) == "href" {
-					out = append(out, string(val))
-					break
-				}
-				if !more {
-					break
-				}
-			}
-		}
-	}
 }
 
 func decode[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
