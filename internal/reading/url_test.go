@@ -229,6 +229,8 @@ func TestClassifySource(t *testing.T) {
 	}{
 		{"https://example.com/post", reading.SourceWeb},
 		{"https://www.youtube.com/watch?v=ID", reading.SourceYouTube},
+		{"https://www.youtube.com/playlist?list=PL", reading.SourceWeb},
+		{"https://www.youtube.com/@channel", reading.SourceWeb},
 		{"https://reddit.com/r/golang/comments/abc/title", reading.SourceReddit},
 		{"https://example.com/notes.md", reading.SourceMarkdown},
 	}

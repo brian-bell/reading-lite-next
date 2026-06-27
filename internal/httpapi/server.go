@@ -93,6 +93,15 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	if s.Health.Degraded() {
+		writeJSON(w, http.StatusServiceUnavailable, healthDocument{
+			Status: "degraded",
+			Build:  s.Build,
+			Checks: skippedHealthChecks(),
+		})
+		return
+	}
+
 	doc := healthDocument{
 		Status: "ok",
 		Build:  s.Build,
@@ -107,6 +116,13 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, doc)
+}
+
+func skippedHealthChecks() map[string]healthCheck {
+	return map[string]healthCheck{
+		"postgres": {Status: "skipped"},
+		"r2":       {Status: "skipped"},
+	}
 }
 
 type healthDocument struct {

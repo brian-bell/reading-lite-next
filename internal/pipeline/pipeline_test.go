@@ -462,6 +462,41 @@ func TestPipeline_YouTube_OEmbedFloor(t *testing.T) {
 	}
 }
 
+func TestPipeline_YouTubeNonVideoFallsBackToFetchExtract(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	key, err := reading.URLKey("https://www.youtube.com/@channel")
+	if err != nil {
+		t.Fatalf("URLKey: %v", err)
+	}
+	r := reading.Reading{
+		ID:         "r1",
+		URL:        "https://www.youtube.com/@channel",
+		URLKey:     key,
+		Status:     reading.Pending,
+		SourceKind: reading.SourceYouTube,
+		CreatedAt:  h.clock.Now(),
+		UpdatedAt:  h.clock.Now(),
+	}
+	if err := h.store.SaveReading(context.Background(), r); err != nil {
+		t.Fatalf("SaveReading: %v", err)
+	}
+
+	h.dispatcher.Submit("r1")
+
+	got := h.get(t, "r1")
+	if got.Status != reading.Ready {
+		t.Fatalf("status = %q, want ready", got.Status)
+	}
+	if h.youtube.calls != 0 {
+		t.Fatalf("youtube calls = %d, want non-video URL to skip oEmbed adapter", h.youtube.calls)
+	}
+	if h.fetcher.Calls() != 1 || h.extractor.Calls() != 1 {
+		t.Fatalf("fetch/extract calls = %d/%d, want 1/1", h.fetcher.Calls(), h.extractor.Calls())
+	}
+}
+
 type fakeYouTube struct {
 	article extract.Article
 	err     error

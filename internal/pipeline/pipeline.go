@@ -271,14 +271,14 @@ func (p *Pipeline) reuse(ctx context.Context, r reading.Reading, diag *diagnosti
 }
 
 // acquire produces the content to index, dispatching on source kind: markdown
-// imports skip fetch/extract and read the stored body; YouTube uses its
-// oEmbed/transcript adapter; everything else fetches and extracts HTML. All
+// imports skip fetch/extract and read the stored body; YouTube video keys use
+// the oEmbed/transcript adapter; everything else fetches and extracts HTML. All
 // paths share the embed/query/blob tail in index.
 func (p *Pipeline) acquire(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
 	if r.SourceKind == reading.SourceMarkdown {
 		return p.acquireMarkdown(ctx, r, diag)
 	}
-	if r.SourceKind == reading.SourceYouTube && p.YouTube != nil {
+	if r.SourceKind == reading.SourceYouTube && p.YouTube != nil && reading.IsYouTubeVideoKey(r.URLKey) {
 		return p.acquireYouTube(ctx, r, diag)
 	}
 	return p.acquireFetched(ctx, r, diag)

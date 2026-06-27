@@ -296,6 +296,43 @@ func TestHealthz_DegradedOnDependencyFailureRedactsError(t *testing.T) {
 	}
 }
 
+func TestHealthz_DegradedSkipsDependencyChecks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	health := &httpapi.HealthState{}
+	health.MarkDegraded()
+	var postgresCalled bool
+	var r2Called bool
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		Health:     health,
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(context.Context) error {
+				postgresCalled = true
+				return nil
+			},
+			R2: func(context.Context) error {
+				r2Called = true
+				return nil
+			},
+		},
+	}
+	h.handler = srv.Routes()
+
+	rr := h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if postgresCalled || r2Called {
+		t.Fatalf("dependency probes called while degraded: postgres=%v r2=%v", postgresCalled, r2Called)
+	}
+}
+
 func TestAuth_ValidTokenPasses(t *testing.T) {
 	t.Parallel()
 
