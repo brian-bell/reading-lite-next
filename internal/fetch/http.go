@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/bbell/reading-lite/internal/dispatch"
@@ -30,6 +33,21 @@ var ErrUnsupportedScheme = errors.New("fetch: unsupported URL scheme")
 // document, and never buffer an unbounded response into memory.
 var ErrBodyTooLarge = errors.New("fetch: response body exceeds limit")
 
+// ErrBlockedPrivateAddress reports an SSRF guard rejection. It wraps
+// dispatch.ErrPermanent at call sites so the dispatcher does not retry a URL
+// whose resolved destination is forbidden.
+var ErrBlockedPrivateAddress = errors.New("fetch: blocked private address")
+
+// Resolver resolves hostnames for the guarded production transport.
+type Resolver interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+type dialResult struct {
+	conn net.Conn
+	err  error
+}
+
 // HTTP is the production [Fetcher]: an http.Client wrapper that sets a User-Agent,
 // honors a timeout, caps the response body size, follows redirects (reporting the
 // post-redirect URL as FinalURL), and rejects non-http(s) schemes.
@@ -38,6 +56,9 @@ type HTTP struct {
 	userAgent string
 	maxBytes  int64
 	timeout   time.Duration
+	resolver  Resolver
+	dial      func(context.Context, string, string) (net.Conn, error)
+	bypass    bool
 }
 
 // Option configures an [HTTP] fetcher.
@@ -68,6 +89,24 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(h *HTTP) { h.client = c }
 }
 
+// WithResolver replaces DNS resolution for the guarded transport. It is intended
+// for tests; production uses net.DefaultResolver through the same guard.
+func WithResolver(r Resolver) Option {
+	return func(h *HTTP) { h.resolver = r }
+}
+
+// WithPrivateNetworkBypassForTests permits private loopback httptest servers.
+// Production construction must not expose or enable this option from config.
+func WithPrivateNetworkBypassForTests() Option {
+	return func(h *HTTP) { h.bypass = true }
+}
+
+// WithDialContextForTests replaces the final network dial while keeping
+// production URL, DNS, redirect, and private-address validation in place.
+func WithDialContextForTests(dial func(context.Context, string, string) (net.Conn, error)) Option {
+	return func(h *HTTP) { h.dial = dial }
+}
+
 // NewHTTP returns an HTTP fetcher with sensible defaults, overridden by opts.
 func NewHTTP(opts ...Option) *HTTP {
 	h := &HTTP{
@@ -75,12 +114,13 @@ func NewHTTP(opts ...Option) *HTTP {
 		userAgent: defaultUserAgent,
 		maxBytes:  defaultMaxBytes,
 		timeout:   defaultTimeout,
+		resolver:  netResolver{},
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
-	// Apply the timeout after options so WithTimeout is order-independent and wins
-	// over any client passed via WithHTTPClient.
+	h.guardClient()
+	// Apply the timeout after options so WithTimeout is order-independent.
 	h.client.Timeout = h.timeout
 	return h
 }
@@ -95,9 +135,9 @@ func (h *HTTP) Get(ctx context.Context, url string) (Resource, error) {
 	if s := req.URL.Scheme; s != "http" && s != "https" {
 		return Resource{}, fmt.Errorf("%w: %q", ErrUnsupportedScheme, s)
 	}
-	// TODO(phase-11): this validates only the initial URL. When the SSRF guard
-	// lands, hook http.Client.CheckRedirect to re-validate each redirect hop's
-	// scheme/host (a redirect can otherwise reach an internal address).
+	if err := h.validateURL(req.URL.Scheme, req.URL.Hostname()); err != nil {
+		return Resource{}, err
+	}
 	req.Header.Set("User-Agent", h.userAgent)
 
 	resp, err := h.client.Do(req)
@@ -141,6 +181,201 @@ func (h *HTTP) Get(ctx context.Context, url string) (Resource, error) {
 		FinalURL:    final,
 		Status:      resp.StatusCode,
 	}, nil
+}
+
+func (h *HTTP) guardClient() {
+	if h.client == nil {
+		h.client = &http.Client{}
+	}
+	if h.resolver == nil {
+		h.resolver = netResolver{}
+	}
+	if h.dial == nil {
+		dialer := net.Dialer{}
+		h.dial = dialer.DialContext
+	}
+	priorRedirect := h.client.CheckRedirect
+	h.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !h.bypass {
+			if req.URL == nil {
+				return nil
+			}
+			if err := h.validateURL(req.URL.Scheme, req.URL.Hostname()); err != nil {
+				return err
+			}
+		}
+		if priorRedirect != nil {
+			return priorRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	if h.bypass {
+		return
+	}
+	if h.client.Transport == nil {
+		h.client.Transport = &http.Transport{
+			Proxy:       nil,
+			DialContext: h.guardedDialContext,
+		}
+		return
+	}
+	if transport, ok := h.client.Transport.(*http.Transport); ok {
+		clone := transport.Clone()
+		clone.Proxy = nil
+		clone.DialContext = h.guardedDialContext
+		clone.DialTLSContext = nil
+		clone.DialTLS = nil //nolint:staticcheck // Clear deprecated hook too; otherwise custom TLS dials bypass the SSRF guard.
+		h.client.Transport = clone
+		return
+	}
+	h.client.Transport = &http.Transport{
+		Proxy:       nil,
+		DialContext: h.guardedDialContext,
+	}
+}
+
+func (h *HTTP) guardedDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("fetch: split dial address: %w", err)
+	}
+	if err := h.validateURL("", host); err != nil {
+		return nil, err
+	}
+	addrs, err := h.resolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("fetch: resolve %s: %w", host, err)
+	}
+	for _, addr := range addrs {
+		if IsPrivateAddress(addr) {
+			return nil, blockedAddressError()
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("fetch: resolve %s: no addresses", host)
+	}
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan dialResult, len(addrs))
+	for _, addr := range addrs {
+		address := net.JoinHostPort(addr.String(), port)
+		go func() {
+			conn, err := h.dial(dialCtx, network, address)
+			results <- dialResult{conn: conn, err: err}
+		}()
+	}
+	var lastErr error
+	for range addrs {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				cancel()
+				go drainDialResults(results, len(addrs)-1)
+				return result.conn, nil
+			}
+			lastErr = result.err
+		case <-ctx.Done():
+			go drainDialResults(results, len(addrs))
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("fetch: dial %s: %w", host, lastErr)
+}
+
+func drainDialResults(results <-chan dialResult, n int) {
+	for range n {
+		result := <-results
+		if result.conn != nil {
+			_ = result.conn.Close()
+		}
+	}
+}
+
+func (h *HTTP) validateURL(scheme, host string) error {
+	if scheme != "" && scheme != "http" && scheme != "https" {
+		return fmt.Errorf("%w: %q", ErrUnsupportedScheme, scheme)
+	}
+	if h.bypass {
+		return nil
+	}
+	addr, ok := parseHostAddr(host)
+	if ok && IsPrivateAddress(addr) {
+		return blockedAddressError()
+	}
+	return nil
+}
+
+func parseHostAddr(host string) (netip.Addr, bool) {
+	host = strings.Trim(host, "[]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr, true
+}
+
+func blockedAddressError() error {
+	return fmt.Errorf("%w: %w", dispatch.ErrPermanent, ErrBlockedPrivateAddress)
+}
+
+// IsPrivateAddress reports whether addr is unsuitable for production fetching.
+func IsPrivateAddress(addr netip.Addr) bool {
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	for _, prefix := range blockedSpecialPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsUnspecified() ||
+		addr.IsMulticast() ||
+		addr == netip.MustParseAddr("255.255.255.255")
+}
+
+var blockedSpecialPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),   // carrier-grade NAT
+	netip.MustParsePrefix("0.0.0.0/8"),       // this network
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments
+	netip.MustParsePrefix("192.31.196.0/24"), // AS112
+	netip.MustParsePrefix("192.52.193.0/24"), // AMT
+	netip.MustParsePrefix("192.88.99.0/24"),  // deprecated 6to4 relay anycast
+	netip.MustParsePrefix("192.175.48.0/24"), // direct delegation AS112
+	netip.MustParsePrefix("192.0.2.0/24"),    // documentation
+	netip.MustParsePrefix("198.18.0.0/15"),   // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // documentation
+	netip.MustParsePrefix("203.0.113.0/24"),  // documentation
+	netip.MustParsePrefix("240.0.0.0/4"),     // reserved
+	netip.MustParsePrefix("100::/64"),        // discard-only
+	netip.MustParsePrefix("2001:1::1/128"),   // Port Control Protocol anycast
+	netip.MustParsePrefix("2001:1::2/128"),   // Traversal Using Relays around NAT anycast
+	netip.MustParsePrefix("2001:3::/32"),     // AMT
+	netip.MustParsePrefix("2001:4:112::/48"), // AS112v6
+	netip.MustParsePrefix("2001:db8::/32"),   // documentation
+	netip.MustParsePrefix("2001:2::/48"),     // benchmarking
+	netip.MustParsePrefix("2001:10::/28"),    // deprecated ORCHID
+	netip.MustParsePrefix("2002::/16"),       // 6to4
+	netip.MustParsePrefix("3fff::/20"),       // documentation
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // local-use NAT64
+	netip.MustParsePrefix("64:ff9b::/96"),    // well-known NAT64
+	netip.MustParsePrefix("2001:0000::/32"),  // Teredo
+	netip.MustParsePrefix("2001:20::/28"),    // ORCHIDv2
+	netip.MustParsePrefix("2001:30::/28"),    // Drone Remote ID
+	netip.MustParsePrefix("2001:db8::/32"),   // documentation
+	netip.MustParsePrefix("fc00::/7"),        // unique local
+	netip.MustParsePrefix("fe80::/10"),       // link local
+}
+
+type netResolver struct{}
+
+func (netResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, network, host)
 }
 
 // readCapped reads up to limit bytes from r and reports whether the stream held

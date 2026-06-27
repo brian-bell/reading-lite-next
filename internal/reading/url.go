@@ -88,9 +88,10 @@ func ClassifySource(key string) SourceKind {
 		return SourceWeb
 	}
 
-	host := canonicalHost(strings.ToLower(u.Scheme), u.Host)
+	scheme := strings.ToLower(u.Scheme)
+	host := canonicalHost(scheme, u.Host)
 	switch {
-	case isYouTubeHost(host):
+	case scheme == "https" && isYouTubeVideoURL(host, u):
 		return SourceYouTube
 	case redditHosts[host]:
 		return SourceReddit
@@ -99,6 +100,18 @@ func ClassifySource(key string) SourceKind {
 	default:
 		return SourceWeb
 	}
+}
+
+// IsYouTubeVideoKey reports whether key is the canonical idempotency key for a
+// YouTube video.
+func IsYouTubeVideoKey(key string) bool {
+	u, err := url.Parse(key)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := canonicalHost(scheme, u.Host)
+	return scheme == "https" && isYouTubeVideoURL(host, u)
 }
 
 func youtubeShortKey(u *url.URL) (string, error) {
@@ -227,6 +240,10 @@ func filteredQuery(values url.Values) url.Values {
 
 func isYouTubeHost(host string) bool {
 	return youtubeHosts[host]
+}
+
+func isYouTubeVideoURL(host string, u *url.URL) bool {
+	return host == "www.youtube.com" && u.Path == "/watch" && isYouTubeID(u.Query().Get("v"))
 }
 
 func isYouTubeID(id string) bool {

@@ -163,3 +163,30 @@ func TestR2_GetMissingKeyIsErrNotFound(t *testing.T) {
 		t.Fatalf("Get missing = %v, want ErrNotFound", err)
 	}
 }
+
+func TestR2_HealthMissingKeyIsReachable(t *testing.T) {
+	t.Parallel()
+
+	srv, _ := newS3Stub(t)
+	r := newR2(t, srv.URL)
+
+	if err := r.Health(context.Background()); err != nil {
+		t.Fatalf("Health missing key = %v, want nil", err)
+	}
+}
+
+func TestR2_HealthMissingBucketIsError(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><Error><Code>NoSuchBucket</Code><Message>bucket not found</Message></Error>`))
+	}))
+	defer srv.Close()
+	r := newR2(t, srv.URL)
+
+	if err := r.Health(context.Background()); err == nil {
+		t.Fatal("Health missing bucket = nil, want error")
+	}
+}

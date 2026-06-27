@@ -15,6 +15,7 @@ import (
 	"html"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/bbell/reading-lite/internal/blobs"
 	"github.com/bbell/reading-lite/internal/clock"
@@ -36,6 +37,11 @@ type Store interface {
 	ReplaceTags(ctx context.Context, id string, tags []string, fields store.TagFields) error
 }
 
+// YouTubeExtractor extracts the oEmbed/transcript floor for a YouTube video URL.
+type YouTubeExtractor interface {
+	Extract(ctx context.Context, videoURL string) (extract.Article, error)
+}
+
 // Config tunes pipeline behavior.
 type Config struct {
 	// TopK bounds how many similar readings to retrieve.
@@ -54,6 +60,7 @@ type Pipeline struct {
 	Blobs      blobs.Blobs
 	Fetcher    fetch.Fetcher
 	Extractor  extract.Extractor
+	YouTube    YouTubeExtractor
 	Embedder   embed.Embedder
 	Vectors    vector.Index
 	Summarizer summarize.Summarizer
@@ -81,11 +88,12 @@ type SimilarItem struct {
 
 // diagnostics records per-step pipeline outcomes, persisted as diagnostics_json.
 type diagnostics struct {
-	Source         string `json:"source"`
-	ExtractionMode string `json:"extraction_mode,omitempty"`
-	SimilarCount   int    `json:"similar_count"`
-	Reused         bool   `json:"reused,omitempty"`
-	NotifyError    string `json:"notify_error,omitempty"`
+	Source         string             `json:"source"`
+	ExtractionMode string             `json:"extraction_mode,omitempty"`
+	SimilarCount   int                `json:"similar_count"`
+	Reused         bool               `json:"reused,omitempty"`
+	NotifyError    string             `json:"notify_error,omitempty"`
+	TimingsMS      map[string]float64 `json:"timings_ms,omitempty"`
 }
 
 // content is the result of acquiring, extracting, and indexing a source.
@@ -125,7 +133,9 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 	// the stored content instead of fetching/extracting again; vector upsert is
 	// retried after the checkpoint so a post-checkpoint failure can recover.
 	if r.ContentKey != "" {
+		stopAcquire := diag.start(p, "acquire")
 		c, err := p.reuse(ctx, r, &diag)
+		stopAcquire()
 		if err != nil {
 			return dispatch.Classify(err)
 		}
@@ -136,27 +146,45 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 		// runs pool.Exec(ctx)), so a cancelled stale upsert never writes. A
 		// generation-fenced Upsert that would also stop a hypothetical
 		// non-context-aware adapter is deferred follow-up.
+		diag.ensureTiming("index")
+		stopVector := diag.start(p, "vector_upsert")
 		if err := p.upsertVector(ctx, r, c); err != nil {
+			stopVector()
 			return dispatch.Classify(err)
 		}
+		stopVector()
 		return p.summarizeAndFinish(ctx, r, c, diag)
 	}
 
+	stopAcquire := diag.start(p, "acquire")
 	c, err := p.acquire(ctx, r, &diag)
+	stopAcquire()
 	if err != nil {
 		return dispatch.Classify(err)
 	}
+	stopIndex := diag.start(p, "index")
+	if err := p.index(ctx, r, &c, &diag); err != nil {
+		stopIndex()
+		return dispatch.Classify(err)
+	}
+	stopIndex()
 
 	// Checkpoint the acquired content before the (separately retryable)
 	// summarize step, so a summarize failure does not force re-fetching,
 	// re-extracting on the retried run. Vector upsert happens after this guarded
 	// checkpoint so a stale forced run cannot overwrite a replacement's vector.
+	stopCheckpoint := diag.start(p, "checkpoint")
 	if err := p.Store.UpdateContent(ctx, id, p.contentFields(r, c, diag, summarize.Summary{})); err != nil {
+		stopCheckpoint()
 		return dispatch.Classify(err)
 	}
+	stopCheckpoint()
+	stopVector := diag.start(p, "vector_upsert")
 	if err := p.upsertVector(ctx, r, c); err != nil {
+		stopVector()
 		return dispatch.Classify(err)
 	}
+	stopVector()
 
 	return p.summarizeAndFinish(ctx, r, c, diag)
 }
@@ -172,6 +200,7 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 // not the LLM call. Checkpointing the summary too is a possible future cost
 // optimization, not a correctness requirement.
 func (p *Pipeline) summarizeAndFinish(ctx context.Context, r reading.Reading, c content, diag diagnostics) dispatch.Result {
+	stopSummarize := diag.start(p, "summarize")
 	sum, err := p.Summarizer.Summarize(ctx, summarize.SummaryInput{
 		Title:    c.title,
 		Author:   c.author,
@@ -179,6 +208,7 @@ func (p *Pipeline) summarizeAndFinish(ctx context.Context, r reading.Reading, c 
 		URL:      r.URL,
 		Markdown: c.markdown,
 	})
+	stopSummarize()
 	if err != nil {
 		return dispatch.Classify(err)
 	}
@@ -241,20 +271,20 @@ func (p *Pipeline) reuse(ctx context.Context, r reading.Reading, diag *diagnosti
 }
 
 // acquire produces the content to index, dispatching on source kind: markdown
-// imports skip fetch/extract and read the stored body; everything else (web and
-// YouTube) fetches and extracts. YouTube has no dedicated branch here — its
-// oEmbed floor and transcript handling live in the Phase 7 extractor adapter, so
-// in Phase 5 a YouTube URL flows through the same fetch+extract path as web (it
-// is fetchable, unlike Reddit). Both paths share the embed/query/blob
-// tail in index.
+// imports skip fetch/extract and read the stored body; YouTube video keys use
+// the oEmbed/transcript adapter; everything else fetches and extracts HTML. All
+// paths share the embed/query/blob tail in index.
 func (p *Pipeline) acquire(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
 	if r.SourceKind == reading.SourceMarkdown {
 		return p.acquireMarkdown(ctx, r, diag)
 	}
+	if r.SourceKind == reading.SourceYouTube && p.YouTube != nil && reading.IsYouTubeVideoKey(r.URLKey) {
+		return p.acquireYouTube(ctx, r, diag)
+	}
 	return p.acquireFetched(ctx, r, diag)
 }
 
-// acquireFetched fetches and extracts a web (or YouTube) source, then indexes it.
+// acquireFetched fetches and extracts a web source.
 func (p *Pipeline) acquireFetched(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
 	res, err := p.Fetcher.Get(ctx, r.URL)
 	if err != nil {
@@ -285,15 +315,39 @@ func (p *Pipeline) acquireFetched(ctx context.Context, r reading.Reading, diag *
 	if err := p.Blobs.Put(ctx, c.rawKey, res.Body, res.ContentType); err != nil {
 		return content{}, err
 	}
-	if err := p.index(ctx, r, &c, diag); err != nil {
+	return c, nil
+}
+
+// acquireYouTube extracts a YouTube source through oEmbed/timed-text without
+// fetching and readability-parsing the watch page HTML.
+func (p *Pipeline) acquireYouTube(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
+	videoURL := r.URLKey
+	if videoURL == "" {
+		videoURL = r.URL
+	}
+	article, err := p.YouTube.Extract(ctx, videoURL)
+	if err != nil {
 		return content{}, err
 	}
+
+	c := content{
+		title:      article.Title,
+		author:     article.Author,
+		site:       article.Site,
+		lang:       article.Lang,
+		wordCount:  article.WordCount,
+		mode:       string(article.Mode),
+		markdown:   article.Markdown,
+		contentKey: contentKey(r),
+		rawKey:     r.RawKey,
+	}
+	diag.ExtractionMode = c.mode
 	return c, nil
 }
 
 // acquireMarkdown reads the markdown body stored at ingest (the raw blob) and
 // indexes it without fetching or extracting.
-func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, diag *diagnostics) (content, error) {
+func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, _ *diagnostics) (content, error) {
 	if r.RawKey == "" {
 		return content{}, fmt.Errorf("%w: markdown reading has no stored body", dispatch.ErrPermanent)
 	}
@@ -310,9 +364,6 @@ func (p *Pipeline) acquireMarkdown(ctx context.Context, r reading.Reading, diag 
 		// A markdown import is not extracted from a fetched page, so it has no
 		// extraction tier: mode is intentionally left empty (the {readability,
 		// raw_dom, raw_only} tiers describe extracted web content only).
-	}
-	if err := p.index(ctx, r, &c, diag); err != nil {
-		return content{}, err
 	}
 	return c, nil
 }
@@ -383,6 +434,8 @@ func (p *Pipeline) notifyBestEffort(ctx context.Context, r reading.Reading, sum 
 	if !p.Config.NotifyEnabled || p.Notifier == nil {
 		return false
 	}
+	stop := diag.start(p, "notify")
+	defer stop()
 	// The summary is derived from untrusted fetched content via the summarizer, so
 	// escape it before embedding it in the HTML body to prevent markup injection.
 	err := p.Notifier.Notify(ctx, notify.Email{
@@ -395,7 +448,7 @@ func (p *Pipeline) notifyBestEffort(ctx context.Context, r reading.Reading, sum 
 		diag.NotifyError = err.Error()
 		return true
 	}
-	return false
+	return true
 }
 
 func (p *Pipeline) contentFields(r reading.Reading, c content, diag diagnostics, sum summarize.Summary) store.ContentFields {
@@ -464,6 +517,34 @@ func marshalDiagnostics(diag diagnostics) json.RawMessage {
 		return nil
 	}
 	return b
+}
+
+func (d *diagnostics) start(p *Pipeline, key string) func() {
+	start := p.now()
+	return func() {
+		d.ensureTiming(key)
+		elapsed := p.now().Sub(start)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		d.TimingsMS[key] = float64(elapsed.Milliseconds())
+	}
+}
+
+func (d *diagnostics) ensureTiming(key string) {
+	if d.TimingsMS == nil {
+		d.TimingsMS = map[string]float64{}
+	}
+	if _, ok := d.TimingsMS[key]; !ok {
+		d.TimingsMS[key] = 0
+	}
+}
+
+func (p *Pipeline) now() time.Time {
+	if p.Clock == nil {
+		return time.Now().UTC()
+	}
+	return p.Clock.Now()
 }
 
 // classifyFetchStatus maps an HTTP status to a pipeline error: 429 is a rate

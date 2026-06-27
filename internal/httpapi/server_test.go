@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -218,6 +219,172 @@ func TestAuth_HealthzSkipsAuth(t *testing.T) {
 	}
 }
 
+func TestHealthz_ReturnsBuildAndDependencyChecks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		Build:      httpapi.BuildInfo{Version: "v1", Commit: "abc", Date: "2026-06-26"},
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(context.Context) error { return nil },
+			R2:       func(context.Context) error { return nil },
+		},
+	}
+	h.handler = srv.Routes()
+
+	rr := h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("content-type = %q, want application/json", got)
+	}
+	got := decodeJSON[struct {
+		Status string `json:"status"`
+		Build  struct {
+			Version string `json:"version"`
+			Commit  string `json:"commit"`
+			Date    string `json:"date"`
+		} `json:"build"`
+		Checks map[string]struct {
+			Status string `json:"status"`
+			Error  string `json:"error,omitempty"`
+		} `json:"checks"`
+	}](t, rr)
+	if got.Status != "ok" || got.Build.Version != "v1" || got.Build.Commit != "abc" || got.Build.Date != "2026-06-26" {
+		t.Fatalf("health body = %+v, want ok build info", got)
+	}
+	for _, name := range []string{"postgres", "r2"} {
+		if got.Checks[name].Status != "ok" {
+			t.Fatalf("check %s = %+v, want ok", name, got.Checks[name])
+		}
+	}
+}
+
+func TestHealthz_DegradedOnDependencyFailureRedactsError(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(context.Context) error { return errors.New("postgres://reader:secret@db.example.com failed") },
+			R2:       func(context.Context) error { return nil },
+		},
+	}
+	h.handler = srv.Routes()
+
+	rr := h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"status":"degraded"`) || !strings.Contains(body, `"postgres"`) {
+		t.Fatalf("body = %s, want degraded postgres check", body)
+	}
+	if strings.Contains(body, "secret") || strings.Contains(body, "postgres://") {
+		t.Fatalf("health leaked raw error: %s", body)
+	}
+}
+
+func TestHealthz_BoundsDependencyChecks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	unblock := make(chan struct{})
+	defer close(unblock)
+	srv := &httpapi.Server{
+		Store:              h.store,
+		Blobs:              h.blobs,
+		Dispatcher:         h.submitter,
+		Clock:              h.clock,
+		Token:              "secret-token",
+		HealthCheckTimeout: 10 * time.Millisecond,
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(ctx context.Context) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-unblock:
+					return nil
+				}
+			},
+			R2: func(context.Context) error { return nil },
+		},
+	}
+	h.handler = srv.Routes()
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	}()
+
+	select {
+	case rr := <-result:
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+		}
+		got := decodeJSON[struct {
+			Status string `json:"status"`
+			Checks map[string]struct {
+				Status string `json:"status"`
+				Error  string `json:"error,omitempty"`
+			} `json:"checks"`
+		}](t, rr)
+		if got.Status != "degraded" || got.Checks["postgres"].Status != "error" || got.Checks["postgres"].Error != "timeout" {
+			t.Fatalf("health body = %+v, want degraded postgres timeout", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("healthz did not return after the health check timeout")
+	}
+}
+
+func TestHealthz_DegradedSkipsDependencyChecks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	health := &httpapi.HealthState{}
+	health.MarkDegraded()
+	var postgresCalled bool
+	var r2Called bool
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		Health:     health,
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(context.Context) error {
+				postgresCalled = true
+				return nil
+			},
+			R2: func(context.Context) error {
+				r2Called = true
+				return nil
+			},
+		},
+	}
+	h.handler = srv.Routes()
+
+	rr := h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if postgresCalled || r2Called {
+		t.Fatalf("dependency probes called while degraded: postgres=%v r2=%v", postgresCalled, r2Called)
+	}
+}
+
 func TestAuth_ValidTokenPasses(t *testing.T) {
 	t.Parallel()
 
@@ -264,6 +431,38 @@ func TestErrors_MethodMismatchUsesJSONEnvelope(t *testing.T) {
 	}](t, rr)
 	if got.Error.Code != "method_not_allowed" {
 		t.Fatalf("error code = %q, want method_not_allowed", got.Error.Code)
+	}
+}
+
+func TestLogging_RecordsSafeRequestFields(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	h := newHarness(t)
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		Logger:     slog.New(slog.NewJSONHandler(&logs, nil)),
+	}
+	h.handler = srv.Routes()
+
+	_ = h.authed(t, http.MethodGet, "/api/readings", nil)
+	_ = h.request(t, http.MethodGet, "/api/readings", nil, "wrong-token")
+	_ = h.authed(t, http.MethodGet, "/api/does-not-exist", nil)
+
+	out := logs.String()
+	for _, want := range []string{`"method":"GET"`, `"path":"/api/readings"`, `"status":200`, `"status":401`, `"status":404`, `"request_id":`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs missing %s in:\n%s", want, out)
+		}
+	}
+	for _, forbidden := range []string{"secret-token", "wrong-token", "Authorization", "Bearer"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("logs leaked %q in:\n%s", forbidden, out)
+		}
 	}
 }
 

@@ -25,7 +25,7 @@ func TestHTTP_RequestShapeAndParse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := fetch.NewHTTP(fetch.WithUserAgent("reading-lite-test/1.0"))
+	f := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithUserAgent("reading-lite-test/1.0"))
 	res, err := f.Get(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -64,7 +64,7 @@ func TestHTTP_FollowsRedirectsReportsFinalURL(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	f := fetch.NewHTTP()
+	f := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests())
 	res, err := f.Get(context.Background(), srv.URL+"/start")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -86,7 +86,7 @@ func TestHTTP_CapsBodySize(t *testing.T) {
 	defer srv.Close()
 
 	// A cap below the response size rejects rather than truncating or OOMing.
-	f := fetch.NewHTTP(fetch.WithMaxBytes(10))
+	f := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithMaxBytes(10))
 	_, err := f.Get(context.Background(), srv.URL)
 	if !errors.Is(err, fetch.ErrBodyTooLarge) {
 		t.Fatalf("Get over cap = %v, want ErrBodyTooLarge", err)
@@ -98,7 +98,7 @@ func TestHTTP_CapsBodySize(t *testing.T) {
 	}
 
 	// A body exactly at the cap is accepted.
-	g := fetch.NewHTTP(fetch.WithMaxBytes(100))
+	g := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithMaxBytes(100))
 	res, err := g.Get(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("Get at cap: %v", err)
@@ -120,7 +120,7 @@ func TestHTTP_OversizedNon2xxPreservesStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res, err := fetch.NewHTTP(fetch.WithMaxBytes(10)).Get(context.Background(), srv.URL)
+	res, err := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithMaxBytes(10)).Get(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("oversized 5xx = %v, want no error (status drives classification)", err)
 	}
@@ -146,7 +146,7 @@ func TestHTTP_RateLimitMapsToRateLimitError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetch.NewHTTP().Get(context.Background(), srv.URL)
+	_, err := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests()).Get(context.Background(), srv.URL)
 	var rl *dispatch.RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("429 = %v, want *dispatch.RateLimitError", err)
@@ -170,7 +170,7 @@ func TestHTTP_RateLimitWithoutRetryAfterUsesBoundedDelay(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetch.NewHTTP().Get(context.Background(), srv.URL)
+	_, err := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests()).Get(context.Background(), srv.URL)
 	var rl *dispatch.RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("bare 429 = %v, want *dispatch.RateLimitError", err)
@@ -204,7 +204,7 @@ func TestHTTP_HonorsTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := fetch.NewHTTP(fetch.WithTimeout(50 * time.Millisecond))
+	f := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithTimeout(50*time.Millisecond))
 	if _, err := f.Get(context.Background(), srv.URL); err == nil {
 		t.Fatal("Get against a hung server = nil error, want a timeout error")
 	}
@@ -220,7 +220,7 @@ func TestHTTP_RespectsContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	f := fetch.NewHTTP()
+	f := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests())
 	if _, err := f.Get(ctx, srv.URL); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Get with cancelled ctx = %v, want context.Canceled", err)
 	}

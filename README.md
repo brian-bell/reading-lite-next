@@ -10,11 +10,14 @@ blob reads, reprocess, and a shared JSON error model. `internal/readingops` owns
 ingest/import/reprocess workflows across the store, blob backend, and dispatcher;
 `internal/httpapi` stays focused on transport concerns.
 
-Production API process wiring is not in place yet. `cmd/reader-api` exists so the project
-builds, but it still exits immediately instead of starting the API server. `cmd/readerctl`
-now delegates to the tested `internal/readerctl` operator command core; commands that need
-store/blob/vector/dispatcher dependencies still require injected construction and return a
-configuration error from the default binary until Phase 11 wiring exists.
+The production API process now boots from environment configuration. `cmd/reader-api`
+validates startup env, opens Postgres, runs embedded migrations, constructs the production
+store/blob/vector/fetch/embed/summarize/notify adapters, starts dispatcher workers, runs the
+startup recovery sweep, serves the HTTP API, reports Postgres/R2 health, and shuts down
+gracefully on cancellation or SIGTERM. `cmd/readerctl` now delegates to the tested
+`internal/readerctl` operator command core; commands that need store/blob/vector/dispatcher
+dependencies still require injected construction and return a configuration error from the
+default binary.
 
 ## Requirements
 
@@ -49,15 +52,21 @@ make test-integration
 The store integration tests use `DATABASE_URL` when it is set. Otherwise they fall back to
 testcontainers with a `pgvector/pgvector` Postgres image and skip when Docker is unavailable.
 
-The API entrypoint currently builds but does not perform useful work:
+The API entrypoint requires Phase 11 environment configuration:
 
 ```sh
 make run
 ```
 
+Required env includes `READER_API_TOKEN`, `DATABASE_URL` with TLS `sslmode=require`,
+`verify-ca`, or `verify-full`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, R2 endpoint/access/
+secret/bucket settings, `RESEND_API_KEY`, `NOTIFY_FROM`, `NOTIFY_TO`, dispatcher TTL/count/
+buffer settings, `PG_MAX_CONNS`, and `LISTEN_ADDR`. Optional `FETCH_TIMEOUT`,
+`FETCH_MAX_BYTES`, and `SHUTDOWN_TIMEOUT` use safe defaults.
+
 `readerctl` supports `smoke` and dry-run `deploy`/`staging` planning from the default binary.
 Smoke can authenticate with `--token` or `--token-env`; deploy/staging smoke plans use
 `--smoke-token-env` so secrets stay out of rendered step arguments. Stateful commands such as
 `import`, `audit`, `recover`, and `drop` are tested in `internal/readerctl` with injected
-dependencies; the default binary refuses them until production configuration and adapter
-construction land.
+dependencies; the default binary still refuses them until production dependency construction is
+added there.

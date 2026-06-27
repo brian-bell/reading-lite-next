@@ -96,6 +96,31 @@ func (r *R2) Get(ctx context.Context, key string) ([]byte, string, error) {
 	return data, aws.ToString(out.ContentType), nil
 }
 
+// Health probes bucket reachability with a deliberately missing key. A typed
+// NoSuchKey means the bucket and credentials are usable; other 404s such as
+// NoSuchBucket or bare NotFound are configuration failures.
+func (r *R2) Health(ctx context.Context) error {
+	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String("__reading-lite-healthcheck-missing__"),
+	})
+	if err == nil {
+		if out.Body != nil {
+			_ = out.Body.Close()
+		}
+		return nil
+	}
+	var noKey *types.NoSuchKey
+	if errors.As(err, &noKey) {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchKey" {
+		return nil
+	}
+	return fmt.Errorf("blobs: r2 health: %w", err)
+}
+
 // Delete removes key. Deleting an absent key is a no-op (S3 DeleteObject succeeds
 // whether or not the key existed).
 func (r *R2) Delete(ctx context.Context, key string) error {
