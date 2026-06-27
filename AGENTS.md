@@ -160,7 +160,11 @@ The project targets Go 1.26.
 - `make cover` runs `go test -race -cover ./...`.
 - `make test-integration` runs tests behind the `integration` build tag. Store integration
   tests use `DATABASE_URL` when set; otherwise they use testcontainers with `pgvector/pgvector`
-  and skip when Docker is unavailable.
+  and skip when Docker is unavailable. In this environment, a shell may not inherit the
+  `docker` group even when the user is a member; if `docker info` fails with socket permission
+  errors, run Docker-backed checks through `sg docker -c 'GOFLAGS=-count=1 make test-integration'`
+  or use the same `sg docker -c '...'` wrapper for a focused `go test -tags integration`
+  command.
 - `make lint` checks `gofmt`, `go vet`, and `golangci-lint`.
 - `make build` runs `go build ./...`.
 - `make run` runs `cmd/reader-api`; the binary now requires production env and exits with a
