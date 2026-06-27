@@ -25,21 +25,23 @@ forever after.
 
 ### Phase status
 
-| Phase | Scope | Status |
-|---|---|---|
-| 0 | Tooling, conventions, CI, clock port | Complete |
-| 1 | Pure reading domain core | Complete |
-| 2 | Store port, memory fake, Postgres adapter, conformance suites | Complete |
-| 3 | In-process dispatcher, retry, recovery sweep | Complete |
-| 4 | External-service ports and scriptable fakes | Complete |
-| 5 | Processing pipeline over fakes | Complete |
-| 6 | Real service adapters and contract tests | Complete |
-| 7 | Extraction internals, YouTube, Reddit guidance | Complete |
-| 8 | Command service and HTTP API | Complete |
-| 9 | End-to-end HTTP integration stories | Complete |
-| 10 | Tested `readerctl` command core | Complete; production dependency injection remains deferred |
-| 11 | Production API runtime, config, health, security, shutdown | Complete |
-| 12 | Optional alternative backends and multi-instance workers | Optional / not started |
+Status values are `complete`, `in progress`, or `not started`.
+
+| Phase | Scope | Status | Commit ref(s) |
+|---|---|---|---|
+| 0 | Tooling, conventions, CI, clock port | complete | `2ebe63b` implementation; `ce09597` PR #1 |
+| 1 | Pure reading domain core | complete | `86d05b0` implementation; `ce09597` PR #1 |
+| 2 | Store port, memory fake, Postgres adapter, conformance suites | complete | `47078f3` implementation; `ce09597` PR #1 |
+| 3 | In-process dispatcher, retry, recovery sweep | complete | `de6d8aa` implementation; `c1a381e` PR #2; `84fdd36` PR #3 acceptance |
+| 4 | External-service ports and scriptable fakes | complete | `30fb344` implementation; `83a403e` PR #4 |
+| 5 | Processing pipeline over fakes | complete | `8a6d8f9` implementation; `f9100d4` PR #5 |
+| 6 | Real service adapters and contract tests | complete | `2bebd4d` implementation; `eb4582f` PR #6 |
+| 7 | Extraction internals, YouTube, Reddit guidance | complete | `08b2b07` implementation; `be0bf36` PR #7 |
+| 8 | Command service and HTTP API | complete | `058be8c` implementation; `7672b0b` PR #8 |
+| 9 | End-to-end HTTP integration stories | complete | `fc2a8d0` implementation; `fcdfb11` PR #10 |
+| 10 | Tested `readerctl` command core; production dependency injection remains deferred | complete | `025b7c9` implementation; `f6142fb` PR #11 |
+| 11 | Production API runtime, config, health, security, shutdown | complete | `77e4c5a` implementation; `8ace075` PR #23 |
+| 12 | Optional alternative backends and multi-instance workers | not started | None |
 
 ---
 
