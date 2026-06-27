@@ -51,6 +51,40 @@ func TestPostgresStoreContract(t *testing.T) {
 	})
 }
 
+func TestPostgresBatchStoreContract(t *testing.T) {
+	ctx := context.Background()
+	var schemaCounter atomic.Int64
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		testcontainers.SkipIfProviderIsNotHealthy(t)
+		container, err := tcpostgres.Run(ctx,
+			"pgvector/pgvector:pg16",
+			tcpostgres.WithDatabase("reading_lite"),
+			tcpostgres.WithUsername("reader"),
+			tcpostgres.WithPassword("reader"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			t.Fatalf("start postgres container: %v", err)
+		}
+		testcontainers.CleanupContainer(t, container)
+
+		dsn, err = container.ConnectionString(ctx, "sslmode=disable")
+		if err != nil {
+			t.Fatalf("postgres connection string: %v", err)
+		}
+	}
+
+	storetest.RunBatchContract(t, func(t *testing.T) store.BatchStore {
+		t.Helper()
+		pool := newPostgresPoolFromDSN(t, ctx, dsn, &schemaCounter)
+		if err := store.ApplyMigrations(ctx, pool); err != nil {
+			t.Fatalf("apply migrations: %v", err)
+		}
+		return store.NewPostgres(pool)
+	})
+}
+
 func TestPostgresMigrationsAreIdempotent(t *testing.T) {
 	ctx := context.Background()
 	var schemaCounter atomic.Int64

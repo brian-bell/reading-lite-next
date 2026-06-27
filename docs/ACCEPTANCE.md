@@ -238,7 +238,7 @@ Expect the uncovered lines to be defensive error returns (e.g. `url.Parse` failu
 paths, IPv6 edge branches, the dispatcher's best-effort final-write error paths that
 fire only when the store rejects a terminal write), not core logic. Flag anything else.
 
-### B5. Integration suite (Store ↔ Postgres parity, plus the Phase 6 DB/object-store adapters)
+### B5. Integration suite (Store/BatchStore ↔ Postgres parity, plus the Phase 6 DB/object-store adapters)
 
 ```sh
 make test-integration                       # go test -tags integration ./...
@@ -249,9 +249,10 @@ DATABASE_URL='postgres://…?sslmode=disable' make test-integration
 ```
 Expected behavior:
 - With a working Docker daemon **or** a reachable `DATABASE_URL`: the
-  `TestPostgresStoreContract`, `TestPostgresMigrationsAreIdempotent`, and
-  `TestPostgresDeleteCascadesVector` tests run and pass — proving `store.Postgres`
-  satisfies the **same** `storetest.RunContract` as `store.Memory`.
+  `TestPostgresStoreContract`, `TestPostgresBatchStoreContract`,
+  `TestPostgresMigrationsAreIdempotent`, and `TestPostgresDeleteCascadesVector` tests run and
+  pass — proving `store.Postgres` satisfies the **same** `storetest.RunContract` and
+  `storetest.RunBatchContract` as `store.Memory`.
 - **Phase 6 adds two more integration arms:** `TestPostgresVectorContract`
   (`internal/vector/postgres_test.go`) runs `vectortest.RunContract` against the pgvector
   adapter — the same suite `vector.Memory` passes — and `TestR2_MinIORoundTrip`
@@ -391,10 +392,14 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
 
 - [ ] `go test -v -run TestMemoryStoreContract ./internal/store/` → all conformance
   subtests pass.
-- [ ] Read `Store` interface in `store.go`: the eight methods match the TDD plan §4.4
+- [ ] Read `Store` interface in `store.go`: the reading methods match the TDD plan §4.4
   (`SaveReading`, `GetByID`, `GetByURLKey`, `UpdateStatus`, `ReplaceTags`, `Search`,
   `ListNonTerminal`, `Delete`) plus the `Query`/`Page`/`Pending`/`StatusFields`/
   `Cursor` DTOs and the `ErrNotFound`/`ErrConflict` sentinels.
+- [ ] Read `BatchStore` in `store.go`: it owns durable manual batch planning/submission,
+  batch/item listing, stable `custom_id` lookup, batch state refresh/terminal transitions,
+  idempotent terminal result writes, and item apply markers without touching reading
+  lifecycle state.
 - [ ] Read `memory.go` and confirm the behaviors the plan calls out:
   - Idempotency: duplicate `id` **or** duplicate `url_key` → `ErrConflict`.
   - `Search` returns **defensive copies** (`cloneReading`) — mutating a returned
@@ -406,7 +411,7 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
 - [ ] Confirm `store.Memory` imports nothing outside stdlib + `internal/reading`
   (`CLAUDE.md`: "keep store.Memory dependency-free").
 
-### C7. Phase 2 — conformance suite (`storetest/contract.go`)
+### C7. Phase 2 — conformance suites (`storetest/contract.go`, `storetest/batch_contract.go`)
 
 - [ ] Read `RunContract` and map each subtest to the TDD plan §4.3 list:
   `RoundTrip`, `URLKeyIdempotency`, `SearchFTS` (incl. adversarial query
@@ -419,6 +424,11 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
   source invoked by both `memory_test.go` and `postgres_test.go`. This is the
   mechanism that makes fake↔Postgres divergence impossible to miss — verify nothing
   in the suite reaches into a concrete implementation.
+- [ ] Read `RunBatchContract` and confirm it covers the manual-batch persistence surface:
+  planned batch round-trip, create-order item listing, stable `custom_id` lookup, active
+  reading uniqueness, duplicate remote id conflicts, submit-only result writes, semantic JSON
+  result idempotency, terminal batch release, item apply release, same-state count refresh,
+  invalid JSON/count rejection, and applied-batch guards.
 
 ### C8. Phase 2 — Postgres adapter, migration, sqlc
 
@@ -429,19 +439,26 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
   `status`) + the HNSW ANN index. Note the deliberate `immutable_array_to_string`
   wrapper (with its explanatory comment) — `array_to_string` is only STABLE and
   cannot be used directly in a generated column.
+- [ ] Read `migrations/0002_manual_batches.sql`: `manual_batches` carries local state,
+  remote id/results URL, per-outcome counts, and lifecycle timestamps; `manual_batch_items`
+  carries one stable `custom_id` per request, create-order `item_index`, request/result JSON,
+  error fields, and item timestamps. Confirm the partial unique index on active item states
+  (`planned`, `submitted`, `succeeded`) prevents more than one active batch item per reading.
 - [ ] Read `query.sql` and confirm: idempotent insert uses
   `on conflict (url_key) do nothing returning id`; search uses
   `websearch_to_tsquery('english', …)` (safe arbitrary input) ranked by `ts_rank`;
   keyset cursor includes **rank first** then the secondary key so ranked pages can't
-  skip/dup; sweep query selects `pending` or stale `running`.
+  skip/dup; sweep query selects `pending` or stale `running`; manual-batch updates fence
+  state changes/results/apply by expected state and preserve item order via `item_index`.
 - [ ] Read `postgres.go` and confirm the error mapping: `pgx.ErrNoRows` or unique
   violation (`23505`) on insert → `ErrConflict`; `ErrNoRows` on get → `ErrNotFound`;
   zero affected rows on update/delete → `ErrNotFound`.
 - [ ] Confirm `migrate.go` uses an advisory lock + `schema_migrations` table so
   repeated/parallel runs are safe (the `TestPostgresMigrationsAreIdempotent`
   integration test proves this — see B5).
-- [ ] **Parity proof (confirmed via B5):** `TestPostgresStoreContract` passes the
-  identical `RunContract` and `TestPostgresDeleteCascadesVector` proves the FK
+- [ ] **Parity proof (confirmed via B5):** `TestPostgresStoreContract` and
+  `TestPostgresBatchStoreContract` pass the identical `RunContract`/`RunBatchContract`;
+  `TestPostgresDeleteCascadesVector` proves the FK
   cascade removes the vector row — all green against a real testcontainers Postgres
   (see B5 baseline). Re-run with `-count=1` if you want fresh (uncached) proof.
 

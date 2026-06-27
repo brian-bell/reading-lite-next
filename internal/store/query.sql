@@ -205,3 +205,135 @@ where status = 'pending'
 -- name: DeleteReading :execrows
 delete from readings
 where id = $1;
+
+-- name: CreateManualBatch :exec
+insert into manual_batches (
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+) values (
+  $1, $2, nullif($3, ''), nullif($4, ''),
+  $5, $6, $7, $8, $9,
+  $10, $11, $12, $13, $14
+);
+
+-- name: CreateManualBatchItem :exec
+insert into manual_batch_items (
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+) values (
+  $1, $2, $3, $4, $5, $6, $7,
+  nullif($8, ''), nullif($9, ''), $10, $11, $12, $13, $14
+);
+
+-- name: GetManualBatch :one
+select
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batches
+where id = $1;
+
+-- name: ListManualBatches :many
+select
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batches
+where ($1 = '' or state = $1)
+  and (not $2::boolean or state in ('planned', 'submitted', 'results_ready'))
+order by created_at desc, id desc;
+
+-- name: ListManualBatchItems :many
+select
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batch_items
+where batch_id = $1
+order by item_index asc;
+
+-- name: CountActiveManualBatchItems :one
+select count(*)
+from manual_batch_items
+where batch_id = $1
+  and state in ('planned', 'submitted', 'succeeded');
+
+-- name: GetManualBatchItemByCustomID :one
+select
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batch_items
+where custom_id = $1;
+
+-- name: SubmitManualBatch :execrows
+update manual_batches
+set
+  state = 'submitted',
+  remote_id = nullif($2, ''),
+  results_url = nullif($3, ''),
+  processing_count = $4,
+  succeeded_count = $5,
+  errored_count = $6,
+  canceled_count = $7,
+  expired_count = $8,
+  submitted_at = $9,
+  updated_at = $9
+where id = $1
+  and state = 'planned'
+  and submitted_at is null;
+
+-- name: SubmitManualBatchItems :execrows
+update manual_batch_items
+set
+  state = 'submitted',
+  submitted_at = $2,
+  updated_at = $2
+where batch_id = $1
+  and state = 'planned';
+
+-- name: UpdateManualBatchState :execrows
+update manual_batches
+set
+  state = $2,
+  results_url = coalesce(nullif($3, ''), results_url),
+  processing_count = $4,
+  succeeded_count = $5,
+  errored_count = $6,
+  canceled_count = $7,
+  expired_count = $8,
+  finished_at = $9,
+  applied_at = $10,
+  updated_at = $11
+where id = $1
+  and state = $12;
+
+-- name: UpdateManualBatchActiveItemsTerminal :execrows
+update manual_batch_items
+set
+  state = $2,
+  finished_at = $3,
+  updated_at = $3
+where batch_id = $1
+  and state in ('planned', 'submitted', 'succeeded');
+
+-- name: WriteManualBatchItemResult :execrows
+update manual_batch_items
+set
+  state = $2,
+  result_json = $3,
+  error_type = nullif($4, ''),
+  error_message = nullif($5, ''),
+  finished_at = $6,
+  updated_at = $6
+where custom_id = $1
+  and state = 'submitted'
+  and finished_at is null;
+
+-- name: MarkManualBatchItemApplied :execrows
+update manual_batch_items
+set
+  state = 'applied',
+  applied_at = $2,
+  updated_at = $2
+where custom_id = $1
+  and state = 'succeeded';

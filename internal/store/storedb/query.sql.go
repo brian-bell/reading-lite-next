@@ -11,6 +11,20 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveManualBatchItems = `-- name: CountActiveManualBatchItems :one
+select count(*)
+from manual_batch_items
+where batch_id = $1
+  and state in ('planned', 'submitted', 'succeeded')
+`
+
+func (q *Queries) CountActiveManualBatchItems(ctx context.Context, batchID string) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveManualBatchItems, batchID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countReadings = `-- name: CountReadings :one
 select count(*)
 from readings
@@ -30,6 +44,102 @@ func (q *Queries) CountReadings(ctx context.Context, arg CountReadingsParams) (i
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const createManualBatch = `-- name: CreateManualBatch :exec
+insert into manual_batches (
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+) values (
+  $1, $2, nullif($3, ''), nullif($4, ''),
+  $5, $6, $7, $8, $9,
+  $10, $11, $12, $13, $14
+)
+`
+
+type CreateManualBatchParams struct {
+	ID              string
+	State           string
+	Column3         interface{}
+	Column4         interface{}
+	ProcessingCount int32
+	SucceededCount  int32
+	ErroredCount    int32
+	CanceledCount   int32
+	ExpiredCount    int32
+	CreatedAt       pgtype.Timestamptz
+	SubmittedAt     pgtype.Timestamptz
+	FinishedAt      pgtype.Timestamptz
+	AppliedAt       pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
+}
+
+func (q *Queries) CreateManualBatch(ctx context.Context, arg CreateManualBatchParams) error {
+	_, err := q.db.Exec(ctx, createManualBatch,
+		arg.ID,
+		arg.State,
+		arg.Column3,
+		arg.Column4,
+		arg.ProcessingCount,
+		arg.SucceededCount,
+		arg.ErroredCount,
+		arg.CanceledCount,
+		arg.ExpiredCount,
+		arg.CreatedAt,
+		arg.SubmittedAt,
+		arg.FinishedAt,
+		arg.AppliedAt,
+		arg.UpdatedAt,
+	)
+	return err
+}
+
+const createManualBatchItem = `-- name: CreateManualBatchItem :exec
+insert into manual_batch_items (
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+) values (
+  $1, $2, $3, $4, $5, $6, $7,
+  nullif($8, ''), nullif($9, ''), $10, $11, $12, $13, $14
+)
+`
+
+type CreateManualBatchItemParams struct {
+	CustomID    string
+	BatchID     string
+	ReadingID   string
+	State       string
+	ItemIndex   int32
+	RequestJson []byte
+	ResultJson  []byte
+	Column8     interface{}
+	Column9     interface{}
+	CreatedAt   pgtype.Timestamptz
+	SubmittedAt pgtype.Timestamptz
+	FinishedAt  pgtype.Timestamptz
+	AppliedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) CreateManualBatchItem(ctx context.Context, arg CreateManualBatchItemParams) error {
+	_, err := q.db.Exec(ctx, createManualBatchItem,
+		arg.CustomID,
+		arg.BatchID,
+		arg.ReadingID,
+		arg.State,
+		arg.ItemIndex,
+		arg.RequestJson,
+		arg.ResultJson,
+		arg.Column8,
+		arg.Column9,
+		arg.CreatedAt,
+		arg.SubmittedAt,
+		arg.FinishedAt,
+		arg.AppliedAt,
+		arg.UpdatedAt,
+	)
+	return err
 }
 
 const createReading = `-- name: CreateReading :one
@@ -117,6 +227,67 @@ func (q *Queries) DeleteReading(ctx context.Context, id string) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getManualBatch = `-- name: GetManualBatch :one
+select
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batches
+where id = $1
+`
+
+func (q *Queries) GetManualBatch(ctx context.Context, id string) (ManualBatch, error) {
+	row := q.db.QueryRow(ctx, getManualBatch, id)
+	var i ManualBatch
+	err := row.Scan(
+		&i.ID,
+		&i.State,
+		&i.RemoteID,
+		&i.ResultsUrl,
+		&i.ProcessingCount,
+		&i.SucceededCount,
+		&i.ErroredCount,
+		&i.CanceledCount,
+		&i.ExpiredCount,
+		&i.CreatedAt,
+		&i.SubmittedAt,
+		&i.FinishedAt,
+		&i.AppliedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getManualBatchItemByCustomID = `-- name: GetManualBatchItemByCustomID :one
+select
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batch_items
+where custom_id = $1
+`
+
+func (q *Queries) GetManualBatchItemByCustomID(ctx context.Context, customID string) (ManualBatchItem, error) {
+	row := q.db.QueryRow(ctx, getManualBatchItemByCustomID, customID)
+	var i ManualBatchItem
+	err := row.Scan(
+		&i.CustomID,
+		&i.BatchID,
+		&i.ReadingID,
+		&i.State,
+		&i.ItemIndex,
+		&i.RequestJson,
+		&i.ResultJson,
+		&i.ErrorType,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.SubmittedAt,
+		&i.FinishedAt,
+		&i.AppliedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getReadingByID = `-- name: GetReadingByID :one
@@ -257,6 +428,101 @@ func (q *Queries) GetReadingByURLKey(ctx context.Context, urlKey string) (GetRea
 	return i, err
 }
 
+const listManualBatchItems = `-- name: ListManualBatchItems :many
+select
+  custom_id, batch_id, reading_id, state, item_index, request_json, result_json,
+  error_type, error_message, created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batch_items
+where batch_id = $1
+order by item_index asc
+`
+
+func (q *Queries) ListManualBatchItems(ctx context.Context, batchID string) ([]ManualBatchItem, error) {
+	rows, err := q.db.Query(ctx, listManualBatchItems, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ManualBatchItem
+	for rows.Next() {
+		var i ManualBatchItem
+		if err := rows.Scan(
+			&i.CustomID,
+			&i.BatchID,
+			&i.ReadingID,
+			&i.State,
+			&i.ItemIndex,
+			&i.RequestJson,
+			&i.ResultJson,
+			&i.ErrorType,
+			&i.ErrorMessage,
+			&i.CreatedAt,
+			&i.SubmittedAt,
+			&i.FinishedAt,
+			&i.AppliedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listManualBatches = `-- name: ListManualBatches :many
+select
+  id, state, remote_id, results_url,
+  processing_count, succeeded_count, errored_count, canceled_count, expired_count,
+  created_at, submitted_at, finished_at, applied_at, updated_at
+from manual_batches
+where ($1 = '' or state = $1)
+  and (not $2::boolean or state in ('planned', 'submitted', 'results_ready'))
+order by created_at desc, id desc
+`
+
+type ListManualBatchesParams struct {
+	Column1 interface{}
+	Column2 bool
+}
+
+func (q *Queries) ListManualBatches(ctx context.Context, arg ListManualBatchesParams) ([]ManualBatch, error) {
+	rows, err := q.db.Query(ctx, listManualBatches, arg.Column1, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ManualBatch
+	for rows.Next() {
+		var i ManualBatch
+		if err := rows.Scan(
+			&i.ID,
+			&i.State,
+			&i.RemoteID,
+			&i.ResultsUrl,
+			&i.ProcessingCount,
+			&i.SucceededCount,
+			&i.ErroredCount,
+			&i.CanceledCount,
+			&i.ExpiredCount,
+			&i.CreatedAt,
+			&i.SubmittedAt,
+			&i.FinishedAt,
+			&i.AppliedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNonTerminalReadings = `-- name: ListNonTerminalReadings :many
 select id, process_attempts
 from readings
@@ -287,6 +553,29 @@ func (q *Queries) ListNonTerminalReadings(ctx context.Context, startedAt pgtype.
 		return nil, err
 	}
 	return items, nil
+}
+
+const markManualBatchItemApplied = `-- name: MarkManualBatchItemApplied :execrows
+update manual_batch_items
+set
+  state = 'applied',
+  applied_at = $2,
+  updated_at = $2
+where custom_id = $1
+  and state = 'succeeded'
+`
+
+type MarkManualBatchItemAppliedParams struct {
+	CustomID  string
+	AppliedAt pgtype.Timestamptz
+}
+
+func (q *Queries) MarkManualBatchItemApplied(ctx context.Context, arg MarkManualBatchItemAppliedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markManualBatchItemApplied, arg.CustomID, arg.AppliedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const replaceReadingTags = `-- name: ReplaceReadingTags :execrows
@@ -720,6 +1009,154 @@ func (q *Queries) SearchReadingsTitle(ctx context.Context, arg SearchReadingsTit
 	return items, nil
 }
 
+const submitManualBatch = `-- name: SubmitManualBatch :execrows
+update manual_batches
+set
+  state = 'submitted',
+  remote_id = nullif($2, ''),
+  results_url = nullif($3, ''),
+  processing_count = $4,
+  succeeded_count = $5,
+  errored_count = $6,
+  canceled_count = $7,
+  expired_count = $8,
+  submitted_at = $9,
+  updated_at = $9
+where id = $1
+  and state = 'planned'
+  and submitted_at is null
+`
+
+type SubmitManualBatchParams struct {
+	ID              string
+	Column2         interface{}
+	Column3         interface{}
+	ProcessingCount int32
+	SucceededCount  int32
+	ErroredCount    int32
+	CanceledCount   int32
+	ExpiredCount    int32
+	SubmittedAt     pgtype.Timestamptz
+}
+
+func (q *Queries) SubmitManualBatch(ctx context.Context, arg SubmitManualBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, submitManualBatch,
+		arg.ID,
+		arg.Column2,
+		arg.Column3,
+		arg.ProcessingCount,
+		arg.SucceededCount,
+		arg.ErroredCount,
+		arg.CanceledCount,
+		arg.ExpiredCount,
+		arg.SubmittedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const submitManualBatchItems = `-- name: SubmitManualBatchItems :execrows
+update manual_batch_items
+set
+  state = 'submitted',
+  submitted_at = $2,
+  updated_at = $2
+where batch_id = $1
+  and state = 'planned'
+`
+
+type SubmitManualBatchItemsParams struct {
+	BatchID     string
+	SubmittedAt pgtype.Timestamptz
+}
+
+func (q *Queries) SubmitManualBatchItems(ctx context.Context, arg SubmitManualBatchItemsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, submitManualBatchItems, arg.BatchID, arg.SubmittedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateManualBatchActiveItemsTerminal = `-- name: UpdateManualBatchActiveItemsTerminal :execrows
+update manual_batch_items
+set
+  state = $2,
+  finished_at = $3,
+  updated_at = $3
+where batch_id = $1
+  and state in ('planned', 'submitted', 'succeeded')
+`
+
+type UpdateManualBatchActiveItemsTerminalParams struct {
+	BatchID    string
+	State      string
+	FinishedAt pgtype.Timestamptz
+}
+
+func (q *Queries) UpdateManualBatchActiveItemsTerminal(ctx context.Context, arg UpdateManualBatchActiveItemsTerminalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateManualBatchActiveItemsTerminal, arg.BatchID, arg.State, arg.FinishedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateManualBatchState = `-- name: UpdateManualBatchState :execrows
+update manual_batches
+set
+  state = $2,
+  results_url = coalesce(nullif($3, ''), results_url),
+  processing_count = $4,
+  succeeded_count = $5,
+  errored_count = $6,
+  canceled_count = $7,
+  expired_count = $8,
+  finished_at = $9,
+  applied_at = $10,
+  updated_at = $11
+where id = $1
+  and state = $12
+`
+
+type UpdateManualBatchStateParams struct {
+	ID              string
+	State           string
+	Column3         interface{}
+	ProcessingCount int32
+	SucceededCount  int32
+	ErroredCount    int32
+	CanceledCount   int32
+	ExpiredCount    int32
+	FinishedAt      pgtype.Timestamptz
+	AppliedAt       pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
+	State_2         string
+}
+
+func (q *Queries) UpdateManualBatchState(ctx context.Context, arg UpdateManualBatchStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateManualBatchState,
+		arg.ID,
+		arg.State,
+		arg.Column3,
+		arg.ProcessingCount,
+		arg.SucceededCount,
+		arg.ErroredCount,
+		arg.CanceledCount,
+		arg.ExpiredCount,
+		arg.FinishedAt,
+		arg.AppliedAt,
+		arg.UpdatedAt,
+		arg.State_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateReadingContent = `-- name: UpdateReadingContent :execrows
 update readings
 set
@@ -863,6 +1300,44 @@ func (q *Queries) UpdateReadingStatus(ctx context.Context, arg UpdateReadingStat
 		arg.Column5,
 		arg.ProcessAttempts,
 		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const writeManualBatchItemResult = `-- name: WriteManualBatchItemResult :execrows
+update manual_batch_items
+set
+  state = $2,
+  result_json = $3,
+  error_type = nullif($4, ''),
+  error_message = nullif($5, ''),
+  finished_at = $6,
+  updated_at = $6
+where custom_id = $1
+  and state = 'submitted'
+  and finished_at is null
+`
+
+type WriteManualBatchItemResultParams struct {
+	CustomID   string
+	State      string
+	ResultJson []byte
+	Column4    interface{}
+	Column5    interface{}
+	FinishedAt pgtype.Timestamptz
+}
+
+func (q *Queries) WriteManualBatchItemResult(ctx context.Context, arg WriteManualBatchItemResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, writeManualBatchItemResult,
+		arg.CustomID,
+		arg.State,
+		arg.ResultJson,
+		arg.Column4,
+		arg.Column5,
+		arg.FinishedAt,
 	)
 	if err != nil {
 		return 0, err

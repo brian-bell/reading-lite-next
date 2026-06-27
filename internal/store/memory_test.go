@@ -13,3 +13,10 @@ func TestMemoryStoreContract(t *testing.T) {
 		return store.NewMemory()
 	})
 }
+
+func TestMemoryBatchStoreContract(t *testing.T) {
+	storetest.RunBatchContract(t, func(t *testing.T) store.BatchStore {
+		t.Helper()
+		return store.NewMemory()
+	})
+}
