@@ -2,7 +2,7 @@
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
-> `docs/PLAN.md` (the implementation contract) and `CLAUDE.md` (the
+> `docs/SPEC.md` (the implementation contract) and `CLAUDE.md` (the
 > project conventions). Every step lists **what to do**, **what to expect**, and
 > **why it matters**. A consolidated checklist is at the end.
 >
@@ -569,7 +569,7 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
   SDK: `grep -rn "net/http\|openai\|anthropic\|resend\|aws-sdk\|pgx" internal/fetch/fetch.go internal/extract/extract.go internal/embed/embed.go internal/summarize/summarize.go internal/notify/notify.go internal/blobs/blobs.go internal/vector/vector.go`
   prints **nothing**. The real adapters live in *separate* files (`http.go`, `openai.go`,
   `anthropic.go`, `resend.go`, `postgres.go`, `r2.go`) added in Phase 6 — verified in C12, not here.
-- [ ] **Naming note / deviation from PLAN.md:** the VectorIndex port interface is named
+- [ ] **Naming note / deviation from SPEC.md:** the VectorIndex port interface is named
   `vector.Index`, not `vector.VectorIndex` as written in §6, because `revive`'s exported
   rule flags `vector.VectorIndex` as a type-name stutter and the lint gate (A4) must stay
   clean. The doc comment on `Index` preserves the "VectorIndex port" traceability. This is
@@ -1049,7 +1049,7 @@ skipped/blocked (write why).
 
 ### E — Sign-off
 - [ ] Limitations in §6 acknowledged
-- [ ] Any deviation from `docs/PLAN.md` recorded with rationale
+- [ ] Any deviation from `docs/SPEC.md` recorded with rationale
 - [ ] C9 dispatcher behavior confirmed and harness `TestAcceptance_Dispatcher*` green
 - [ ] Overall verdict: Phases 0–11 **accept / reject** (record in §8 sign-off log)
 
@@ -1071,4 +1071,4 @@ Notes:
   external-service ports, HTTP API, CLI, hardening) are out of scope for this sign-off
   (§0). The Phase 3 dispatcher has since landed in `internal/dispatch` and is verified
   by its own package tests, pending its own acceptance sign-off.
-- No deviations from `docs/PLAN.md` were found.
+- No deviations from `docs/SPEC.md` were found.

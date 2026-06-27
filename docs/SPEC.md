@@ -1,6 +1,6 @@
-# reading-lite — Go Backend TDD Implementation Plan
+# reading-lite — Go Backend TDD Specification
 
-> A test-first build plan for the `reading-lite` backend: a personal reading service that
+> A test-first implementation specification for the `reading-lite` backend: a personal reading service that
 > ingests a URL, extracts + summarizes the article, finds similar past readings, and makes
 > everything searchable. This document is the implementation contract — work top to bottom,
 > writing the listed tests **before** the code that makes them pass.
@@ -9,7 +9,7 @@
 
 ## 0. Reading guide
 
-The plan is organized as **phases**. Each phase is a vertical slice with:
+The spec is organized as **phases**. Each phase is a vertical slice with:
 
 - **Goal** — the behavior we are adding.
 - **Red** — the tests to write first, named concretely, with table cases.
@@ -22,6 +22,24 @@ then the Postgres-backed store (with an in-memory fake), then the in-process dis
 the external-service ports and their fakes, then the pipeline that wires them, then real adapters, then the HTTP API, then
 end-to-end, then operator tooling. Each phase ends green and `go test ./...` stays green
 forever after.
+
+### Phase status
+
+| Phase | Scope | Status |
+|---|---|---|
+| 0 | Tooling, conventions, CI, clock port | Complete |
+| 1 | Pure reading domain core | Complete |
+| 2 | Store port, memory fake, Postgres adapter, conformance suites | Complete |
+| 3 | In-process dispatcher, retry, recovery sweep | Complete |
+| 4 | External-service ports and scriptable fakes | Complete |
+| 5 | Processing pipeline over fakes | Complete |
+| 6 | Real service adapters and contract tests | Complete |
+| 7 | Extraction internals, YouTube, Reddit guidance | Complete |
+| 8 | Command service and HTTP API | Complete |
+| 9 | End-to-end HTTP integration stories | Complete |
+| 10 | Tested `readerctl` command core | Complete; production dependency injection remains deferred |
+| 11 | Production API runtime, config, health, security, shutdown | Complete |
+| 12 | Optional alternative backends and multi-instance workers | Optional / not started |
 
 ---
 
@@ -176,7 +194,7 @@ reading-lite/
 │   └── clock/             # Clock port + system + fake
 ├── testdata/              # HTML fixtures, recorded API bodies, bookmark exports
 ├── go.mod
-└── docs/PLAN.md
+└── docs/SPEC.md
 ```
 
 ---
