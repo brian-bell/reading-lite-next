@@ -3,6 +3,7 @@ package store
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"slices"
 	"strings"
 	"sync"
@@ -16,16 +17,22 @@ const defaultLimit = 50
 
 // Memory is an in-memory Store implementation for fast tests and zero-infra development.
 type Memory struct {
-	mu       sync.RWMutex
-	byID     map[string]reading.Reading
-	byURLKey map[string]string
+	mu                sync.RWMutex
+	byID              map[string]reading.Reading
+	byURLKey          map[string]string
+	batches           map[string]ManualBatch
+	batchItems        map[string]ManualBatchItem
+	batchItemsByBatch map[string][]string
 }
 
 // NewMemory returns an empty, concurrency-safe in-memory store.
 func NewMemory() *Memory {
 	return &Memory{
-		byID:     map[string]reading.Reading{},
-		byURLKey: map[string]string{},
+		byID:              map[string]reading.Reading{},
+		byURLKey:          map[string]string{},
+		batches:           map[string]ManualBatch{},
+		batchItems:        map[string]ManualBatchItem{},
+		batchItemsByBatch: map[string][]string{},
 	}
 }
 
@@ -389,6 +396,374 @@ func (m *Memory) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// CreatePlannedBatch stores a new planned manual batch and its request items.
+func (m *Memory) CreatePlannedBatch(ctx context.Context, fields BatchCreateFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.batches[fields.ID]; ok {
+		return ErrConflict
+	}
+	seenCustomIDs := map[string]bool{}
+	seenReadingIDs := map[string]bool{}
+	for _, item := range fields.Items {
+		if !json.Valid(item.RequestJSON) {
+			return ErrConflict
+		}
+		if seenCustomIDs[item.CustomID] {
+			return ErrConflict
+		}
+		seenCustomIDs[item.CustomID] = true
+		if seenReadingIDs[item.ReadingID] {
+			return ErrConflict
+		}
+		seenReadingIDs[item.ReadingID] = true
+		if _, ok := m.batchItems[item.CustomID]; ok {
+			return ErrConflict
+		}
+		for _, existing := range m.batchItems {
+			if existing.ReadingID == item.ReadingID && existing.State.active() {
+				return ErrConflict
+			}
+		}
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	batch := ManualBatch{
+		ID:        fields.ID,
+		State:     BatchStatePlanned,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	m.batches[fields.ID] = cloneManualBatch(batch)
+
+	customIDs := make([]string, 0, len(fields.Items))
+	for _, item := range fields.Items {
+		stored := ManualBatchItem{
+			BatchID:     fields.ID,
+			ReadingID:   item.ReadingID,
+			CustomID:    item.CustomID,
+			State:       BatchItemStatePlanned,
+			RequestJSON: cloneBytes(item.RequestJSON),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		m.batchItems[item.CustomID] = cloneManualBatchItem(stored)
+		customIDs = append(customIDs, item.CustomID)
+	}
+	m.batchItemsByBatch[fields.ID] = customIDs
+	return nil
+}
+
+// SubmitBatch records remote metadata and marks the batch's planned items submitted.
+func (m *Memory) SubmitBatch(ctx context.Context, id string, fields BatchSubmitFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	batch, ok := m.batches[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if batch.SubmittedAt != nil {
+		if batchSubmitEqual(batch, fields) {
+			return nil
+		}
+		return ErrConflict
+	}
+	if batch.State != BatchStatePlanned {
+		return ErrConflict
+	}
+	if err := validateBatchCounts(fields.Counts); err != nil {
+		return err
+	}
+	if fields.RemoteID != "" {
+		for otherID, other := range m.batches {
+			if otherID != id && other.RemoteID == fields.RemoteID {
+				return ErrConflict
+			}
+		}
+	}
+
+	customIDs := m.batchItemsByBatch[id]
+	for _, customID := range customIDs {
+		if m.batchItems[customID].State != BatchItemStatePlanned {
+			return ErrConflict
+		}
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	batch.State = BatchStateSubmitted
+	batch.RemoteID = fields.RemoteID
+	batch.ResultsURL = fields.ResultsURL
+	batch.Counts = fields.Counts
+	batch.SubmittedAt = cloneTimePtr(&now)
+	batch.UpdatedAt = now
+	m.batches[id] = cloneManualBatch(batch)
+
+	for _, customID := range customIDs {
+		item := m.batchItems[customID]
+		item.State = BatchItemStateSubmitted
+		item.SubmittedAt = cloneTimePtr(&now)
+		item.UpdatedAt = now
+		m.batchItems[customID] = cloneManualBatchItem(item)
+	}
+	return nil
+}
+
+// UpdateBatchState records a manual batch state transition.
+func (m *Memory) UpdateBatchState(ctx context.Context, id string, state BatchState, fields BatchStateFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	batch, ok := m.batches[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if fields.Counts != nil {
+		if err := validateBatchCounts(*fields.Counts); err != nil {
+			return err
+		}
+	}
+	sameState := batch.State == state
+	if !sameState {
+		if state == BatchStateApplied && m.hasActiveBatchItemLocked(id) {
+			return ErrConflict
+		}
+		if !validBatchTransition(batch.State, state) {
+			return ErrConflict
+		}
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if !sameState {
+		batch.State = state
+	}
+	if fields.ResultsURL != "" {
+		batch.ResultsURL = fields.ResultsURL
+	}
+	if fields.Counts != nil {
+		batch.Counts = *fields.Counts
+	}
+	if !sameState {
+		switch state {
+		case BatchStateResultsReady:
+			batch.FinishedAt = cloneTimePtr(&now)
+		case BatchStateApplied:
+			if batch.FinishedAt == nil {
+				batch.FinishedAt = cloneTimePtr(&now)
+			}
+			batch.AppliedAt = cloneTimePtr(&now)
+		case BatchStateCanceled, BatchStateFailed:
+			batch.FinishedAt = cloneTimePtr(&now)
+		}
+	}
+	batch.UpdatedAt = now
+	m.batches[id] = cloneManualBatch(batch)
+	if !sameState {
+		itemState, ok := terminalItemStateForBatch(state)
+		if !ok {
+			return nil
+		}
+		for _, customID := range m.batchItemsByBatch[id] {
+			item := m.batchItems[customID]
+			if !item.State.active() {
+				continue
+			}
+			item.State = itemState
+			item.FinishedAt = cloneTimePtr(&now)
+			item.UpdatedAt = now
+			m.batchItems[customID] = cloneManualBatchItem(item)
+		}
+	}
+	return nil
+}
+
+// GetBatch returns one manual batch by id.
+func (m *Memory) GetBatch(ctx context.Context, id string) (ManualBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return ManualBatch{}, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	batch, ok := m.batches[id]
+	if !ok {
+		return ManualBatch{}, ErrNotFound
+	}
+	return cloneManualBatch(batch), nil
+}
+
+// ListBatches returns manual batches matching q.
+func (m *Memory) ListBatches(ctx context.Context, q BatchQuery) ([]ManualBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	out := make([]ManualBatch, 0, len(m.batches))
+	for _, batch := range m.batches {
+		if q.State != "" && batch.State != q.State {
+			continue
+		}
+		if q.ActiveOnly && !batch.State.active() {
+			continue
+		}
+		out = append(out, cloneManualBatch(batch))
+	}
+	m.mu.RUnlock()
+
+	sortBatches(out)
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+// ListBatchItems returns every item in a manual batch in creation order.
+func (m *Memory) ListBatchItems(ctx context.Context, batchID string) ([]ManualBatchItem, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	customIDs, ok := m.batchItemsByBatch[batchID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]ManualBatchItem, 0, len(customIDs))
+	for _, customID := range customIDs {
+		out = append(out, cloneManualBatchItem(m.batchItems[customID]))
+	}
+	return out, nil
+}
+
+// GetBatchItemByCustomID returns one manual batch item by its stable custom_id.
+func (m *Memory) GetBatchItemByCustomID(ctx context.Context, customID string) (ManualBatchItem, error) {
+	if err := ctx.Err(); err != nil {
+		return ManualBatchItem{}, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	item, ok := m.batchItems[customID]
+	if !ok {
+		return ManualBatchItem{}, ErrNotFound
+	}
+	return cloneManualBatchItem(item), nil
+}
+
+func (m *Memory) hasActiveBatchItemLocked(batchID string) bool {
+	for _, customID := range m.batchItemsByBatch[batchID] {
+		if m.batchItems[customID].State.active() {
+			return true
+		}
+	}
+	return false
+}
+
+// WriteBatchItemResult stores one remote terminal result by custom_id.
+func (m *Memory) WriteBatchItemResult(ctx context.Context, customID string, fields BatchItemResultFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !fields.State.resultState() {
+		return ErrConflict
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item, ok := m.batchItems[customID]
+	if !ok {
+		return ErrNotFound
+	}
+	if item.FinishedAt != nil {
+		equal, err := batchItemResultEqualJSON(item, fields)
+		if err != nil {
+			return err
+		}
+		if equal {
+			return nil
+		}
+		return ErrConflict
+	}
+	if item.State != BatchItemStateSubmitted {
+		return ErrConflict
+	}
+	if !json.Valid(fields.ResultJSON) {
+		return ErrConflict
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	item.State = fields.State
+	item.ResultJSON = cloneBytes(fields.ResultJSON)
+	item.ErrorType = fields.ErrorType
+	item.ErrorMessage = fields.ErrorMessage
+	item.FinishedAt = cloneTimePtr(&now)
+	item.UpdatedAt = now
+	m.batchItems[customID] = cloneManualBatchItem(item)
+	return nil
+}
+
+// MarkBatchItemApplied marks a succeeded item as applied to its reading.
+func (m *Memory) MarkBatchItemApplied(ctx context.Context, customID string, fields BatchItemApplyFields) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item, ok := m.batchItems[customID]
+	if !ok {
+		return ErrNotFound
+	}
+	if item.State == BatchItemStateApplied {
+		return nil
+	}
+	if item.State != BatchItemStateSucceeded {
+		return ErrConflict
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	item.State = BatchItemStateApplied
+	item.AppliedAt = cloneTimePtr(&now)
+	item.UpdatedAt = now
+	m.batchItems[customID] = cloneManualBatchItem(item)
+	return nil
+}
+
 type searchMatch struct {
 	reading reading.Reading
 	score   int
@@ -524,6 +899,88 @@ func cloneReading(r reading.Reading) reading.Reading {
 	r.SimilarJSON = cloneBytes(r.SimilarJSON)
 	r.DiagnosticsJSON = cloneBytes(r.DiagnosticsJSON)
 	return r
+}
+
+func cloneManualBatch(batch ManualBatch) ManualBatch {
+	batch.SubmittedAt = cloneTimePtr(batch.SubmittedAt)
+	batch.FinishedAt = cloneTimePtr(batch.FinishedAt)
+	batch.AppliedAt = cloneTimePtr(batch.AppliedAt)
+	return batch
+}
+
+func cloneManualBatchItem(item ManualBatchItem) ManualBatchItem {
+	item.RequestJSON = cloneBytes(item.RequestJSON)
+	item.ResultJSON = cloneBytes(item.ResultJSON)
+	item.SubmittedAt = cloneTimePtr(item.SubmittedAt)
+	item.FinishedAt = cloneTimePtr(item.FinishedAt)
+	item.AppliedAt = cloneTimePtr(item.AppliedAt)
+	return item
+}
+
+func sortBatches(batches []ManualBatch) {
+	slices.SortFunc(batches, func(a, b ManualBatch) int {
+		if n := b.CreatedAt.Compare(a.CreatedAt); n != 0 {
+			return n
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
+}
+
+func (state BatchState) active() bool {
+	switch state {
+	case BatchStatePlanned, BatchStateSubmitted, BatchStateResultsReady:
+		return true
+	default:
+		return false
+	}
+}
+
+func validBatchTransition(from, to BatchState) bool {
+	switch from {
+	case BatchStatePlanned:
+		return to == BatchStateCanceled || to == BatchStateFailed
+	case BatchStateSubmitted:
+		return to == BatchStateResultsReady || to == BatchStateCanceled || to == BatchStateFailed
+	case BatchStateResultsReady:
+		return to == BatchStateApplied || to == BatchStateCanceled || to == BatchStateFailed
+	default:
+		return false
+	}
+}
+
+func terminalItemStateForBatch(state BatchState) (BatchItemState, bool) {
+	switch state {
+	case BatchStateCanceled:
+		return BatchItemStateCanceled, true
+	case BatchStateFailed:
+		return BatchItemStateFailed, true
+	default:
+		return "", false
+	}
+}
+
+func (state BatchItemState) active() bool {
+	switch state {
+	case BatchItemStatePlanned, BatchItemStateSubmitted, BatchItemStateSucceeded:
+		return true
+	default:
+		return false
+	}
+}
+
+func (state BatchItemState) resultState() bool {
+	switch state {
+	case BatchItemStateSucceeded, BatchItemStateErrored, BatchItemStateCanceled, BatchItemStateExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func batchSubmitEqual(batch ManualBatch, fields BatchSubmitFields) bool {
+	return batch.RemoteID == fields.RemoteID &&
+		batch.ResultsURL == fields.ResultsURL &&
+		batch.Counts == fields.Counts
 }
 
 func cloneBytes(in []byte) []byte {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,12 +18,13 @@ import (
 
 // Postgres is a pgx-backed Store implementation.
 type Postgres struct {
+	pool    *pgxpool.Pool
 	queries *storedb.Queries
 }
 
 // NewPostgres returns a Store backed by pool.
 func NewPostgres(pool *pgxpool.Pool) *Postgres {
-	return &Postgres{queries: storedb.New(pool)}
+	return &Postgres{pool: pool, queries: storedb.New(pool)}
 }
 
 // SaveReading inserts r and returns ErrConflict when id or url_key already exists.
@@ -316,6 +318,403 @@ func (p *Postgres) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// CreatePlannedBatch stores a new planned manual batch and its request items.
+func (p *Postgres) CreatePlannedBatch(ctx context.Context, fields BatchCreateFields) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	q := p.queries.WithTx(tx)
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := q.CreateManualBatch(ctx, storedb.CreateManualBatchParams{
+		ID:        fields.ID,
+		State:     string(BatchStatePlanned),
+		CreatedAt: timestamptz(now),
+		UpdatedAt: timestamptz(now),
+	}); err != nil {
+		if isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	for i, item := range fields.Items {
+		if !json.Valid(item.RequestJSON) {
+			return ErrConflict
+		}
+		if err := q.CreateManualBatchItem(ctx, storedb.CreateManualBatchItemParams{
+			CustomID:    item.CustomID,
+			BatchID:     fields.ID,
+			ReadingID:   item.ReadingID,
+			State:       string(BatchItemStatePlanned),
+			ItemIndex:   int32(i),
+			RequestJson: cloneBytes(item.RequestJSON),
+			CreatedAt:   timestamptz(now),
+			UpdatedAt:   timestamptz(now),
+		}); err != nil {
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return err
+	}
+	return nil
+}
+
+// SubmitBatch records remote metadata and marks the batch's planned items submitted.
+func (p *Postgres) SubmitBatch(ctx context.Context, id string, fields BatchSubmitFields) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	q := p.queries.WithTx(tx)
+	batchRow, err := q.GetManualBatch(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	batch := manualBatchFromDB(batchRow)
+	if batch.SubmittedAt != nil {
+		if batchSubmitEqual(batch, fields) {
+			return nil
+		}
+		return ErrConflict
+	}
+	if batch.State != BatchStatePlanned {
+		return ErrConflict
+	}
+	if err := validateBatchCounts(fields.Counts); err != nil {
+		return err
+	}
+
+	items, err := q.ListManualBatchItems(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if BatchItemState(item.State) != BatchItemStatePlanned {
+			return ErrConflict
+		}
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := q.SubmitManualBatch(ctx, storedb.SubmitManualBatchParams{
+		ID:              id,
+		Column2:         fields.RemoteID,
+		Column3:         fields.ResultsURL,
+		ProcessingCount: int32(fields.Counts.Processing),
+		SucceededCount:  int32(fields.Counts.Succeeded),
+		ErroredCount:    int32(fields.Counts.Errored),
+		CanceledCount:   int32(fields.Counts.Canceled),
+		ExpiredCount:    int32(fields.Counts.Expired),
+		SubmittedAt:     timestamptz(now),
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	if rows == 0 {
+		return ErrConflict
+	}
+	itemRows, err := q.SubmitManualBatchItems(ctx, storedb.SubmitManualBatchItemsParams{
+		BatchID:     id,
+		SubmittedAt: timestamptz(now),
+	})
+	if err != nil {
+		return err
+	}
+	if itemRows != int64(len(items)) {
+		return ErrConflict
+	}
+	if err := tx.Commit(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return err
+	}
+	return nil
+}
+
+// UpdateBatchState records a manual batch state transition.
+func (p *Postgres) UpdateBatchState(ctx context.Context, id string, state BatchState, fields BatchStateFields) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	q := p.queries.WithTx(tx)
+	row, err := q.GetManualBatch(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	batch := manualBatchFromDB(row)
+	if fields.Counts != nil {
+		if err := validateBatchCounts(*fields.Counts); err != nil {
+			return err
+		}
+	}
+	sameState := batch.State == state
+	if !sameState && state == BatchStateApplied {
+		activeItems, err := q.CountActiveManualBatchItems(ctx, id)
+		if err != nil {
+			return err
+		}
+		if activeItems > 0 {
+			return ErrConflict
+		}
+	}
+	if !sameState && !validBatchTransition(batch.State, state) {
+		return ErrConflict
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	counts := batch.Counts
+	if fields.Counts != nil {
+		counts = *fields.Counts
+	}
+	resultsURL := batch.ResultsURL
+	if fields.ResultsURL != "" {
+		resultsURL = fields.ResultsURL
+	}
+	finishedAt := batch.FinishedAt
+	appliedAt := batch.AppliedAt
+	if !sameState {
+		switch state {
+		case BatchStateResultsReady:
+			finishedAt = cloneTimePtr(&now)
+		case BatchStateApplied:
+			if finishedAt == nil {
+				finishedAt = cloneTimePtr(&now)
+			}
+			appliedAt = cloneTimePtr(&now)
+		case BatchStateCanceled, BatchStateFailed:
+			finishedAt = cloneTimePtr(&now)
+		}
+	}
+
+	rows, err := q.UpdateManualBatchState(ctx, storedb.UpdateManualBatchStateParams{
+		ID:              id,
+		State:           string(state),
+		Column3:         resultsURL,
+		ProcessingCount: int32(counts.Processing),
+		SucceededCount:  int32(counts.Succeeded),
+		ErroredCount:    int32(counts.Errored),
+		CanceledCount:   int32(counts.Canceled),
+		ExpiredCount:    int32(counts.Expired),
+		FinishedAt:      timestamptzPtr(finishedAt),
+		AppliedAt:       timestamptzPtr(appliedAt),
+		UpdatedAt:       timestamptz(now),
+		State_2:         string(batch.State),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrConflict
+	}
+	if !sameState {
+		itemState, ok := terminalItemStateForBatch(state)
+		if !ok {
+			if err := tx.Commit(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+				return err
+			}
+			return nil
+		}
+		if _, err := q.UpdateManualBatchActiveItemsTerminal(ctx, storedb.UpdateManualBatchActiveItemsTerminalParams{
+			BatchID:    id,
+			State:      string(itemState),
+			FinishedAt: timestamptz(now),
+		}); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return err
+	}
+	return nil
+}
+
+// GetBatch returns one manual batch by id.
+func (p *Postgres) GetBatch(ctx context.Context, id string) (ManualBatch, error) {
+	row, err := p.queries.GetManualBatch(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ManualBatch{}, ErrNotFound
+	}
+	if err != nil {
+		return ManualBatch{}, err
+	}
+	return manualBatchFromDB(row), nil
+}
+
+// ListBatches returns manual batches matching q.
+func (p *Postgres) ListBatches(ctx context.Context, q BatchQuery) ([]ManualBatch, error) {
+	rows, err := p.queries.ListManualBatches(ctx, storedb.ListManualBatchesParams{
+		Column1: string(q.State),
+		Column2: q.ActiveOnly,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if q.Limit > 0 && len(rows) > q.Limit {
+		rows = rows[:q.Limit]
+	}
+	out := make([]ManualBatch, len(rows))
+	for i, row := range rows {
+		out[i] = manualBatchFromDB(row)
+	}
+	return out, nil
+}
+
+// ListBatchItems returns every item in a manual batch in creation order.
+func (p *Postgres) ListBatchItems(ctx context.Context, batchID string) ([]ManualBatchItem, error) {
+	if _, err := p.GetBatch(ctx, batchID); err != nil {
+		return nil, err
+	}
+	rows, err := p.queries.ListManualBatchItems(ctx, batchID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ManualBatchItem, len(rows))
+	for i, row := range rows {
+		out[i] = manualBatchItemFromDB(row)
+	}
+	return out, nil
+}
+
+// GetBatchItemByCustomID returns one manual batch item by its stable custom_id.
+func (p *Postgres) GetBatchItemByCustomID(ctx context.Context, customID string) (ManualBatchItem, error) {
+	row, err := p.queries.GetManualBatchItemByCustomID(ctx, customID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ManualBatchItem{}, ErrNotFound
+	}
+	if err != nil {
+		return ManualBatchItem{}, err
+	}
+	return manualBatchItemFromDB(row), nil
+}
+
+// WriteBatchItemResult stores one remote terminal result by custom_id.
+func (p *Postgres) WriteBatchItemResult(ctx context.Context, customID string, fields BatchItemResultFields) error {
+	if !fields.State.resultState() {
+		return ErrConflict
+	}
+
+	item, err := p.GetBatchItemByCustomID(ctx, customID)
+	if err != nil {
+		return err
+	}
+	if item.FinishedAt != nil {
+		equal, err := batchItemResultEqualJSON(item, fields)
+		if err != nil {
+			return err
+		}
+		if equal {
+			return nil
+		}
+		return ErrConflict
+	}
+	if item.State != BatchItemStateSubmitted {
+		return ErrConflict
+	}
+	if !json.Valid(fields.ResultJSON) {
+		return ErrConflict
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := p.queries.WriteManualBatchItemResult(ctx, storedb.WriteManualBatchItemResultParams{
+		CustomID:   customID,
+		State:      string(fields.State),
+		ResultJson: cloneBytes(fields.ResultJSON),
+		Column4:    fields.ErrorType,
+		Column5:    fields.ErrorMessage,
+		FinishedAt: timestamptz(now),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		latest, getErr := p.GetBatchItemByCustomID(ctx, customID)
+		if getErr != nil {
+			return getErr
+		}
+		equal, equalErr := batchItemResultEqualJSON(latest, fields)
+		if equalErr != nil {
+			return equalErr
+		}
+		if equal {
+			return nil
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
+// MarkBatchItemApplied marks a succeeded item as applied to its reading.
+func (p *Postgres) MarkBatchItemApplied(ctx context.Context, customID string, fields BatchItemApplyFields) error {
+	item, err := p.GetBatchItemByCustomID(ctx, customID)
+	if err != nil {
+		return err
+	}
+	if item.State == BatchItemStateApplied {
+		return nil
+	}
+	if item.State != BatchItemStateSucceeded {
+		return ErrConflict
+	}
+
+	now := fields.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := p.queries.MarkManualBatchItemApplied(ctx, storedb.MarkManualBatchItemAppliedParams{
+		CustomID:  customID,
+		AppliedAt: timestamptz(now),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		latest, getErr := p.GetBatchItemByCustomID(ctx, customID)
+		if getErr != nil {
+			return getErr
+		}
+		if latest.State == BatchItemStateApplied {
+			return nil
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
 func (p *Postgres) searchRows(ctx context.Context, q Query, tags []string, status string, limit int) ([]postgresSearchMatch, error) {
 	switch q.Sort {
 	case SortOldest:
@@ -422,6 +821,71 @@ func readingFromGetByURLKey(row storedb.GetReadingByURLKeyRow) reading.Reading {
 		finishedAt:      row.FinishedAt,
 		updatedAt:       row.UpdatedAt,
 	})
+}
+
+func manualBatchFromDB(row storedb.ManualBatch) ManualBatch {
+	return ManualBatch{
+		ID:         row.ID,
+		State:      BatchState(row.State),
+		RemoteID:   stringValue(row.RemoteID),
+		ResultsURL: stringValue(row.ResultsUrl),
+		Counts: BatchCounts{
+			Processing: int(row.ProcessingCount),
+			Succeeded:  int(row.SucceededCount),
+			Errored:    int(row.ErroredCount),
+			Canceled:   int(row.CanceledCount),
+			Expired:    int(row.ExpiredCount),
+		},
+		CreatedAt:   timeValue(row.CreatedAt),
+		SubmittedAt: timePtrValue(row.SubmittedAt),
+		FinishedAt:  timePtrValue(row.FinishedAt),
+		AppliedAt:   timePtrValue(row.AppliedAt),
+		UpdatedAt:   timeValue(row.UpdatedAt),
+	}
+}
+
+func manualBatchItemFromDB(row storedb.ManualBatchItem) ManualBatchItem {
+	return ManualBatchItem{
+		BatchID:      row.BatchID,
+		ReadingID:    row.ReadingID,
+		CustomID:     row.CustomID,
+		State:        BatchItemState(row.State),
+		RequestJSON:  jsonValue(row.RequestJson),
+		ResultJSON:   jsonValue(row.ResultJson),
+		ErrorType:    stringValue(row.ErrorType),
+		ErrorMessage: stringValue(row.ErrorMessage),
+		CreatedAt:    timeValue(row.CreatedAt),
+		SubmittedAt:  timePtrValue(row.SubmittedAt),
+		FinishedAt:   timePtrValue(row.FinishedAt),
+		AppliedAt:    timePtrValue(row.AppliedAt),
+		UpdatedAt:    timeValue(row.UpdatedAt),
+	}
+}
+
+func batchItemResultEqualJSON(item ManualBatchItem, fields BatchItemResultFields) (bool, error) {
+	if item.State != fields.State || item.ErrorType != fields.ErrorType || item.ErrorMessage != fields.ErrorMessage {
+		return false, nil
+	}
+	equal, err := jsonRawEqual(item.ResultJSON, fields.ResultJSON)
+	if err != nil {
+		return false, err
+	}
+	return equal, nil
+}
+
+func jsonRawEqual(a, b json.RawMessage) (bool, error) {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b), nil
+	}
+	var av any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false, err
+	}
+	var bv any
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(av, bv), nil
 }
 
 type postgresSearchMatch struct {

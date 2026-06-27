@@ -28,15 +28,19 @@ production config.
 - `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit
   status transitions, terminal-state checks, URL idempotency key normalization, source
   classification, and read-time stale annotation.
-- `internal/store/` defines the `Store` port, shared query/page DTOs, `store.Memory`, the
-  pgx-backed `store.Postgres` adapter, embedded migrations, SQL query source for sqlc, and
-  `storetest.RunContract` for backend-neutral behavior checks. `UpdateStatus` advances the
-  lifecycle; `UpdateContent` overwrites the processed-content columns
+- `internal/store/` defines the `Store` port, shared query/page DTOs, the manual
+  `BatchStore` port, `store.Memory`, the pgx-backed `store.Postgres` adapter, embedded
+  migrations, SQL query source for sqlc, and `storetest.RunContract`/`RunBatchContract` for
+  backend-neutral behavior checks. `UpdateStatus` advances the lifecycle; `UpdateContent`
+  overwrites the processed-content columns
   (title/summary/keys and the `summary_json`/`similar_json`/`diagnostics_json` blobs) the
   pipeline produces, leaving status, timestamps, error, attempts, and tags alone.
   `UpdateImport` replaces a failed reading's source metadata with a markdown import under the
   same stable id while clearing derived content. `Reprocess` atomically clears derived content
-  and marks a row pending for manual reprocessing.
+  and marks a row pending for manual reprocessing. `BatchStore` is independent of reading
+  lifecycle state: it persists planned manual Anthropic batches, item `custom_id` lookup,
+  remote ids/counts, state transitions, idempotent result writes, applied-item markers, and a
+  partial active-item uniqueness guard per reading.
 - `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
   and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
   injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
@@ -164,7 +168,8 @@ The project targets Go 1.26.
   read them.
 - Keep integration tests behind `//go:build integration`.
 - Add store behavior to `internal/store/storetest` first, then make `store.Memory` and
-  `store.Postgres` satisfy the same contract. Likewise, add vector-index behavior to
+  `store.Postgres` satisfy the same contract (`RunContract` for readings, `RunBatchContract`
+  for manual batches). Likewise, add vector-index behavior to
   `internal/vector/vectortest` first, then make `vector.Memory` and the pgvector adapter
   satisfy it.
 - Scriptable port fakes expose their configured response/error as fields set before use and

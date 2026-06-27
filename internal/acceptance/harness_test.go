@@ -61,6 +61,8 @@ import (
 var (
 	_ store.Store      = (*store.Memory)(nil)
 	_ store.Store      = (*store.Postgres)(nil)
+	_ store.BatchStore = (*store.Memory)(nil)
+	_ store.BatchStore = (*store.Postgres)(nil)
 	_ clock.Clock      = clock.System{}
 	_ clock.Clock      = (*clock.Fake)(nil)
 	_ dispatch.Store   = (*store.Memory)(nil) // the memory backend satisfies the dispatcher's narrow Store port
@@ -210,6 +212,24 @@ func TestAcceptance_StoreContract(t *testing.T) {
 	for _, be := range storeBackends() {
 		t.Run(be.name, func(t *testing.T) {
 			storetest.RunContract(t, be.factory(t))
+		})
+	}
+}
+
+// TestAcceptance_BatchStoreContract runs the manual batch persistence contract
+// against the same store backend matrix so memory/Postgres batch behavior cannot
+// drift.
+func TestAcceptance_BatchStoreContract(t *testing.T) {
+	for _, be := range storeBackends() {
+		t.Run(be.name, func(t *testing.T) {
+			storetest.RunBatchContract(t, func(t *testing.T) store.BatchStore {
+				t.Helper()
+				batchStore, ok := be.factory(t)(t).(store.BatchStore)
+				if !ok {
+					t.Fatalf("backend %s does not implement store.BatchStore", be.name)
+				}
+				return batchStore
+			})
 		})
 	}
 }

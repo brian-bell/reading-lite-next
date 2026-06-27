@@ -9,6 +9,40 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+type ManualBatch struct {
+	ID              string
+	State           string
+	RemoteID        *string
+	ResultsUrl      *string
+	ProcessingCount int32
+	SucceededCount  int32
+	ErroredCount    int32
+	CanceledCount   int32
+	ExpiredCount    int32
+	CreatedAt       pgtype.Timestamptz
+	SubmittedAt     pgtype.Timestamptz
+	FinishedAt      pgtype.Timestamptz
+	AppliedAt       pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
+}
+
+type ManualBatchItem struct {
+	CustomID     string
+	BatchID      string
+	ReadingID    string
+	State        string
+	ItemIndex    int32
+	RequestJson  []byte
+	ResultJson   []byte
+	ErrorType    *string
+	ErrorMessage *string
+	CreatedAt    pgtype.Timestamptz
+	SubmittedAt  pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
+	AppliedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
 type Reading struct {
 	ID              string
 	Url             string
