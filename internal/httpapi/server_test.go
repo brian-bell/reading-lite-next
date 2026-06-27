@@ -296,6 +296,58 @@ func TestHealthz_DegradedOnDependencyFailureRedactsError(t *testing.T) {
 	}
 }
 
+func TestHealthz_BoundsDependencyChecks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	unblock := make(chan struct{})
+	defer close(unblock)
+	srv := &httpapi.Server{
+		Store:              h.store,
+		Blobs:              h.blobs,
+		Dispatcher:         h.submitter,
+		Clock:              h.clock,
+		Token:              "secret-token",
+		HealthCheckTimeout: 10 * time.Millisecond,
+		HealthChecks: httpapi.HealthChecks{
+			Postgres: func(ctx context.Context) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-unblock:
+					return nil
+				}
+			},
+			R2: func(context.Context) error { return nil },
+		},
+	}
+	h.handler = srv.Routes()
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- h.request(t, http.MethodGet, "/api/healthz", nil, "")
+	}()
+
+	select {
+	case rr := <-result:
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+		}
+		got := decodeJSON[struct {
+			Status string `json:"status"`
+			Checks map[string]struct {
+				Status string `json:"status"`
+				Error  string `json:"error,omitempty"`
+			} `json:"checks"`
+		}](t, rr)
+		if got.Status != "degraded" || got.Checks["postgres"].Status != "error" || got.Checks["postgres"].Error != "timeout" {
+			t.Fatalf("health body = %+v, want degraded postgres timeout", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("healthz did not return after the health check timeout")
+	}
+}
+
 func TestHealthz_DegradedSkipsDependencyChecks(t *testing.T) {
 	t.Parallel()
 

@@ -26,7 +26,10 @@ import (
 	"github.com/bbell/reading-lite/internal/store"
 )
 
-const maxBodyBytes = 1 << 20
+const (
+	maxBodyBytes              = 1 << 20
+	defaultHealthCheckTimeout = 2 * time.Second
+)
 
 // Dispatcher is the queue surface the HTTP layer needs.
 type Dispatcher interface {
@@ -46,7 +49,9 @@ type Server struct {
 	Build        BuildInfo
 	Health       *HealthState
 	HealthChecks HealthChecks
-	Logger       *slog.Logger
+	// HealthCheckTimeout bounds each dependency probe. A zero value uses the default.
+	HealthCheckTimeout time.Duration
+	Logger             *slog.Logger
 }
 
 // BuildInfo is the build metadata exposed by /api/healthz.
@@ -140,10 +145,19 @@ func (s *Server) runHealthCheck(ctx context.Context, check func(context.Context)
 	if check == nil {
 		return healthCheck{Status: "ok"}
 	}
+	ctx, cancel := context.WithTimeout(ctx, s.healthCheckTimeout())
+	defer cancel()
 	if err := check(ctx); err != nil {
 		return healthCheck{Status: "error", Error: safeHealthError(err)}
 	}
 	return healthCheck{Status: "ok"}
+}
+
+func (s *Server) healthCheckTimeout() time.Duration {
+	if s.HealthCheckTimeout > 0 {
+		return s.HealthCheckTimeout
+	}
+	return defaultHealthCheckTimeout
 }
 
 func safeHealthError(err error) string {
