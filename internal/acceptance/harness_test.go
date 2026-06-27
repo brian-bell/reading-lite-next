@@ -141,6 +141,35 @@ func TestStaticAnalysis_GoVetVerifyHarness(t *testing.T) {
 	}
 }
 
+func TestBinaryBoundary_ReaderAPIRequiresConfig(t *testing.T) {
+	root, goBin := repoRoot(t), goBin(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, goBin, "run", "./cmd/reader-api")
+	cmd.Dir = root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"GOCACHE=" + filepath.Join(t.TempDir(), "gocache"),
+		"READER_API_TOKEN=sentinel-token",
+		"DATABASE_URL=postgres://reader:sentinel-db-password@db.example.com/reading?sslmode=disable",
+	}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("go run ./cmd/reader-api unexpectedly succeeded; output=%s", out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "OPENAI_API_KEY") || !strings.Contains(text, "DATABASE_URL") {
+		t.Fatalf("reader-api config failure = %q, want missing/invalid field names", text)
+	}
+	for _, secret := range []string{"sentinel-token", "sentinel-db-password", "sslmode=disable"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("reader-api config failure leaked %q in %q", secret, text)
+		}
+	}
+}
+
 func TestStaticAnalysis_Gofmt(t *testing.T) {
 	root, gofmt := repoRoot(t), gofmtBin(t)
 	out, err := runTool(t, root, gofmt, "-l", ".")
@@ -878,7 +907,7 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 		}))
 		defer srv.Close()
-		_, err := fetch.NewHTTP().Get(ctx, srv.URL)
+		_, err := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests()).Get(ctx, srv.URL)
 		if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 15*time.Second {
 			t.Fatalf("Classify(fetch 429) = %v/%v, want Requeue/15s", got.Outcome, got.After)
 		}
@@ -890,7 +919,7 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 		}))
 		defer bare.Close()
-		_, err = fetch.NewHTTP().Get(ctx, bare.URL)
+		_, err = fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests()).Get(ctx, bare.URL)
 		if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != dispatch.DefaultRateLimitDelay {
 			t.Fatalf("Classify(bare fetch 429) = %v/%v, want Requeue/DefaultRateLimitDelay", got.Outcome, got.After)
 		}
@@ -904,7 +933,7 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 			_, _ = w.Write([]byte(strings.Repeat("x", 100)))
 		}))
 		defer srv.Close()
-		_, err := fetch.NewHTTP(fetch.WithMaxBytes(10)).Get(ctx, srv.URL)
+		_, err := fetch.NewHTTP(fetch.WithPrivateNetworkBypassForTests(), fetch.WithMaxBytes(10)).Get(ctx, srv.URL)
 		if !errors.Is(err, fetch.ErrBodyTooLarge) {
 			t.Fatalf("oversize body = %v, want ErrBodyTooLarge", err)
 		}

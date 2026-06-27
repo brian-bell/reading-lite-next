@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bbell/reading-lite/internal/blobs"
@@ -34,13 +36,45 @@ type Dispatcher interface {
 
 // Server wires the HTTP API to the core ports.
 type Server struct {
-	Store      store.Store
-	Dispatcher Dispatcher
-	Blobs      blobs.Blobs
-	Clock      clock.Clock
-	Token      string
-	TTLs       reading.TTLs
-	NewID      func() string
+	Store        store.Store
+	Dispatcher   Dispatcher
+	Blobs        blobs.Blobs
+	Clock        clock.Clock
+	Token        string
+	TTLs         reading.TTLs
+	NewID        func() string
+	Build        BuildInfo
+	Health       *HealthState
+	HealthChecks HealthChecks
+	Logger       *slog.Logger
+}
+
+// BuildInfo is the build metadata exposed by /api/healthz.
+type BuildInfo struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Date    string `json:"date"`
+}
+
+// HealthChecks are dependency probes exposed by /api/healthz.
+type HealthChecks struct {
+	Postgres func(context.Context) error
+	R2       func(context.Context) error
+}
+
+// HealthState carries process-level readiness for graceful shutdown.
+type HealthState struct {
+	degraded atomic.Bool
+}
+
+// MarkDegraded makes health checks report degraded regardless of dependency state.
+func (h *HealthState) MarkDegraded() {
+	h.degraded.Store(true)
+}
+
+// Degraded reports whether the process has been marked unhealthy.
+func (h *HealthState) Degraded() bool {
+	return h != nil && h.degraded.Load()
 }
 
 // Routes returns the API handler.
@@ -55,11 +89,56 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/readings/{id}/content", s.getContent)
 	mux.HandleFunc("GET /api/readings/{id}/raw", s.getRaw)
 	mux.HandleFunc("POST /api/readings/{id}/reprocess", s.reprocess)
-	return s.auth(jsonMuxErrors(mux))
+	return s.logRequests(s.auth(jsonMuxErrors(mux)))
 }
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	doc := healthDocument{
+		Status: "ok",
+		Build:  s.Build,
+		Checks: map[string]healthCheck{
+			"postgres": s.runHealthCheck(r.Context(), s.HealthChecks.Postgres),
+			"r2":       s.runHealthCheck(r.Context(), s.HealthChecks.R2),
+		},
+	}
+	status := http.StatusOK
+	if s.Health.Degraded() || doc.Checks["postgres"].Status != "ok" || doc.Checks["r2"].Status != "ok" {
+		doc.Status = "degraded"
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, doc)
+}
+
+type healthDocument struct {
+	Status string                 `json:"status"`
+	Build  BuildInfo              `json:"build"`
+	Checks map[string]healthCheck `json:"checks"`
+}
+
+type healthCheck struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+func (s *Server) runHealthCheck(ctx context.Context, check func(context.Context) error) healthCheck {
+	if check == nil {
+		return healthCheck{Status: "ok"}
+	}
+	if err := check(ctx); err != nil {
+		return healthCheck{Status: "error", Error: safeHealthError(err)}
+	}
+	return healthCheck{Status: "ok"}
+}
+
+func safeHealthError(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "unavailable"
+	}
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
@@ -487,6 +566,37 @@ func jsonMuxErrors(next http.Handler) http.Handler {
 			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		}
 	})
+}
+
+var requestSeq atomic.Uint64
+
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	if s.Logger == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(lw, r)
+		reqID := fmt.Sprintf("req-%d", requestSeq.Add(1))
+		s.Logger.InfoContext(r.Context(), "http_request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", lw.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"request_id", reqID,
+		)
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
 type muxErrorWriter struct {

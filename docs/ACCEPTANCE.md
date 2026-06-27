@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–10)
+# reading-lite — Manual Verification Plan (Phases 0–11)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -43,10 +43,13 @@
 > reprocess workflows behind the handlers. Phase 9's E2E layer is covered by
 > `internal/httpapi/e2e_test.go`: those tests drive the HTTP surface with the real
 > in-process dispatcher and real pipeline over `store.Memory`, `blobs.Memory`, and
-> `vector.Memory`, while external services remain fake and deterministic.
+> `vector.Memory`, while external services remain fake and deterministic. Phase 11 is covered by
+> focused tests in `internal/config`, `internal/fetch`, `internal/pipeline`, `internal/httpapi`,
+> `internal/readerapi`, and `cmd/reader-api`, plus the binary-boundary assertion in
+> `internal/acceptance`.
 > Tool- and
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
-> judgment call in B3/B4 and reviewing the still-unwired production API binary. `make test-integration`
+> judgment call in B3/B4 and production smoke checks against real external services. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
 > `blobs.R2` (MinIO) integration suites. Each automated test names the plan section it covers.
 
@@ -63,13 +66,14 @@ behind the Phase 4 ports, contract-tested via `httptest`/testcontainers), and
 oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
 **Phase 8** (the HTTP API surface, tested through `httptest` with in-memory ports),
 **Phase 9** (end-to-end HTTP stories with the real dispatcher and pipeline over in-memory
-backends and fake external services), and **Phase 10** (the tested readerctl operator command
-core and shared bookmark parser):
+backends and fake external services), **Phase 10** (the tested readerctl operator command
+core and shared bookmark parser), and **Phase 11** (production config, reader-api runtime
+wiring, dependency health, SSRF hardening, request logging, and graceful shutdown):
 
 | Area | Files | Phase |
 |---|---|---|
 | Module, Makefile, CI, lint config | `go.mod`, `Makefile`, `.github/workflows/ci.yml`, `.golangci.yml` | 0 |
-| Placeholder API binary | `cmd/reader-api/main.go` | 0 |
+| Production API binary | `cmd/reader-api/main.go`, `internal/readerapi/*`, `internal/config/*` | 11 |
 | Clock port + system + fake | `internal/clock/clock.go` | 0 |
 | Status machine, terminal checks | `internal/reading/status.go` | 1 |
 | URL idempotency key + source classification | `internal/reading/url.go` | 1 |
@@ -107,30 +111,21 @@ core and shared bookmark parser):
 
 ### Out of scope (do not expect these to work yet)
 
-The Phase 5 pipeline (`internal/pipeline/`) now wires the Phase 4 ports together and is
-verified by its own race-tested package tests and the C11 blackbox checks here, the Phase 6
-real adapters (`fetch.HTTP`, `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`,
-`vector.Postgres`, `blobs.R2`) now exist behind those ports, and the Phase 8 command/API
-packages (`internal/readingops`, `internal/httpapi`) now exist, and Phase 9 proves the package
-composition end-to-end through HTTP with in-memory backends and fake externals — but these are
-**not wired into the binaries**: nothing calls
-`Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter, or starts
-`httpapi.Server.Routes` from `main` yet (that lands with the `main` lifecycle/config work in
-Phase 11).
-The Phase 5 pipeline still drives the ports through their in-memory fakes in tests; the real
-adapters are exercised only by their own contract tests (`httptest` upstreams, and
-testcontainers Postgres/MinIO under `//go:build integration`).
-The Phase 7 extraction internals (`extract.Readability`, `extract.YouTube`, `extract.RedditGuidance`)
-now exist and are contract-/fixture-tested (C13), but, like the Phase 6 adapters and Phase 8 API,
-are **not yet wired into the API binary** — nothing constructs `extract.Readability` from
-`cmd/reader-api` or routes a YouTube URL through `extract.YouTube` there yet. The remaining
-Phases 11–12 are **not** implemented: config loading, production lifecycle wiring, and
-observability. `reader-api` is still an intentionally empty `main(){}` placeholder.
+Phase 11 wires the production `reader-api` binary: it loads env config, opens Postgres, runs
+embedded migrations, builds production adapters, starts dispatcher workers, runs the startup
+sweep, serves the HTTP API, reports dependency health, and shuts down gracefully. It still does
+not add a durable multi-instance queue, Prometheus `/metrics`, alternate backends, production
+private-network fetch exceptions, or stateful production dependency construction for
+`readerctl`.
+
 `readerctl` now delegates to the tested `internal/readerctl` command core, but the default
-binary constructs no store/blob/vector/dispatcher dependencies before Phase 11. Stateful
-commands therefore return deterministic configuration errors from the default binary; smoke
-and dry-run deploy/staging planning are Phase-10-safe.
-Verifying "the service runs and ingests a URL" is **premature** and not part of this plan.
+binary constructs no store/blob/vector/dispatcher dependencies. Stateful commands therefore
+return deterministic configuration errors from the default binary; smoke and dry-run
+deploy/staging planning remain Phase-10-safe.
+
+Production smoke against live OpenAI/Anthropic/Resend/R2/Postgres credentials is an operations
+activity, not part of the deterministic default suite. The default and verify suites continue to
+use fakes, `httptest`, and build-tagged integration adapters.
 
 ---
 
@@ -312,10 +307,10 @@ against the TDD plan, and (where useful) poke it with a throwaway program.
   Confirm Go `1.26.x` and that integration is a separate job (not in the default run).
 - [ ] Confirm `go.mod` declares `go 1.26` and module path
   `github.com/bbell/reading-lite`.
-- [ ] Binary boundary: `go run ./cmd/reader-api` should build and exit 0 immediately
-  (empty API `main`). `cmd/readerctl` should build and delegate to `internal/readerctl`;
-  stateful commands such as `audit` return a deterministic configuration error from the
-  default binary until Phase 11 dependency construction exists.
+- [ ] Binary boundary: `go run ./cmd/reader-api` should build and exit non-zero with a
+  redacted missing-config error when required env is absent. `cmd/readerctl` should build and
+  delegate to `internal/readerctl`; stateful commands such as `audit` return a deterministic
+  configuration error from the default binary until readerctl dependency construction exists.
 
 ### C2. Phase 0 — clock port (`internal/clock/clock.go`)
 
@@ -587,7 +582,8 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
 > Note: C10 covers only the fakes/in-memory backends. The real adapters — `fetch.HTTP`,
 > `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
 > the integration arm of `vectortest.RunContract` are **Phase 6**, verified in **C12**. The
-> ports are wired into the Phase 5 pipeline (C11); the real adapters are not yet wired into `main`.
+> ports are wired into the Phase 5 pipeline (C11); the real adapters are wired into the
+> production API runtime in Phase 11 (C17).
 
 ### C11. Phase 5 — processing pipeline (`internal/pipeline/pipeline.go`)
 
@@ -650,9 +646,10 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
   `FinalURL`, returns the status, **caps the body** (`WithMaxBytes` → `ErrBodyTooLarge` for an
   over-cap **2xx**, rejected not truncated; a non-2xx keeps its status so the pipeline classifies
   it), honors `WithTimeout` and `ctx` cancellation, **rejects non-http(s) schemes**
-  (`ErrUnsupportedScheme`) before dialing, and maps a **429 → `dispatch.RateLimitError`** (honoring
-  `Retry-After`) so a throttled origin **requeues** instead of permanently failing. The private-IP
-  SSRF guard is deliberately deferred to Phase 11 (TDD plan §13). Tests: `TestHTTP_*`.
+  (`ErrUnsupportedScheme`) before dialing, rejects private and special-use literal, DNS-resolved,
+  and redirect targets, disables environment proxies in production mode, and maps a **429 →
+  `dispatch.RateLimitError`** (honoring `Retry-After`) so a throttled origin **requeues** instead
+  of permanently failing. Tests: `TestHTTP_*` and `TestHTTP_Blocks*`.
 - [ ] **`embed.OpenAI`.** POSTs `/v1/embeddings` with `Bearer` auth and `model=text-embedding-3-small`,
   parses `data[0].embedding`, and maps 429/4xx/5xx via `httpx`. Tests: `TestOpenAI_*` (request shape,
   rate-limit→`Requeue`, 4xx→`Fail`, 5xx→`Retry`).
@@ -686,8 +683,8 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
   `TestStaticAnalysis_GoVetIntegrationTag` vets the whole module under `-tags integration` so the
   `vector.Postgres`/`blobs.R2` integration tests always compile.
 
-> Note: these adapters are not yet wired into `main` (later main/config lifecycle work). Do not
-> flag that as a gap.
+> Note: these adapters are wired into the production API runtime in Phase 11 (C17). Their
+> package-level contract tests remain in C12.
 > New runtime dependency: `aws-sdk-go-v2` (S3 client) for `blobs.R2`; the HTTP adapters are
 > stdlib-only.
 
@@ -753,6 +750,10 @@ workflow semantics directly.
   `Authorization: Bearer <token>`, checked with `subtle.ConstantTimeCompare`. Tests:
   `TestAuth_MissingTokenRejected`, `TestAuth_WrongTokenRejected`, `TestAuth_HealthzSkipsAuth`,
   and `TestAuth_ValidTokenPasses`.
+- [ ] **Dependency health and request logging.** `GET /api/healthz` returns JSON status,
+  build metadata, and Postgres/R2 checks; it returns 200 only when all checks are ok and 503 when
+  degraded. Request logs include generated request id, method, path, status, and duration only;
+  they do not log tokens, headers, or bodies.
 - [ ] **Ingest idempotency.** `POST /api/readings` normalizes with `reading.URLKey` before lookup,
   persists new readings as `pending`, returns 201 for new and 200 for existing, does not duplicate
   pending/ready submissions, and reprocesses failed readings in place. Tests cover the full matrix:
@@ -793,9 +794,8 @@ workflow semantics directly.
   with health, auth, ingest, URL normalization, submitter invocation, and detail DTO mapping; the
   acceptance harness also asserts `*dispatch.Dispatcher` satisfies `httpapi.Dispatcher`.
 
-> Note: `cmd/reader-api` still does not construct `httpapi.Server`, adapters, the pipeline, or a
-> worker pool. That runtime wiring belongs to the later main/config lifecycle work, so do not flag
-> the `cmd/reader-api` placeholder as a Phase 8 API-package gap.
+> Note: `cmd/reader-api` runtime wiring is now covered in C17. C14 remains the package-level API
+> surface check.
 
 ### C15. Phase 9 — End-to-end HTTP integration (`internal/httpapi/e2e_test.go`)
 
@@ -825,8 +825,8 @@ worker-pool concurrency itself remains covered in C9.
 
 ### C16. Phase 10 — Readerctl operator command core
 
-Phase 10 adds the operator CLI core while still deferring production dependency construction to
-Phase 11. Tests drive `internal/readerctl.Command` with injected in-memory store/blob/vector
+Phase 10 adds the operator CLI core while still deferring readerctl production dependency
+construction. Tests drive `internal/readerctl.Command` with injected in-memory store/blob/vector
 backends, fake dispatcher/runner seams, fake clock, and `httptest` smoke upstreams.
 
 - [ ] `go test ./internal/bookmarks ./internal/httpapi ./internal/readerctl ./cmd/readerctl`
@@ -854,6 +854,37 @@ backends, fake dispatcher/runner seams, fake clock, and `httptest` smoke upstrea
 - [ ] **Default binary boundary.** `cmd/readerctl` delegates to `readerctl.Main` and has a test
   proving stateful commands report configuration errors rather than silently succeeding. It does
   not construct Postgres/R2/vector/dispatcher dependencies yet.
+
+### C17. Phase 11 — Production runtime, config, health, and shutdown
+
+Phase 11 wires the production API process while keeping the behavior testable through seams in
+`internal/readerapi` and pure validation in `internal/config`.
+
+- [ ] `go test ./internal/config ./internal/fetch ./internal/pipeline ./internal/httpapi ./internal/readerapi ./cmd/reader-api`
+  passes clean.
+- [ ] **Startup config.** `internal/config.LoadEnv` requires all production env, validates
+  Postgres URLs with `postgres://` or `postgresql://` and TLS `sslmode=require|verify-ca|verify-full`,
+  applies safe defaults for optional fetch/shutdown settings, and exposes only redacted safe
+  fields for logs.
+- [ ] **SSRF hardening.** `fetch.HTTP` rejects private and special-use literal, DNS-resolved, and
+  redirect targets; disables environment proxies in production; and keeps custom HTTP clients
+  guarded unless the explicit non-production test bypass is used.
+- [ ] **Pipeline diagnostics.** Persisted diagnostics include numeric `timings_ms` entries for
+  durable stages such as acquire, index, summarize, and notify when notification runs. YouTube
+  readings use the oEmbed/timed-text adapter instead of fetching and readability-parsing watch
+  page HTML.
+- [ ] **Health and logs.** `/api/healthz` skips auth and returns JSON status, build metadata, and
+  Postgres/R2 check objects, with 503 on degraded dependencies and redacted error classes only.
+  R2 health treats a typed missing key as reachable but reports missing buckets/endpoints as
+  errors. Request logs include generated request id, method, path, status, and duration, never
+  tokens, headers, or bodies.
+- [ ] **Runtime ordering.** `readerapi.Run` validates config before side effects, runs migrations
+  before constructing the server, starts workers before `Sweep`, blocks serving until `Sweep`
+  succeeds, classifies `http.ErrServerClosed` as clean shutdown, and cleans up opened resources on
+  startup failures.
+- [ ] **Graceful shutdown.** On cancellation or SIGTERM, runtime marks health degraded before
+  `http.Server.Shutdown`, waits for accepted handlers up to `SHUTDOWN_TIMEOUT`, then cancels and
+  drains dispatcher workers before closing the pool/resources.
 
 ---
 
@@ -905,16 +936,11 @@ Record these so a reviewer doesn't waste time or raise false bugs:
 2. **Domain coverage clears the 90% bar** — `clock` 90.9%, `reading` 97.4%,
    `dispatch` 93.0%, `pipeline` 91.5% (B3). The store's 48.8% is a build-tag artifact, not a
    gap. No domain coverage finding is currently open; B4 is the method to use if one reopens.
-3. **Production API wiring is still absent** — `reader-api` does nothing. The Phase 3
-   dispatcher (`internal/dispatch`, C9), the Phase 5 pipeline (`internal/pipeline`, C11), the
-   Phase 6 real adapters (C12), the Phase 7 extraction internals (`internal/extract`, C13), and
-   the Phase 8 HTTP API (`internal/httpapi`, C14) are all complete and verified. Phase 9 also
-   proves those package pieces fit together end-to-end through HTTP against memory backends and
-   fake external ports (C15), but they are **not yet wired into `cmd/reader-api`**: nothing calls
-   `Submit`/`Run`/`Sweep`, constructs a `Pipeline`, constructs an adapter / extractor, or starts
-   `httpapi.Server.Routes` from the API binary. `readerctl` has a tested Phase 10 command core
-   (C16), but its default binary still constructs no store/blob/vector/dispatcher dependencies.
-   Production main wiring, config, and observability do not exist yet (Phases 11–12).
+3. **Production API wiring exists in `reader-api`** — Phase 11 adds env validation, migration
+   gating, production adapter construction, dispatcher worker startup, startup recovery sweep,
+   HTTP serving, dependency health, redacted logging, and graceful shutdown. `readerctl` has a
+   tested Phase 10 command core (C16), but its default binary still constructs no
+   store/blob/vector/dispatcher dependencies.
 4. **The dispatcher's dedup claim is in-process** — the `claim`/`release` map gives
    single-process exactly-once dispatch, matching the single-instance topology
    (PLAN §1.5). It is **not** a cross-instance guard; a multi-instance deployment
@@ -990,12 +1016,12 @@ skipped/blocked (write why).
   idempotent re-entry summarizes once; status/content split; server-derived blob keys; ≥90%
   coverage; `TestAcceptance_PipelineProcess` green
 - [ ] C12 real adapters: each Phase 6 adapter matches §8 — `fetch.HTTP` (UA/timeout/size-cap/
-  redirect→FinalURL/scheme reject, **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` (request
-  shape, forced `emit_reading` tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`),
-  `notify.Resend` (shape + non-2xx error), `vector.Postgres` (`vectortest.RunContract` under
-  integration **and** the harness's pgvector backend), `blobs.R2` (httptest round-trip + MinIO under
-  integration); compile-time port conformance + `TestAcceptance_RealAdapters` green; SSRF private-IP
-  guard deferred to Phase 11
+  redirect→FinalURL/scheme reject, private/special-use address block, proxy disabled in production,
+  **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` (request shape, forced `emit_reading`
+  tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`), `notify.Resend` (shape + non-2xx
+  error), `vector.Postgres` (`vectortest.RunContract` under integration **and** the harness's
+  pgvector backend), `blobs.R2` (httptest round-trip + MinIO under integration); compile-time port
+  conformance + `TestAcceptance_RealAdapters` green
 - [ ] C13 extraction internals: `extract.Readability` tier ladder selects readability/raw_dom/raw_only
   by readerability (fixtures + golden markdown), pure `selectTier`/`rawText` white-box tested;
   `extract.YouTube` oEmbed floor (title/author) + best-effort transcript, 404→Fail via `internal/httpx`;
@@ -1008,6 +1034,8 @@ skipped/blocked (write why).
   rate-limit requeue, restart recovery with real dispatcher+pipeline over memory backends
 - [ ] C16 Phase 10 readerctl: shared bookmark parser, imports, audit, recover, drop, smoke
   token-env auth, deploy/staging plans, default binary config errors
+- [ ] C17 Phase 11 runtime: env config validation/redaction, SSRF hardening, health schema,
+  request logging, migrations and sweep gate serving, production adapters, graceful shutdown
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
@@ -1023,7 +1051,7 @@ skipped/blocked (write why).
 - [ ] Limitations in §6 acknowledged
 - [ ] Any deviation from `docs/PLAN.md` recorded with rationale
 - [ ] C9 dispatcher behavior confirmed and harness `TestAcceptance_Dispatcher*` green
-- [ ] Overall verdict: Phases 0–10 **accept / reject** (record in §8 sign-off log)
+- [ ] Overall verdict: Phases 0–11 **accept / reject** (record in §8 sign-off log)
 
 ---
 

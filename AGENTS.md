@@ -8,8 +8,9 @@ API package, and the command service that coordinates multi-resource workflows.
 The service can ingest URLs, import markdown and bookmark files, fetch and extract source
 content, store raw and processed blobs, embed and index readings for similarity, summarize
 readings, tag them, and optionally send notifications. The HTTP API is implemented and
-tested as a package. The production `cmd/reader-api` binary is still a minimal entrypoint:
-it does not yet construct adapters, start the HTTP server, or run a worker pool. The
+tested as a package. The production `cmd/reader-api` binary now validates env config, runs
+embedded store migrations, constructs production adapters, starts the dispatcher worker pool,
+runs startup recovery, serves HTTP, reports dependency health, and shuts down gracefully. The
 `cmd/readerctl` binary now delegates to the tested `internal/readerctl` command core, but
 stateful commands still need injected store/blob/vector/dispatcher dependencies; the default
 binary only supports Phase-10-safe smoke and dry-run deploy/staging planning without
@@ -17,17 +18,20 @@ production config.
 
 ## Structure
 
-- `cmd/reader-api/` contains the API process entrypoint. It is currently a minimal
-  placeholder until production config, adapter construction, the HTTP server, and the worker
-  pool are wired.
+- `cmd/reader-api/` contains the API process entrypoint. It delegates to
+  `internal/readerapi.Main`, which loads env config, runs migrations, wires production
+  adapters, starts workers, serves HTTP, and handles graceful shutdown.
 - `cmd/readerctl/` contains the operator CLI entrypoint. It delegates to
   `internal/readerctl.Main`; production dependency construction is still deferred to
-  Phase 11 config/lifecycle wiring.
+  future readerctl wiring.
 - `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
   used by concurrent tests.
 - `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit
   status transitions, terminal-state checks, URL idempotency key normalization, source
   classification, and read-time stale annotation.
+- `internal/config/` defines the pure startup environment loader for `reader-api`: required
+  fields, safe defaults, strict Postgres TLS URL validation, positive tuning values, and
+  redacted logging fields.
 - `internal/store/` defines the `Store` port, shared query/page DTOs, the manual
   `BatchStore` port, `store.Memory`, the pgx-backed `store.Postgres` adapter, embedded
   migrations, SQL query source for sqlc, and `storetest.RunContract`/`RunBatchContract` for
@@ -57,13 +61,16 @@ production config.
   `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
   `extract` consumes a `fetch.Resource`. Each package also ships its real adapter:
   `fetch.HTTP` (user agent, timeout, body-size cap, redirect tracking to `FinalURL`,
-  non-http(s) scheme rejection, and a 429 to `dispatch.RateLimitError` requeue),
+  non-http(s) scheme rejection, private/special-use address SSRF blocking for literal,
+  DNS-resolved, and redirect targets, environment proxy disabling, and a 429 to
+  `dispatch.RateLimitError` requeue),
   `embed.OpenAI` (`/v1/embeddings`, `text-embedding-3-small`),
   `summarize.Anthropic` (Messages API with forced `emit_reading` tool use, plus a Message
   Batches client for create/get/results and JSONL result parsing), and `notify.Resend`
   (`/emails`). The HTTP adapters take `WithBaseURL` and `WithHTTPClient` options so contract
   tests can point them at `httptest` upstreams, and classify upstream failures through
-  `internal/httpx`. A private-IP SSRF guard is not implemented in `fetch.HTTP`.
+  `internal/httpx`. `fetch.HTTP` exposes an explicit private-network bypass only for
+  non-production tests.
 - `internal/extract/` also holds the extraction internals. `extract.Readability` is the
   production `Extractor`: a three-tier salvage ladder over fetched HTML: `readability`
   (go-readability when the page is readerable, then html-to-markdown), `raw_dom` (whole-DOM
@@ -86,8 +93,9 @@ production config.
   `extract.YouTube` oEmbed error semantics identical to `dispatch.Classify`.
 - `internal/blobs/` defines the `Blobs` content-blob port, `blobs.Memory` (in-memory), and
   `blobs.R2`, the production S3-compatible adapter (aws-sdk-go-v2, path-style, custom
-  endpoint; maps a missing key to `blobs.ErrNotFound`). `R2` is exercised by an `httptest` S3
-  stub on every run and a MinIO container under `//go:build integration`.
+  endpoint; maps a missing key to `blobs.ErrNotFound`; health probes distinguish a typed
+  missing key from a missing bucket). `R2` is exercised by an `httptest` S3 stub on every run
+  and a MinIO container under `//go:build integration`.
 - `internal/vector/` defines the `Index` similarity port, `vector.Memory` (a real
   cosine-similarity index), `vector.Postgres` (the pgvector adapter over `reading_vectors`,
   ranking by cosine distance via `<=>`), and `vectortest.RunContract`, the backend-neutral
@@ -95,14 +103,15 @@ production config.
   `//go:build integration`).
 - `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
   `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
-  Reddit fails permanently with `extract.RedditGuidance`; everything else fetches and
-  extracts), embeds, snapshots similar readings, persists a guarded content checkpoint,
+  Reddit fails permanently with `extract.RedditGuidance`; YouTube uses the oEmbed/timed-text
+  adapter; everything else fetches and extracts), embeds, snapshots similar readings, persists a guarded content checkpoint,
   upserts a vector, summarizes once, optionally notifies, and persists the content via
   `store.UpdateContent` plus `ReplaceTags`. It returns a `dispatch.Result`; the dispatcher owns
   lifecycle status, and the pipeline owns content. Re-entry is idempotent: a persisted
   `content_key` checkpoint lets a retried run skip fetch/extract and resume near summarize; it
   may re-embed to recover a vector upsert after the guarded checkpoint. Blob keys are derived
-  from the server-side reading id and dispatcher run timestamp.
+  from the server-side reading id and dispatcher run timestamp. Diagnostics include
+  `timings_ms` for durable pipeline stages such as acquire, index, summarize, and notify.
 - `internal/readingops/` defines the application command service for multi-resource HTTP
   workflows: URL ingest, markdown import and failed-reading replacement, bookmark import, and
   manual reprocess. It owns sequencing across `store.Store`, `blobs.Blobs`, and the dispatcher,
@@ -118,18 +127,22 @@ production config.
   running API (`--token` or `--token-env`), and deploy/staging structured plans behind a
   `Runner` seam. Deploy and staging up/promote require `--smoke-token-env` so generated smoke
   steps can authenticate without printing a secret. Default `readerctl.Main` intentionally
-  constructs no store/blob/vector/dispatcher before Phase 11.
+  constructs no store/blob/vector/dispatcher dependencies.
 - `internal/httpapi/` defines the JSON API as
   `httpapi.Server{Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID}` with one
   `Routes() http.Handler`. It uses the stdlib `http.ServeMux`, constant-time bearer-token
   auth (health skips auth), bounded JSON decoding, opaque cursor encoding over `store.Cursor`,
-  and DTO mapping that avoids exposing internal blob/url-key columns. Ingest, import, and
-  reprocess handlers delegate to `internal/readingops`. Tests drive it through `httptest`
+  dependency health JSON for Postgres/R2, request-id structured logging, and DTO mapping that
+  avoids exposing internal blob/url-key columns. Ingest, import, and reprocess handlers delegate
+  to `internal/readingops`. Tests drive it through `httptest`
   against `store.Memory`, `blobs.Memory`, a fake clock, and a submitter seam;
   `*dispatch.Dispatcher` satisfies that seam. `internal/httpapi/e2e_test.go` adds end-to-end
   HTTP coverage for URL ingest/read/content, similarity across two readings, failed-to-reprocess
   flows, retry exhaustion, rate-limit requeue, and restart recovery, all with the real
   dispatcher and pipeline over in-memory backends and fake external ports.
+- `internal/readerapi/` defines the production API runtime: env-driven startup, pgx pool
+  construction, embedded migrations, production adapter construction, worker lifecycle,
+  startup sweep, health checks, redacted startup logging, and graceful shutdown ordering.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the project tooling and CI
   conventions.
 
@@ -150,9 +163,10 @@ The project targets Go 1.26.
   and skip when Docker is unavailable.
 - `make lint` checks `gofmt`, `go vet`, and `golangci-lint`.
 - `make build` runs `go build ./...`.
-- `make run` runs `cmd/reader-api`; the binary currently exits immediately.
+- `make run` runs `cmd/reader-api`; the binary now requires production env and exits with a
+  redacted configuration error when required fields are missing or invalid.
 - `make migrate` is a reserved target that currently invokes unsupported `readerctl migrate`;
-  migrations-at-startup and production CLI migration wiring are Phase 11 work.
+  production CLI migration wiring remains deferred to future readerctl dependency injection.
 - `make sqlc` runs `sqlc generate`.
 
 ## Conventions

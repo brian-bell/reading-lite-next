@@ -31,6 +31,7 @@ type harness struct {
 	blobs      *blobs.Memory
 	fetcher    *fetch.Fake
 	extractor  *extract.Fake
+	youtube    *fakeYouTube
 	embedder   *embed.Fake
 	vectors    *vector.Memory
 	summarizer *summarize.Fake
@@ -49,6 +50,7 @@ func newHarness(t *testing.T) *harness {
 		blobs:      blobs.NewMemory(),
 		fetcher:    &fetch.Fake{Resource: fetch.Resource{Body: []byte("<html><body>hi</body></html>"), ContentType: "text/html", Status: 200}},
 		extractor:  &extract.Fake{Article: extract.Article{Title: "Extracted Title", Author: "Ada", Site: "example.com", Lang: "en", Markdown: "# Heading\n\nBody text here.", Mode: extract.ModeReadability, WordCount: 42}},
+		youtube:    &fakeYouTube{article: extract.Article{Title: "Video Title", Author: "Creator", Site: "YouTube", Markdown: "video description", Mode: extract.ModeRawOnly, WordCount: 2}},
 		embedder:   &embed.Fake{Vec: unitVec()},
 		vectors:    vector.NewMemory(),
 		summarizer: &summarize.Fake{Summary: summarize.Summary{Title: "Refined Title", Summary: "A concise summary.", Tags: []string{"go", "db"}, JSON: json.RawMessage(`{"key":"value"}`)}},
@@ -61,6 +63,7 @@ func newHarness(t *testing.T) *harness {
 		Blobs:      h.blobs,
 		Fetcher:    h.fetcher,
 		Extractor:  h.extractor,
+		YouTube:    h.youtube,
 		Embedder:   h.embedder,
 		Vectors:    h.vectors,
 		Summarizer: h.summarizer,
@@ -205,6 +208,17 @@ func TestPipeline_HappyPath(t *testing.T) {
 	// Diagnostics recorded.
 	if len(got.DiagnosticsJSON) == 0 {
 		t.Fatalf("diagnostics_json empty, want recorded pipeline diagnostics")
+	}
+	var diag struct {
+		TimingsMS map[string]float64 `json:"timings_ms"`
+	}
+	if err := json.Unmarshal(got.DiagnosticsJSON, &diag); err != nil {
+		t.Fatalf("diagnostics_json unmarshal: %v", err)
+	}
+	for _, key := range []string{"acquire", "index", "checkpoint", "vector_upsert", "summarize", "notify"} {
+		if _, ok := diag.TimingsMS[key]; !ok {
+			t.Fatalf("timings_ms = %+v, missing %q", diag.TimingsMS, key)
+		}
 	}
 }
 
@@ -416,14 +430,8 @@ func TestPipeline_ExtractionFallback(t *testing.T) {
 func TestPipeline_YouTube_OEmbedFloor(t *testing.T) {
 	t.Parallel()
 
-	// Phase 5 has no YouTube-specific branch: a YouTube URL flows through the same
-	// fetch+extract path as web (the oEmbed floor itself lives in the Phase 7
-	// extractor adapter). This test therefore verifies the *pipeline* contract for
-	// YouTube — it is fetched (unlike Reddit) and reaches ready carrying the
-	// floor's author/extraction_mode that the (scripted) extractor reports.
 	h := newHarness(t)
-	h.extractor.Article = extract.Article{Title: "Video Title", Author: "Creator", Markdown: "video description", Mode: extract.ModeRawOnly, WordCount: 2}
-	r := h.seed(t, "r1", "https://www.youtube.com/watch?v=abcdEFGHijk")
+	r := h.seed(t, "r1", "https://youtu.be/abcdEFGHijk")
 	if r.SourceKind != reading.SourceYouTube {
 		t.Fatalf("source kind = %q, want youtube", r.SourceKind)
 	}
@@ -434,8 +442,17 @@ func TestPipeline_YouTube_OEmbedFloor(t *testing.T) {
 	if got.Status != reading.Ready {
 		t.Fatalf("status = %q, want ready (youtube is fetchable, unlike reddit)", got.Status)
 	}
-	if h.fetcher.Calls() == 0 {
-		t.Fatalf("fetcher calls = 0, want youtube to be fetched")
+	if h.fetcher.Calls() != 0 {
+		t.Fatalf("fetcher calls = %d, want youtube to use oEmbed adapter", h.fetcher.Calls())
+	}
+	if h.extractor.Calls() != 0 {
+		t.Fatalf("extractor calls = %d, want youtube to skip HTML extractor", h.extractor.Calls())
+	}
+	if h.youtube.calls != 1 {
+		t.Fatalf("youtube calls = %d, want 1", h.youtube.calls)
+	}
+	if h.youtube.urls[0] != r.URLKey {
+		t.Fatalf("youtube URL = %q, want canonical key %q", h.youtube.urls[0], r.URLKey)
 	}
 	if got.Author != "Creator" {
 		t.Fatalf("author = %q, want the floor author 'Creator'", got.Author)
@@ -443,6 +460,22 @@ func TestPipeline_YouTube_OEmbedFloor(t *testing.T) {
 	if got.ExtractionMode != string(extract.ModeRawOnly) {
 		t.Fatalf("extraction_mode = %q, want raw_only floor", got.ExtractionMode)
 	}
+}
+
+type fakeYouTube struct {
+	article extract.Article
+	err     error
+	calls   int
+	urls    []string
+}
+
+func (f *fakeYouTube) Extract(_ context.Context, videoURL string) (extract.Article, error) {
+	f.calls++
+	f.urls = append(f.urls, videoURL)
+	if f.err != nil {
+		return extract.Article{}, f.err
+	}
+	return f.article, nil
 }
 
 func TestPipeline_RateLimited_Requeues(t *testing.T) {
