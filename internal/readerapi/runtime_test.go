@@ -88,6 +88,42 @@ func TestMainDefaultsBuildInfoAndLogger(t *testing.T) {
 	}
 }
 
+func TestRun_PassesCORSAllowedOriginsToHTTPServer(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig(t)
+	cfg.CORSAllowedOrigins = []string{"https://app.example.com"}
+	var gotStatus int
+	var gotAllowOrigin string
+	err := readerapi.Run(context.Background(), cfg, readerapi.Options{
+		OpenPool:        func(context.Context, config.Config) (readerapi.Pool, error) { return &fakePool{}, nil },
+		ApplyMigrations: func(context.Context, readerapi.Pool) error { return nil },
+		BuildComponents: func(context.Context, config.Config, readerapi.Pool) (readerapi.Components, error) {
+			return fakeComponents(), nil
+		},
+		RunWorkers: func(context.Context, *dispatch.Dispatcher) {},
+		Sweep:      func(context.Context, *dispatch.Dispatcher) error { return nil },
+		Serve: func(server *http.Server) error {
+			req := httptest.NewRequest(http.MethodGet, "/api/healthz", nil)
+			req.Header.Set("Origin", "https://app.example.com")
+			rr := httptest.NewRecorder()
+			server.Handler.ServeHTTP(rr, req)
+			gotStatus = rr.Code
+			gotAllowOrigin = rr.Header().Get("Access-Control-Allow-Origin")
+			return http.ErrServerClosed
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if gotStatus != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", gotStatus)
+	}
+	if gotAllowOrigin != "https://app.example.com" {
+		t.Fatalf("allow-origin = %q, want configured origin", gotAllowOrigin)
+	}
+}
+
 func TestRun_MigrationsAndSweepGateServing(t *testing.T) {
 	t.Parallel()
 

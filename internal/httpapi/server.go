@@ -29,6 +29,8 @@ import (
 const (
 	maxBodyBytes              = 1 << 20
 	defaultHealthCheckTimeout = 2 * time.Second
+	corsAllowedMethods        = "GET, POST, OPTIONS"
+	corsAllowedHeaders        = "Authorization, Content-Type"
 )
 
 // Dispatcher is the queue surface the HTTP layer needs.
@@ -49,6 +51,8 @@ type Server struct {
 	Build        BuildInfo
 	Health       *HealthState
 	HealthChecks HealthChecks
+	// CORSAllowedOrigins is an exact Origin allowlist for browser access to /api/.
+	CORSAllowedOrigins []string
 	// HealthCheckTimeout bounds each dependency probe. A zero value uses the default.
 	HealthCheckTimeout time.Duration
 	Logger             *slog.Logger
@@ -94,7 +98,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/readings/{id}/content", s.getContent)
 	mux.HandleFunc("GET /api/readings/{id}/raw", s.getRaw)
 	mux.HandleFunc("POST /api/readings/{id}/reprocess", s.reprocess)
-	return s.logRequests(s.auth(jsonMuxErrors(mux)))
+	return s.logRequests(s.cors(s.auth(jsonMuxErrors(mux))))
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -332,6 +336,69 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) cors(next http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(s.CORSAllowedOrigins))
+	for _, origin := range s.CORSAllowedOrigins {
+		allowed[origin] = struct{}{}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" || !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Add("Vary", "Origin")
+		if _, ok := allowed[origin]; !ok {
+			writeErr(w, http.StatusForbidden, "forbidden", "origin is not allowed")
+			return
+		}
+		if isCORSPreflight(r) {
+			w.Header().Add("Vary", "Access-Control-Request-Method")
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
+			if !allowedCORSMethod(r.Header.Get("Access-Control-Request-Method")) || !allowedCORSHeaders(r.Header.Get("Access-Control-Request-Headers")) {
+				writeErr(w, http.StatusForbidden, "forbidden", "cors preflight is not allowed")
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", corsAllowedMethods)
+			w.Header().Set("Access-Control-Allow-Headers", corsAllowedHeaders)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isCORSPreflight(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+func allowedCORSMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPost:
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedCORSHeaders(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+	for header := range strings.SplitSeq(raw, ",") {
+		switch strings.ToLower(strings.TrimSpace(header)) {
+		case "authorization", "content-type":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func tokenEqual(got, want string) bool {

@@ -214,7 +214,8 @@ func Run(ctx context.Context, cfg config.Config, opts Options) error {
 				Postgres: pool.Ping,
 				R2:       r2HealthCheck(components.Blobs),
 			},
-			Logger: opts.Logger,
+			CORSAllowedOrigins: cfg.CORSAllowedOrigins,
+			Logger:             opts.Logger,
 		}).Routes(),
 	}
 
