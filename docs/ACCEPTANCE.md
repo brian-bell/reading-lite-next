@@ -1,4 +1,4 @@
-# reading-lite — Manual Verification Plan (Phases 0–11)
+# reading-lite — Manual Verification Plan (Phases 0–11 + Web Bootstrap)
 
 > Purpose: a step-by-step plan a human can follow to independently verify that the
 > work completed so far is correct, complete, and consistent with both
@@ -51,7 +51,9 @@
 > Docker-dependent steps skip when unavailable. What stays manual: the coverage
 > judgment call in B3/B4 and production smoke checks against real external services. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
-> `blobs.R2` (MinIO) integration suites. Each automated test names the plan section it covers.
+> `blobs.R2` (MinIO) integration suites. The isolated `web/` SPA bootstrap is verified by its
+> own npm commands (`npm ci`, `npm test`, `npm run build`) rather than `make verify`. Each
+> automated backend test names the plan section it covers.
 
 ## 0. Scope
 
@@ -68,7 +70,9 @@ oEmbed client, and the Reddit guidance, fixture- and contract-tested), and
 **Phase 9** (end-to-end HTTP stories with the real dispatcher and pipeline over in-memory
 backends and fake external services), **Phase 10** (the tested readerctl operator command
 core and shared bookmark parser), and **Phase 11** (production config, reader-api runtime
-wiring, dependency health, SSRF hardening, request logging, and graceful shutdown):
+wiring, dependency health, SSRF hardening, request logging, and graceful shutdown). The checkout
+also includes the first web tracer bullet from issue #25: exact-origin API CORS plus an isolated
+Vite/React health-check SPA under `web/`:
 
 | Area | Files | Phase |
 |---|---|---|
@@ -108,6 +112,7 @@ wiring, dependency health, SSRF hardening, request logging, and graceful shutdow
 | End-to-end HTTP integration stories | `internal/httpapi/e2e_test.go` | 9 |
 | Shared bookmark import parser | `internal/bookmarks/bookmarks.go` | 10 |
 | Operator command core and entrypoint | `internal/readerctl/readerctl.go`, `cmd/readerctl/main.go` | 10 |
+| CORS-backed SPA bootstrap | `web/`, `internal/config/config.go`, `internal/httpapi/server.go`, `internal/readerapi/runtime.go` | Web #25 |
 
 ### Out of scope (do not expect these to work yet)
 
@@ -144,6 +149,7 @@ export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
 | Tool | Required version | Verify | Expected |
 |---|---|---|---|
 | Go | 1.26.x | `go version` | `go version go1.26.4 linux/amd64` (or newer 1.26) |
+| Node.js/npm | current LTS or newer | `node --version && npm --version` | Node can run the isolated `web/` package scripts |
 | golangci-lint | v2.x | `golangci-lint version` | reports v2.12.x |
 | sqlc | v1.31.x | `sqlc version` | `v1.31.1` |
 | Docker (integration only) | any | `docker info` | Daemon runs v29.6.0; the user is in the `docker` group. If a session predates that membership, `docker info` returns "permission denied" — start a fresh login (so `id -nG` lists `docker`) or prefix commands with `sg docker -c '…'`. `DATABASE_URL` remains an alternative that bypasses Docker entirely. |
@@ -248,6 +254,7 @@ Expected behavior:
   `TestPostgresMigrationsAreIdempotent`, and `TestPostgresDeleteCascadesVector` tests run and
   pass — proving `store.Postgres` satisfies the **same** `storetest.RunContract` and
   `storetest.RunBatchContract` as `store.Memory`.
+
 - **Phase 6 adds two more integration arms:** `TestPostgresVectorContract`
   (`internal/vector/postgres_test.go`) runs `vectortest.RunContract` against the pgvector
   adapter — the same suite `vector.Memory` passes — and `TestR2_MinIORoundTrip`
@@ -290,6 +297,24 @@ Expect **no** changes — the committed `internal/store/storedb/*.go` must match
 
 > Why it matters: checked-in generated code that drifts from its source is a silent
 > correctness hazard; CI doesn't currently regenerate, so this is a manual gate.
+
+### B7. Web SPA bootstrap package
+
+```sh
+cd web && npm ci
+cd web && npm test
+cd web && npm run build
+```
+
+Expected behavior:
+- `npm ci` installs exactly from `web/package-lock.json`.
+- Vitest reports the API client, token storage, and React bootstrap tests passing.
+- `npm run build` type-checks the app and Vite config, then writes a production build to
+  ignored `web/dist/`.
+
+> Why it matters: the web tracer bullet is intentionally isolated from the Go `Makefile` and
+> CI gates for this slice, so its package-level checks are the source of truth until later web
+> tooling work wires them into repo-level automation.
 
 ---
 
@@ -864,8 +889,8 @@ Phase 11 wires the production API process while keeping the behavior testable th
   passes clean.
 - [ ] **Startup config.** `internal/config.LoadEnv` requires all production env, validates
   Postgres URLs with `postgres://` or `postgresql://` and TLS `sslmode=require|verify-ca|verify-full`,
-  applies safe defaults for optional fetch/shutdown settings, and exposes only redacted safe
-  fields for logs.
+  applies safe defaults for optional fetch/shutdown settings, validates exact
+  `CORS_ALLOWED_ORIGINS` when configured, and exposes only redacted safe fields for logs.
 - [ ] **SSRF hardening.** `fetch.HTTP` rejects private and special-use literal, DNS-resolved, and
   redirect targets; disables environment proxies in production; and keeps custom HTTP clients
   guarded unless the explicit non-production test bypass is used.
@@ -885,6 +910,25 @@ Phase 11 wires the production API process while keeping the behavior testable th
 - [ ] **Graceful shutdown.** On cancellation or SIGTERM, runtime marks health degraded before
   `http.Server.Shutdown`, waits for accepted handlers up to `SHUTDOWN_TIMEOUT`, then cancels and
   drains dispatcher workers before closing the pool/resources.
+
+### C18. Web issue #25 — CORS-backed SPA bootstrap
+
+Issue #25 adds the first browser-facing tracer bullet while keeping the production deployment
+and fuller reading UI out of scope.
+
+- [ ] `go test ./internal/config ./internal/httpapi ./internal/readerapi` passes clean for the
+  backend CORS config, middleware, and runtime wiring.
+- [ ] `cd web && npm ci && npm test && npm run build` passes clean for the isolated SPA package.
+- [ ] **CORS config.** `CORS_ALLOWED_ORIGINS` is closed by default, rejects wildcard/path/query/
+  fragment/userinfo values, de-duplicates exact origins, and logs only
+  `cors_allowed_origin_count`.
+- [ ] **CORS transport behavior.** `/api/` responses with allowed origins get exact
+  `Access-Control-Allow-Origin` plus `Vary: Origin`; disallowed origins fail closed; preflight
+  runs before bearer auth; only `GET`/`POST` requests with `Authorization`/`Content-Type` headers
+  are accepted; credentialed CORS is not enabled.
+- [ ] **SPA bootstrap.** `web/` reads `VITE_READER_API_BASE_URL`, fetches `/api/healthz` without
+  sending bearer auth, validates health response shape before rendering, persists the bearer token
+  under `reading-lite.token`, and limits the UI to the health/token utility surface.
 
 ---
 
@@ -971,6 +1015,7 @@ skipped/blocked (write why).
 ### Environment
 - [ ] `command -v go gofmt golangci-lint sqlc` all resolve (PATH set in `~/.bashrc`)
 - [ ] `go version` is 1.26.x
+- [ ] `node --version && npm --version` resolve for the isolated `web/` package
 - [ ] `golangci-lint version` is v2.12.x
 - [ ] `sqlc version` is v1.31.x
 - [ ] Docker daemon reachable **or** `DATABASE_URL` set (else integration is `[~]`)
@@ -989,6 +1034,7 @@ skipped/blocked (write why).
 - [ ] B4 domain uncovered lines inspected and judged benign (if any finding reopens)
 - [ ] B5 `make test-integration` actually **ran** (not skipped) and passed
 - [ ] B6 `make sqlc` produces no `git` drift
+- [ ] B7 `cd web && npm ci && npm test && npm run build` passes
 
 ### C — Components
 - [ ] C1 Makefile / CI / go.mod / binary boundaries reviewed
@@ -1036,6 +1082,8 @@ skipped/blocked (write why).
   token-env auth, deploy/staging plans, default binary config errors
 - [ ] C17 Phase 11 runtime: env config validation/redaction, SSRF hardening, health schema,
   request logging, migrations and sweep gate serving, production adapters, graceful shutdown
+- [ ] C18 Web #25 bootstrap: exact-origin CORS config/runtime, isolated npm package, health
+  fetch/rendering, local token persistence, no auth on health requests
 
 ### D — Conventions
 - [ ] D1 no wall-clock/RNG/network in domain core + memory fake (fallback noted);
@@ -1051,7 +1099,7 @@ skipped/blocked (write why).
 - [ ] Limitations in §6 acknowledged
 - [ ] Any deviation from backend spec issue #31 recorded with rationale
 - [ ] C9 dispatcher behavior confirmed and harness `TestAcceptance_Dispatcher*` green
-- [ ] Overall verdict: Phases 0–11 **accept / reject** (record in §8 sign-off log)
+- [ ] Overall verdict: Phases 0–11 plus Web #25 **accept / reject** (record in §8 sign-off log)
 
 ---
 
