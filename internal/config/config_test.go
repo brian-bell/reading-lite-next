@@ -72,7 +72,7 @@ func TestLoadEnv_CORSAllowedOriginsDefaultsToNone(t *testing.T) {
 func TestLoadEnv_CORSAllowedOriginsParsesAllowlist(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS= HTTPS://APP.Example.com , http://localhost:5173, https://app.example.com, http://127.0.0.1:5173, https://app.example.com:443 "))
+	cfg, err := config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS= HTTPS://APP.Example.com , http://localhost:5173, https://app.example.com, http://127.0.0.1:5173, https://app.example.com:443, HTTP://APP.Example.com:80 "))
 	if err != nil {
 		t.Fatalf("LoadEnv: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestLoadEnv_CORSAllowedOriginsParsesAllowlist(t *testing.T) {
 		"https://app.example.com",
 		"http://localhost:5173",
 		"http://127.0.0.1:5173",
-		"https://app.example.com:443",
+		"http://app.example.com",
 	}
 	if !slices.Equal(cfg.CORSAllowedOrigins, want) {
 		t.Fatalf("CORSAllowedOrigins = %v, want %v", cfg.CORSAllowedOrigins, want)

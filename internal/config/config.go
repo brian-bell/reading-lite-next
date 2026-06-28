@@ -261,11 +261,34 @@ func parseCORSOrigin(raw string) (string, bool) {
 	if u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
 		return "", false
 	}
-	host := strings.ToLower(u.Host)
+	host := strings.ToLower(u.Hostname())
 	if strings.TrimSpace(host) == "" {
 		return "", false
 	}
-	return scheme + "://" + host, true
+	port := u.Port()
+	if port == "" && strings.Contains(u.Host, ":") && !(strings.HasPrefix(u.Host, "[") && strings.HasSuffix(u.Host, "]")) {
+		return "", false
+	}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+		if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+			port = ""
+		}
+	}
+	return scheme + "://" + originHost(host, port), true
+}
+
+func originHost(host, port string) string {
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 func requiredPositiveInt32(values map[string]string, name string, errs *fieldErrors) int32 {
