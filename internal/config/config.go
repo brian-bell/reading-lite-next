@@ -266,7 +266,7 @@ func parseCORSOrigin(raw string) (string, bool) {
 		return "", false
 	}
 	port := u.Port()
-	if port == "" && strings.Contains(u.Host, ":") && !(strings.HasPrefix(u.Host, "[") && strings.HasSuffix(u.Host, "]")) {
+	if port == "" && strings.Contains(u.Host, ":") && (!strings.HasPrefix(u.Host, "[") || !strings.HasSuffix(u.Host, "]")) {
 		return "", false
 	}
 	if port != "" {
