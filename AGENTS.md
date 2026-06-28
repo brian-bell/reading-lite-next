@@ -1,20 +1,23 @@
 # reading-lite
 
-`reading-lite` is a Go backend for a personal reading service. The codebase contains
-the reading domain core, persistence ports and adapters, an in-process dispatcher, the
-processing pipeline, real adapters for external services, extraction internals, an HTTP
-API package, and the command service that coordinates multi-resource workflows.
+`reading-lite` is a Go backend for a personal reading service with an isolated SPA bootstrap.
+The codebase contains the reading domain core, persistence ports and adapters, an in-process
+dispatcher, the processing pipeline, real adapters for external services, extraction
+internals, an HTTP API package, the command service that coordinates multi-resource workflows,
+and a separate Vite/React package under `web/`.
 
 The service can ingest URLs, import markdown and bookmark files, fetch and extract source
 content, store raw and processed blobs, embed and index readings for similarity, summarize
 readings, tag them, and optionally send notifications. The HTTP API is implemented and
 tested as a package. The production `cmd/reader-api` binary now validates env config, runs
 embedded store migrations, constructs production adapters, starts the dispatcher worker pool,
-runs startup recovery, serves HTTP, reports dependency health, and shuts down gracefully. The
-`cmd/readerctl` binary now delegates to the tested `internal/readerctl` command core, but
-stateful commands still need injected store/blob/vector/dispatcher dependencies; the default
-binary only supports Phase-10-safe smoke and dry-run deploy/staging planning without
-production config.
+runs startup recovery, serves HTTP, reports dependency health, handles exact-origin CORS for
+configured SPA origins, and shuts down gracefully. The `cmd/readerctl` binary now delegates to
+the tested `internal/readerctl` command core, but stateful commands still need injected
+store/blob/vector/dispatcher dependencies; the default binary only supports Phase-10-safe smoke
+and dry-run deploy/staging planning without production config. The current `web/` tracer
+bullet reads `VITE_READER_API_BASE_URL`, stores a bearer token in `localStorage`, and displays
+the Go API health document from `/api/healthz`.
 
 ## Structure
 
@@ -30,8 +33,9 @@ production config.
   status transitions, terminal-state checks, URL idempotency key normalization, source
   classification, and read-time stale annotation.
 - `internal/config/` defines the pure startup environment loader for `reader-api`: required
-  fields, safe defaults, strict Postgres TLS URL validation, positive tuning values, and
-  redacted logging fields.
+  fields, safe defaults, strict Postgres TLS URL validation, positive tuning values, exact
+  `CORS_ALLOWED_ORIGINS` parsing, and redacted logging fields. CORS origin values are never
+  logged; only the configured count is safe to log.
 - `internal/store/` defines the `Store` port, shared query/page DTOs, the manual
   `BatchStore` port, `store.Memory`, the pgx-backed `store.Postgres` adapter, embedded
   migrations, SQL query source for sqlc, and `storetest.RunContract`/`RunBatchContract` for
@@ -131,10 +135,11 @@ production config.
 - `internal/httpapi/` defines the JSON API as
   `httpapi.Server{Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID}` with one
   `Routes() http.Handler`. It uses the stdlib `http.ServeMux`, constant-time bearer-token
-  auth (health skips auth), bounded JSON decoding, opaque cursor encoding over `store.Cursor`,
-  dependency health JSON for Postgres/R2, request-id structured logging, and DTO mapping that
-  avoids exposing internal blob/url-key columns. Ingest, import, and reprocess handlers delegate
-  to `internal/readingops`. Tests drive it through `httptest`
+  auth (health skips auth), exact-origin CORS middleware for configured `/api/` browser
+  origins, bounded JSON decoding, opaque cursor encoding over `store.Cursor`, dependency health
+  JSON for Postgres/R2, request-id structured logging, and DTO mapping that avoids exposing
+  internal blob/url-key columns. Ingest, import, and reprocess handlers delegate to
+  `internal/readingops`. Tests drive it through `httptest`
   against `store.Memory`, `blobs.Memory`, a fake clock, and a submitter seam;
   `*dispatch.Dispatcher` satisfies that seam. `internal/httpapi/e2e_test.go` adds end-to-end
   HTTP coverage for URL ingest/read/content, similarity across two readings, failed-to-reprocess
@@ -142,7 +147,13 @@ production config.
   dispatcher and pipeline over in-memory backends and fake external ports.
 - `internal/readerapi/` defines the production API runtime: env-driven startup, pgx pool
   construction, embedded migrations, production adapter construction, worker lifecycle,
-  startup sweep, health checks, redacted startup logging, and graceful shutdown ordering.
+  startup sweep, health checks, CORS config propagation, redacted startup logging, and graceful
+  shutdown ordering.
+- `web/` is an isolated Vite/React/TypeScript package with its own `package.json` and
+  `package-lock.json`. It exposes scripts for `npm test`, `npm run build`, `npm run dev`, and
+  `npm run preview`. It currently implements only the SPA bootstrap utility: configured API
+  base URL resolution, unauthenticated health fetches, typed API errors, local bearer-token
+  persistence, and a focused health/status screen.
 - `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the project tooling and CI
   conventions.
 
@@ -172,6 +183,9 @@ The project targets Go 1.26.
 - `make migrate` is a reserved target that currently invokes unsupported `readerctl migrate`;
   production CLI migration wiring remains deferred to future readerctl dependency injection.
 - `make sqlc` runs `sqlc generate`.
+- `cd web && npm ci` installs the isolated SPA package from the committed lockfile.
+- `cd web && npm test` runs the Vitest suite for the SPA bootstrap.
+- `cd web && npm run build` runs TypeScript project checks and a Vite production build.
 
 ## Conventions
 
@@ -221,7 +235,8 @@ The project targets Go 1.26.
   `{ "error": { "code": "...", "message": "..." } }`. `readingops.Service.Reprocess` must use
   `store.Reprocess` to atomically clear content checkpoints before re-enqueueing so the
   pipeline does not reuse stale `content_key` data. Raw blob responses must not reflect upstream
-  executable content types; serve them as downloads with `nosniff`.
+  executable content types; serve them as downloads with `nosniff`. CORS stays closed by
+  default, exact-origin only when configured, and preflight handling must run before bearer auth.
 - Drive pipeline tests through an inline `dispatch.Dispatcher` (`Inline: true`) with a
   `dispatch.FakeDelayer`, so a test exercises real status transitions and asserts the
   pipeline's effects on the store/blobs/vector index and its scripted port fakes.
