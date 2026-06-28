@@ -90,4 +90,25 @@ describe('App', () => {
     expect(screen.getByLabelText('Bearer token')).toHaveValue('stored-token');
     expect(localStorage.getItem(TOKEN_STORAGE_KEY)).toBe('stored-token');
   });
+
+  it('renders malformed health documents as an error', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('API response was not a health document')).toBeInTheDocument();
+  });
+
+  it('renders malformed health check values as an error', async () => {
+    const malformedHealth = {
+      status: 'ok',
+      build: { version: 'dev', commit: 'abc123', date: '2026-06-28' },
+      checks: { postgres: null },
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(malformedHealth), { status: 200 }));
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('API response was not a health document')).toBeInTheDocument();
+  });
 });

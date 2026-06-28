@@ -76,4 +76,31 @@ describe('createAPIClient', () => {
       status: 502,
     });
   });
+
+  it('rejects successful responses that are not health documents', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.health()).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a health document',
+      status: 200,
+    });
+  });
+
+  it('rejects successful health documents with malformed check values', async () => {
+    const malformedHealth = {
+      status: 'ok',
+      build: { version: 'dev', commit: 'abc123', date: '2026-06-28' },
+      checks: { postgres: null },
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(malformedHealth), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.health()).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a health document',
+      status: 200,
+    });
+  });
 });

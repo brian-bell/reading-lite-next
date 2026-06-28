@@ -65,7 +65,7 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
       if (!response.ok) {
         throw errorFromBody(response, body);
       }
-      return body as HealthDocument;
+      throw new APIError('invalid_response', 'API response was not a health document', response.status);
     },
   };
 }
@@ -88,10 +88,25 @@ function isHealthDocument(body: unknown): body is HealthDocument {
     typeof body.build.version === 'string' &&
     typeof body.build.commit === 'string' &&
     typeof body.build.date === 'string' &&
-    isRecord(body.checks)
+    isHealthChecks(body.checks)
   );
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === 'object' && value !== null;
+function isHealthChecks(value: unknown): value is HealthDocument['checks'] {
+  if (!isRecord(value)) {
+    return false;
+  }
+  for (const check of Object.values(value)) {
+    if (!isRecord(check) || typeof check.status !== 'string') {
+      return false;
+    }
+    if ('error' in check && typeof check.error !== 'string') {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
