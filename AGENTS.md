@@ -1,150 +1,52 @@
 # reading-lite
 
-`reading-lite` is a Go backend for a personal reading service. The codebase contains
-the reading domain core, persistence ports and adapters, an in-process dispatcher, the
-processing pipeline, real adapters for external services, extraction internals, an HTTP
-API package, and the command service that coordinates multi-resource workflows.
+`reading-lite` is a Go backend for a personal reading service with an isolated SPA bootstrap
+under `web/`. It ingests URLs and imports markdown/bookmark files, fetches and extracts source
+content, stores raw and processed blobs, embeds and indexes readings for similarity, summarizes
+readings, tags them, and can send notifications.
 
-The service can ingest URLs, import markdown and bookmark files, fetch and extract source
-content, store raw and processed blobs, embed and index readings for similarity, summarize
-readings, tag them, and optionally send notifications. The HTTP API is implemented and
-tested as a package. The production `cmd/reader-api` binary now validates env config, runs
-embedded store migrations, constructs production adapters, starts the dispatcher worker pool,
-runs startup recovery, serves HTTP, reports dependency health, and shuts down gracefully. The
-`cmd/readerctl` binary now delegates to the tested `internal/readerctl` command core, but
-stateful commands still need injected store/blob/vector/dispatcher dependencies; the default
-binary only supports Phase-10-safe smoke and dry-run deploy/staging planning without
-production config.
+The production `cmd/reader-api` binary validates env config, runs embedded store migrations,
+wires production adapters, starts dispatcher workers, runs startup recovery, serves the HTTP
+API, reports dependency health, handles exact-origin CORS for configured SPA origins, and shuts
+down gracefully. `cmd/readerctl` delegates to the tested `internal/readerctl` command core, but
+stateful default-binary dependency wiring is still deferred. The current `web/` tracer bullet
+reads `VITE_READER_API_BASE_URL`, stores a bearer token in `localStorage`, and displays
+`/api/healthz`.
 
 ## Structure
 
-- `cmd/reader-api/` contains the API process entrypoint. It delegates to
-  `internal/readerapi.Main`, which loads env config, runs migrations, wires production
-  adapters, starts workers, serves HTTP, and handles graceful shutdown.
-- `cmd/readerctl/` contains the operator CLI entrypoint. It delegates to
-  `internal/readerctl.Main`; production dependency construction is still deferred to
-  future readerctl wiring.
-- `internal/clock/` defines the clock port, real system clock, and mutex-protected fake clock
-  used by concurrent tests.
-- `internal/reading/` defines the pure domain core: reading lifecycle statuses, explicit
-  status transitions, terminal-state checks, URL idempotency key normalization, source
-  classification, and read-time stale annotation.
-- `internal/config/` defines the pure startup environment loader for `reader-api`: required
-  fields, safe defaults, strict Postgres TLS URL validation, positive tuning values, and
-  redacted logging fields.
-- `internal/store/` defines the `Store` port, shared query/page DTOs, the manual
-  `BatchStore` port, `store.Memory`, the pgx-backed `store.Postgres` adapter, embedded
-  migrations, SQL query source for sqlc, and `storetest.RunContract`/`RunBatchContract` for
-  backend-neutral behavior checks. `UpdateStatus` advances the lifecycle; `UpdateContent`
-  overwrites the processed-content columns
-  (title/summary/keys and the `summary_json`/`similar_json`/`diagnostics_json` blobs) the
-  pipeline produces, leaving status, timestamps, error, attempts, and tags alone.
-  `UpdateImport` replaces a failed reading's source metadata with a markdown import under the
-  same stable id while clearing derived content. `Reprocess` atomically clears derived content
-  and marks a row pending for manual reprocessing. `BatchStore` is independent of reading
-  lifecycle state: it persists planned manual Anthropic batches, item `custom_id` lookup,
-  remote ids/counts, state transitions, idempotent result writes, applied-item markers, and a
-  partial active-item uniqueness guard per reading.
-- `internal/dispatch/` defines the in-process dispatcher: the pure retry-decision function
-  and error classifier (`decide`/`Classify`, with `RateLimitError`/`ErrPermanent`), an
-  injectable delay seam (`Delayer` with a real timer and a fireable fake), a worker pool that
-  drains an in-memory channel and persists each run's lifecycle outcome, and a startup
-  `Sweep` that re-dispatches readings left non-terminal by a crash, resuming each at its
-  stored attempt count. It also exposes a forced-recovery seam
-  (`ForceSubmit`/`ForceSubmitAfter`) for operator reprocess of stale in-flight work: it
-  cancels and token-replaces the in-process claim, waits for the stale handler to drain,
-  bounds that wait with `ForceWaitTTL` through the `Delay` seam, then runs the caller's reset
-  and re-enqueues. Correctness against late stale writes rests on the store
-  `ExpectedStartedAt` fence and run-scoped blob keys, not on the wait.
+- `cmd/reader-api/` and `internal/readerapi/` are the production API runtime: env loading,
+  migrations, adapter construction, dispatcher workers, startup sweep, health checks, HTTP
+  serving, and graceful shutdown.
+- `cmd/readerctl/` and `internal/readerctl/` are the operator CLI entrypoint and tested command
+  core. The default binary still does not construct production store/blob/vector/dispatcher
+  dependencies for stateful commands.
+- `internal/reading/` and `internal/clock/` are the dependency-light domain core and time seam:
+  reading lifecycle, URL keys, source classification, stale overlays, and deterministic clocks.
+- `internal/store/`, `internal/blobs/`, and `internal/vector/` define persistence ports,
+  in-memory implementations, production adapters, migrations/sqlc output, and backend-neutral
+  contract suites. Postgres/pgvector/R2 integration stays behind `//go:build integration`.
+- `internal/dispatch/` owns retry classification, pure retry/backoff decisions, delayed
+  requeueing, worker lifecycle, crash sweep, and forced stale-work recovery.
 - `internal/fetch/`, `internal/extract/`, `internal/embed/`, `internal/summarize/`, and
-  `internal/notify/` define the external-service ports (`Fetcher`, `Extractor`, `Embedder`,
-  `Summarizer`, `Notifier`) and a concurrency-safe, scriptable in-memory `Fake` for each.
-  `extract` consumes a `fetch.Resource`. Each package also ships its real adapter:
-  `fetch.HTTP` (user agent, timeout, body-size cap, redirect tracking to `FinalURL`,
-  non-http(s) scheme rejection, private/special-use address SSRF blocking for literal,
-  DNS-resolved, and redirect targets, environment proxy disabling, and a 429 to
-  `dispatch.RateLimitError` requeue),
-  `embed.OpenAI` (`/v1/embeddings`, `text-embedding-3-small`),
-  `summarize.Anthropic` (Messages API with forced `emit_reading` tool use, plus a Message
-  Batches client for create/get/results and JSONL result parsing), and `notify.Resend`
-  (`/emails`). The HTTP adapters take `WithBaseURL` and `WithHTTPClient` options so contract
-  tests can point them at `httptest` upstreams, and classify upstream failures through
-  `internal/httpx`. `fetch.HTTP` exposes an explicit private-network bypass only for
-  non-production tests.
-- `internal/extract/` also holds the extraction internals. `extract.Readability` is the
-  production `Extractor`: a three-tier salvage ladder over fetched HTML: `readability`
-  (go-readability when the page is readerable, then html-to-markdown), `raw_dom` (whole-DOM
-  markdown salvage when it is not), and the `raw_only` floor (every text node, including
-  script/style text, collected from the parsed body; a contentless body fails extraction
-  permanently). Each tier carries the matching `extract.Mode`. The ladder ordering and the
-  sufficiency gate live in the pure, white-box-tested `selectTier`/`sufficient` helpers, kept
-  separate from the HTML libraries; the tiers are pinned by HTML fixtures and golden markdown
-  in `internal/extract/testdata/` (regenerate with
-  `go test ./internal/extract -run TestReadability -update`). `extract.YouTube` is a separate
-  oEmbed client, not an `Extractor`, since it takes a video URL and makes its own requests. It
-  fetches the title/author floor from `/oembed`, folds in a best-effort `/api/timedtext`
-  transcript, reports `ModeRawOnly`, and classifies oEmbed failures through `internal/httpx`.
-  `extract.RedditGuidance` is the canonical operator-facing message for the unfetchable Reddit
-  source; the pipeline reuses it.
-- `internal/httpx/` holds helpers shared by the HTTP service adapters: `ClassifyResponse` maps
-  a non-2xx response to a dispatcher-classified error (429 to `dispatch.RateLimitError`
-  honoring `Retry-After`, other 4xx to `dispatch.ErrPermanent`, 5xx to transient), and
-  `RetryAfter` parses the header. This keeps `embed.OpenAI`, `summarize.Anthropic`, and
-  `extract.YouTube` oEmbed error semantics identical to `dispatch.Classify`.
-- `internal/blobs/` defines the `Blobs` content-blob port, `blobs.Memory` (in-memory), and
-  `blobs.R2`, the production S3-compatible adapter (aws-sdk-go-v2, path-style, custom
-  endpoint; maps a missing key to `blobs.ErrNotFound`; health probes distinguish a typed
-  missing key from a missing bucket). `R2` is exercised by an `httptest` S3 stub on every run
-  and a MinIO container under `//go:build integration`.
-- `internal/vector/` defines the `Index` similarity port, `vector.Memory` (a real
-  cosine-similarity index), `vector.Postgres` (the pgvector adapter over `reading_vectors`,
-  ranking by cosine distance via `<=>`), and `vectortest.RunContract`, the backend-neutral
-  suite both backends satisfy (`vector.Memory` on every run, `vector.Postgres` under
-  `//go:build integration`).
-- `internal/pipeline/` defines the processing pipeline. `Pipeline.Process` is the dispatcher's
-  `Handler`: it loads a reading, acquires content (markdown imports read the stored body;
-  Reddit fails permanently with `extract.RedditGuidance`; YouTube uses the oEmbed/timed-text
-  adapter; everything else fetches and extracts), embeds, snapshots similar readings, persists a guarded content checkpoint,
-  upserts a vector, summarizes once, optionally notifies, and persists the content via
-  `store.UpdateContent` plus `ReplaceTags`. It returns a `dispatch.Result`; the dispatcher owns
-  lifecycle status, and the pipeline owns content. Re-entry is idempotent: a persisted
-  `content_key` checkpoint lets a retried run skip fetch/extract and resume near summarize; it
-  may re-embed to recover a vector upsert after the guarded checkpoint. Blob keys are derived
-  from the server-side reading id and dispatcher run timestamp. Diagnostics include
-  `timings_ms` for durable pipeline stages such as acquire, index, summarize, and notify.
-- `internal/readingops/` defines the application command service for multi-resource HTTP
-  workflows: URL ingest, markdown import and failed-reading replacement, bookmark import, and
-  manual reprocess. It owns sequencing across `store.Store`, `blobs.Blobs`, and the dispatcher,
-  including stale pending/running force requeue, markdown raw-blob staging/cleanup, and
-  `store.Reprocess` checkpoint clearing.
-- `internal/bookmarks/` defines the shared bookmark import parser used by HTTP and
-  `readerctl`: Netscape/HTML links, JSON arrays of `{ "url": ... }`, and JSON objects with
-  `bookmarks` plus optional `html`, preserving order and duplicate URLs.
-- `internal/readerctl/` defines the tested operator command core. It supports URL/markdown/
-  bookmark imports through `readingops.Service`, audit reports with stale/missing-blob and
-  optional orphan inventory checks, recover dry-runs/apply through `readingops.Reprocess`,
-  destructive drop dry-runs/apply over store/blob/vector dependencies, smoke checks against a
-  running API (`--token` or `--token-env`), and deploy/staging structured plans behind a
-  `Runner` seam. Deploy and staging up/promote require `--smoke-token-env` so generated smoke
-  steps can authenticate without printing a secret. Default `readerctl.Main` intentionally
-  constructs no store/blob/vector/dispatcher dependencies.
-- `internal/httpapi/` defines the JSON API as
-  `httpapi.Server{Store, Dispatcher, Blobs, Clock, Token, TTLs, NewID}` with one
-  `Routes() http.Handler`. It uses the stdlib `http.ServeMux`, constant-time bearer-token
-  auth (health skips auth), bounded JSON decoding, opaque cursor encoding over `store.Cursor`,
-  dependency health JSON for Postgres/R2, request-id structured logging, and DTO mapping that
-  avoids exposing internal blob/url-key columns. Ingest, import, and reprocess handlers delegate
-  to `internal/readingops`. Tests drive it through `httptest`
-  against `store.Memory`, `blobs.Memory`, a fake clock, and a submitter seam;
-  `*dispatch.Dispatcher` satisfies that seam. `internal/httpapi/e2e_test.go` adds end-to-end
-  HTTP coverage for URL ingest/read/content, similarity across two readings, failed-to-reprocess
-  flows, retry exhaustion, rate-limit requeue, and restart recovery, all with the real
-  dispatcher and pipeline over in-memory backends and fake external ports.
-- `internal/readerapi/` defines the production API runtime: env-driven startup, pgx pool
-  construction, embedded migrations, production adapter construction, worker lifecycle,
-  startup sweep, health checks, redacted startup logging, and graceful shutdown ordering.
-- `.github/workflows/ci.yml`, `Makefile`, and `.golangci.yml` define the project tooling and CI
-  conventions.
+  `internal/notify/` define external-service ports, race-safe scriptable fakes, and real HTTP
+  adapters. Shared non-2xx classification lives in `internal/httpx/`.
+- `internal/extract/` also contains extraction internals: readability/raw DOM/raw-only HTML
+  salvage, YouTube oEmbed/timed-text support, and the canonical Reddit guidance string.
+- `internal/pipeline/` is the dispatcher handler. It acquires source content, embeds, snapshots
+  similar readings, checkpoints processed content, summarizes, optionally notifies, and persists
+  content/tags while leaving lifecycle status to the dispatcher.
+- `internal/readingops/` coordinates multi-resource workflows for HTTP and CLI: URL ingest,
+  markdown import/replacement, bookmark import, and manual reprocess.
+- `internal/httpapi/` is the JSON API transport: auth, exact-origin CORS, bounded JSON,
+  health/dependency checks, DTO mapping, cursor encoding, blob streaming, and delegation to
+  `readingops`.
+- `internal/bookmarks/` is the shared bookmark parser for HTTP and `readerctl`.
+- `web/` is the isolated Vite/React/TypeScript SPA package. It currently implements only the
+  bootstrap utility: configured API base URL, unauthenticated health fetches, typed API errors,
+  local bearer-token persistence, and a focused health/status screen.
+- `.github/workflows/ci.yml`, `Makefile`, `.golangci.yml`, `sqlc.yaml`, and `go.mod` define the
+  project tooling and generated-code conventions.
 
 ## Commands
 
@@ -172,6 +74,9 @@ The project targets Go 1.26.
 - `make migrate` is a reserved target that currently invokes unsupported `readerctl migrate`;
   production CLI migration wiring remains deferred to future readerctl dependency injection.
 - `make sqlc` runs `sqlc generate`.
+- `cd web && npm ci` installs the isolated SPA package from the committed lockfile.
+- `cd web && npm test` runs the Vitest suite for the SPA bootstrap.
+- `cd web && npm run build` runs TypeScript project checks and a Vite production build.
 
 ## Conventions
 
@@ -221,7 +126,8 @@ The project targets Go 1.26.
   `{ "error": { "code": "...", "message": "..." } }`. `readingops.Service.Reprocess` must use
   `store.Reprocess` to atomically clear content checkpoints before re-enqueueing so the
   pipeline does not reuse stale `content_key` data. Raw blob responses must not reflect upstream
-  executable content types; serve them as downloads with `nosniff`.
+  executable content types; serve them as downloads with `nosniff`. CORS stays closed by
+  default, exact-origin only when configured, and preflight handling must run before bearer auth.
 - Drive pipeline tests through an inline `dispatch.Dispatcher` (`Inline: true`) with a
   `dispatch.FakeDelayer`, so a test exercises real status transitions and asserts the
   pipeline's effects on the store/blobs/vector index and its scripted port fakes.

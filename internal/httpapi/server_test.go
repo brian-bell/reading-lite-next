@@ -78,7 +78,36 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
+func newCORSHarness(t *testing.T, origins []string) *harness {
+	t.Helper()
+
+	h := newHarness(t)
+	srv := &httpapi.Server{
+		Store:      h.store,
+		Blobs:      h.blobs,
+		Dispatcher: h.submitter,
+		Clock:      h.clock,
+		Token:      "secret-token",
+		TTLs: reading.TTLs{
+			Pending: 5 * time.Minute,
+			Running: 5 * time.Minute,
+		},
+		NewID: func() string {
+			h.nextID++
+			return "r" + string(rune('0'+h.nextID))
+		},
+		CORSAllowedOrigins: origins,
+	}
+	h.handler = srv.Routes()
+	return h
+}
+
 func (h *harness) request(t *testing.T, method, path string, body any, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	return h.requestWithHeaders(t, method, path, body, token, nil)
+}
+
+func (h *harness) requestWithHeaders(t *testing.T, method, path string, body any, token string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var rbody *bytes.Reader
@@ -97,6 +126,9 @@ func (h *harness) request(t *testing.T, method, path string, body any, token str
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
 	}
 	rr := httptest.NewRecorder()
 	h.handler.ServeHTTP(rr, req)
@@ -129,6 +161,17 @@ func decodeJSON[T any](t *testing.T, rr *httptest.ResponseRecorder) T {
 		t.Fatalf("decode response %q: %v", rr.Body.String(), err)
 	}
 	return out
+}
+
+func headerContainsToken(header http.Header, name, token string) bool {
+	for _, value := range header.Values(name) {
+		for part := range strings.SplitSeq(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func seedReading(t *testing.T, h *harness, r reading.Reading) reading.Reading {
@@ -382,6 +425,209 @@ func TestHealthz_DegradedSkipsDependencyChecks(t *testing.T) {
 	}
 	if postgresCalled || r2Called {
 		t.Fatalf("dependency probes called while degraded: postgres=%v r2=%v", postgresCalled, r2Called)
+	}
+}
+
+func TestCORS_AllowedOriginGetsHeaders(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	rr := h.requestWithHeaders(t, http.MethodGet, "/api/healthz", nil, "", map[string]string{
+		"Origin": "https://app.example.com",
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("allow-origin = %q, want exact origin", got)
+	}
+	if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+		t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("allow-credentials = %q, want unset", got)
+	}
+}
+
+func TestCORS_AllowedOriginDecoratesDelegatedJSONErrors(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	rr := h.requestWithHeaders(t, http.MethodGet, "/api/does-not-exist", nil, "secret-token", map[string]string{
+		"Origin": "https://app.example.com",
+	})
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("allow-origin = %q, want exact origin", got)
+	}
+	if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+		t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
+	}
+	got := decodeJSON[struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}](t, rr)
+	if got.Error.Code != "not_found" {
+		t.Fatalf("error code = %q, want not_found", got.Error.Code)
+	}
+}
+
+func TestCORS_DisallowedActualOriginForbidden(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	rr := h.requestWithHeaders(t, http.MethodGet, "/api/healthz", nil, "", map[string]string{
+		"Origin": "https://evil.example.com",
+	})
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("allow-origin = %q, want unset", got)
+	}
+	if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+		t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
+	}
+}
+
+func TestCORS_PreflightAllowedProtectedRouteSkipsAuth(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	rr := h.requestWithHeaders(t, http.MethodOptions, "/api/readings", nil, "", map[string]string{
+		"Origin":                         "https://app.example.com",
+		"Access-Control-Request-Method":  http.MethodGet,
+		"Access-Control-Request-Headers": "Authorization, Content-Type",
+	})
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("allow-origin = %q, want exact origin", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
+		t.Fatalf("allow-methods = %q, want GET, POST, OPTIONS", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type" {
+		t.Fatalf("allow-headers = %q, want Authorization, Content-Type", got)
+	}
+	if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+		t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
+	}
+}
+
+func TestCORS_PreflightRejectsDisallowedOrUnsupportedRequests(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		origin  string
+		method  string
+		headers string
+	}{
+		{
+			name:    "disallowed origin",
+			origin:  "https://evil.example.com",
+			method:  http.MethodGet,
+			headers: "Authorization",
+		},
+		{
+			name:    "unsupported method",
+			origin:  "https://app.example.com",
+			method:  http.MethodDelete,
+			headers: "Authorization",
+		},
+		{
+			name:    "unsupported header",
+			origin:  "https://app.example.com",
+			method:  http.MethodPost,
+			headers: "X-Reader",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newCORSHarness(t, []string{"https://app.example.com"})
+			rr := h.requestWithHeaders(t, http.MethodOptions, "/api/readings", nil, "", map[string]string{
+				"Origin":                         tc.origin,
+				"Access-Control-Request-Method":  tc.method,
+				"Access-Control-Request-Headers": tc.headers,
+			})
+
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+				t.Fatalf("allow-origin = %q, want unset", got)
+			}
+			if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+				t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
+			}
+		})
+	}
+}
+
+func TestCORS_NonCORSOptionsAndNonAPIPathsUseNormalRouting(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	optionsAPI := h.requestWithHeaders(t, http.MethodOptions, "/api/readings", nil, "secret-token", map[string]string{
+		"Origin": "https://app.example.com",
+	})
+	if optionsAPI.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("API OPTIONS status = %d, want 405; body=%s", optionsAPI.Code, optionsAPI.Body.String())
+	}
+	apiErr := decodeJSON[struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}](t, optionsAPI)
+	if apiErr.Error.Code != "method_not_allowed" {
+		t.Fatalf("API OPTIONS error code = %q, want method_not_allowed", apiErr.Error.Code)
+	}
+
+	nonAPI := h.requestWithHeaders(t, http.MethodOptions, "/not-api", nil, "secret-token", map[string]string{
+		"Origin": "https://app.example.com",
+	})
+	if nonAPI.Code != http.StatusNotFound {
+		t.Fatalf("non-API status = %d, want 404; body=%s", nonAPI.Code, nonAPI.Body.String())
+	}
+	if got := nonAPI.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("non-API allow-origin = %q, want unset", got)
+	}
+	nonAPIErr := decodeJSON[struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}](t, nonAPI)
+	if nonAPIErr.Error.Code != "not_found" {
+		t.Fatalf("non-API error code = %q, want not_found", nonAPIErr.Error.Code)
+	}
+}
+
+func TestCORS_ProtectedRouteUnauthorizedIncludesAllowedOrigin(t *testing.T) {
+	t.Parallel()
+
+	h := newCORSHarness(t, []string{"https://app.example.com"})
+	rr := h.requestWithHeaders(t, http.MethodGet, "/api/readings", nil, "", map[string]string{
+		"Origin": "https://app.example.com",
+	})
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("allow-origin = %q, want exact origin", got)
+	}
+	if !headerContainsToken(rr.Header(), "Vary", "Origin") {
+		t.Fatalf("Vary = %q, want Origin", rr.Header().Values("Vary"))
 	}
 }
 

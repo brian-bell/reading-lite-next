@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,76 @@ func TestLoadEnv_MinimalValidConfigWithDefaults(t *testing.T) {
 	}
 	if cfg.Notify.From != "reader@example.com" || cfg.Notify.To != "me@example.com" {
 		t.Fatalf("notify = %q/%q, want configured addresses", cfg.Notify.From, cfg.Notify.To)
+	}
+}
+
+func TestLoadEnv_CORSAllowedOriginsDefaultsToNone(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadEnv(validEnv())
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+	if len(cfg.CORSAllowedOrigins) != 0 {
+		t.Fatalf("CORSAllowedOrigins = %v, want none", cfg.CORSAllowedOrigins)
+	}
+
+	cfg, err = config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS= \t "))
+	if err != nil {
+		t.Fatalf("LoadEnv with blank CORS_ALLOWED_ORIGINS: %v", err)
+	}
+	if len(cfg.CORSAllowedOrigins) != 0 {
+		t.Fatalf("blank CORSAllowedOrigins = %v, want none", cfg.CORSAllowedOrigins)
+	}
+}
+
+func TestLoadEnv_CORSAllowedOriginsParsesAllowlist(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS= HTTPS://APP.Example.com , http://localhost:5173, https://app.example.com, http://127.0.0.1:5173, https://app.example.com:443, HTTP://APP.Example.com:80 "))
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+	want := []string{
+		"https://app.example.com",
+		"http://localhost:5173",
+		"http://127.0.0.1:5173",
+		"http://app.example.com",
+	}
+	if !slices.Equal(cfg.CORSAllowedOrigins, want) {
+		t.Fatalf("CORSAllowedOrigins = %v, want %v", cfg.CORSAllowedOrigins, want)
+	}
+}
+
+func TestLoadEnv_CORSAllowedOriginsRejectsUnsafeValuesWithoutLeaks(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"wildcard", "*"},
+		{"invalid URL", "://not-a-url"},
+		{"ftp", "ftp://app.example.com"},
+		{"userinfo", "https://user@app.example.com"},
+		{"path", "https://app.example.com/path"},
+		{"query", "https://app.example.com?x=1"},
+		{"fragment", "https://app.example.com#x"},
+		{"doubled comma", "https://app.example.com,,https://other.example.com"},
+		{"trailing comma", "https://app.example.com,"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS=" + tc.raw))
+			if err == nil {
+				t.Fatal("LoadEnv = nil error, want invalid CORS_ALLOWED_ORIGINS")
+			}
+			if !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+				t.Fatalf("error = %q, want CORS_ALLOWED_ORIGINS named", err)
+			}
+			if strings.Contains(err.Error(), tc.raw) {
+				t.Fatalf("error = %q leaked raw CORS value %q", err, tc.raw)
+			}
+		})
 	}
 }
 
@@ -200,6 +271,24 @@ func TestConfig_SafeFieldsExcludeSecrets(t *testing.T) {
 	for _, want := range []string{"listen_addr", "worker_concurrency", "pg_max_conns", "r2_bucket", "notify_from"} {
 		if !strings.Contains(logValue, want) {
 			t.Fatalf("LogValue %q missing operational field %s", logValue, want)
+		}
+	}
+}
+
+func TestConfig_SafeFieldsLogsCORSCountOnly(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadEnv(validEnv("CORS_ALLOWED_ORIGINS=https://app.example.com,http://localhost:5173"))
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+	logValue := config.LogValue(cfg)
+	if !strings.Contains(logValue, `"cors_allowed_origin_count":2`) {
+		t.Fatalf("LogValue = %q, want CORS origin count", logValue)
+	}
+	for _, forbidden := range []string{"https://app.example.com", "http://localhost:5173"} {
+		if strings.Contains(logValue, forbidden) {
+			t.Fatalf("LogValue leaked CORS origin %q in %q", forbidden, logValue)
 		}
 	}
 }
