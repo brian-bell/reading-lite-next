@@ -1316,7 +1316,9 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		`"$(WEB_DIST_DIR)"`,
 		`*://*`,
 		`tr '[:upper:]' '[:lower:]'`,
-		`localhost|127.0.0.1|\[::1\]`,
+		`localhost|\[::1\]`,
+		`127.*`,
+		`tr -d '0-9.'`,
 		"WEB_API_BASE_URL must use https",
 	} {
 		if !strings.Contains(deployWeb, want) {
@@ -1366,6 +1368,11 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"HTTP://LOCALHOST",
 		"http://127.0.0.1",
 		"http://127.0.0.1?x=1",
+		"https://127.0.0.2",
+		"https://127.1",
+		"https://127.1?x=1",
+		"https://127.0.1.1",
+		"https://127.255.255.255",
 		"http://[::1]",
 		"http://[::1]?x=1",
 	} {
@@ -1419,6 +1426,32 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 			}
 			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
 				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Hostnames that merely start with "127." but are not numeric IPv4
+	// addresses (e.g. real DNS names) must not be rejected as loopback.
+	for _, apiBase := range []string{
+		"https://127.example.com",
+		"https://127.0.0.1.example.com",
+	} {
+		t.Run("accept non-loopback apply "+apiBase, func(t *testing.T) {
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err != nil {
+				t.Fatalf("make deploy-web with %s unexpectedly failed:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
+				t.Fatalf("make deploy-web with %s wrongly rejected as loopback:\n%s", apiBase, out)
 			}
 		})
 	}

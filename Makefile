@@ -74,7 +74,11 @@ deploy-web:
 		esac; \
 		host="$$(printf '%s' "$$host" | tr '[:upper:]' '[:lower:]')"; \
 		case "$$host" in \
-			localhost|127.0.0.1|\[::1\]) printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
+			localhost|\[::1\]) printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
+			127.*) \
+				if [ -z "$$(printf '%s' "$$host" | tr -d '0-9.')" ]; then \
+					printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2; \
+				fi ;; \
 		esac; \
 		scheme="$${api_base%%://*}"; \
 		scheme="$$(printf '%s' "$$scheme" | tr '[:upper:]' '[:lower:]')"; \
