@@ -44,13 +44,13 @@ make build
 make verify
 ```
 
-The web package is intentionally not wired into the Go `Makefile` targets yet. Run its checks
-from `web/`:
+The web package has repo-level convenience targets plus the package-local npm scripts:
 
 ```sh
 cd web && npm ci
-cd web && npm test
-cd web && npm run build
+make web-test
+make web-build
+make web-dev WEB_API_BASE_URL=http://127.0.0.1:8080
 ```
 
 `make verify` runs the blackbox verification harness in `internal/acceptance/` with the
@@ -88,3 +88,70 @@ Smoke can authenticate with `--token` or `--token-env`; deploy/staging smoke pla
 `import`, `audit`, `recover`, and `drop` are tested in `internal/readerctl` with injected
 dependencies; the default binary still refuses them until production dependency construction is
 added there.
+
+## Cloudflare Pages + Tunnel Runbook
+
+This operator path runs the Vite SPA on Cloudflare Pages while keeping `reader-api` bound to the
+local host and reachable through a stable named Cloudflare Tunnel.
+
+API runtime setup:
+
+- Run `reader-api` with `LISTEN_ADDR=127.0.0.1:8080` so it only accepts local connections.
+- Set `CORS_ALLOWED_ORIGINS` to the exact Pages origins that browsers will use. Include the
+  production Pages/custom origin and every preview origin you intend to test, for example
+  `https://reading-lite.pages.dev,https://<preview>.reading-lite.pages.dev`. Origins must not
+  include wildcards, paths, query strings, fragments, or trailing slashes.
+
+Named tunnel routing:
+
+- Create or reuse a stable named tunnel, then route a hostname such as `api.example.com` to it:
+  `cloudflared tunnel route dns <tunnel-name> api.example.com`.
+- Use tunnel ingress that forwards the hostname to the locally bound API:
+
+```yaml
+ingress:
+  - hostname: api.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+```
+
+Pages build settings:
+
+- Project root: `web`
+- Build command when the Pages project root is `web`: `npm ci && npm run build`
+- Build output directory: `dist`
+- Environment variable for production and preview builds:
+  `VITE_READER_API_BASE_URL=https://api.example.com`
+
+Local and deploy commands:
+
+```sh
+make web-test
+make web-build
+make web-dev WEB_API_BASE_URL=https://api.example.com
+make deploy-web
+make deploy-web CLOUDFLARE_PAGES_PROJECT=reading-lite
+make deploy-web CLOUDFLARE_PAGES_PROJECT=reading-lite DEPLOY_WEB_APPLY=1
+```
+
+`make deploy-web` runs `web-build` first and is dry-run-only unless `DEPLOY_WEB_APPLY=1` is set.
+The dry run prints the non-secret Wrangler command. The apply path requires
+`CLOUDFLARE_PAGES_PROJECT`; Wrangler uses its normal login state or `CLOUDFLARE_API_TOKEN` from
+the environment. The target does not print token values. `WRANGLER` defaults to `npx wrangler`,
+which may install or use Wrangler outside the repo lockfile.
+
+Secret-safe smoke:
+
+- Keep bearer tokens in environment variables or interactive browser input. Do not put tokens in
+  command history, screenshots, or logs.
+- Current CLI tunnel smoke:
+
+```sh
+readerctl smoke --base-url https://api.example.com --ingest-url https://example.com --token-env READER_API_TOKEN
+```
+
+This validates health plus authenticated submit/ingest through the tunnel.
+
+- Future browser smoke, once list/detail/submit UI slices exist: open the Pages origin, paste the
+  token only in the SPA token control, submit a reading, verify it appears in the list, open the
+  detail view, and confirm browser network requests use the tunnel API hostname.

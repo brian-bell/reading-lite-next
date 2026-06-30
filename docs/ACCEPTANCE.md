@@ -52,8 +52,8 @@
 > judgment call in B3/B4 and production smoke checks against real external services. `make test-integration`
 > remains a separate, dedicated path for the store↔Postgres, `vector.Postgres`, and
 > `blobs.R2` (MinIO) integration suites. The isolated `web/` SPA bootstrap is verified by its
-> own npm commands (`npm ci`, `npm test`, `npm run build`) rather than `make verify`. Each
-> automated backend test names the plan section it covers.
+> own npm commands plus repo-level `make web-test` / `make web-build` convenience targets, rather
+> than `make verify`. Each automated backend test names the plan section it covers.
 
 ## 0. Scope
 
@@ -113,6 +113,7 @@ Vite/React health-check SPA under `web/`:
 | Shared bookmark import parser | `internal/bookmarks/bookmarks.go` | 10 |
 | Operator command core and entrypoint | `internal/readerctl/readerctl.go`, `cmd/readerctl/main.go` | 10 |
 | CORS-backed SPA bootstrap | `web/`, `internal/config/config.go`, `internal/httpapi/server.go`, `internal/readerapi/runtime.go` | Web #25 |
+| Cloudflare Pages + Tunnel runbook | `README.md`, `Makefile`, `internal/acceptance/harness_test.go` | Web #27 |
 
 ### Out of scope (do not expect these to work yet)
 
@@ -302,19 +303,18 @@ Expect **no** changes — the committed `internal/store/storedb/*.go` must match
 
 ```sh
 cd web && npm ci
-cd web && npm test
-cd web && npm run build
+make web-test
+make web-build
 ```
 
 Expected behavior:
 - `npm ci` installs exactly from `web/package-lock.json`.
 - Vitest reports the API client, token storage, and React bootstrap tests passing.
-- `npm run build` type-checks the app and Vite config, then writes a production build to
+- `make web-build` type-checks the app and Vite config, then writes a production build to
   ignored `web/dist/`.
 
-> Why it matters: the web tracer bullet is intentionally isolated from the Go `Makefile` and
-> CI gates for this slice, so its package-level checks are the source of truth until later web
-> tooling work wires them into repo-level automation.
+> Why it matters: the web tracer bullet remains isolated from backend CI gates, but the repo
+> Makefile now exposes stable web commands for operators and local verification.
 
 ---
 
@@ -1034,7 +1034,7 @@ skipped/blocked (write why).
 - [ ] B4 domain uncovered lines inspected and judged benign (if any finding reopens)
 - [ ] B5 `make test-integration` actually **ran** (not skipped) and passed
 - [ ] B6 `make sqlc` produces no `git` drift
-- [ ] B7 `cd web && npm ci && npm test && npm run build` passes
+- [ ] B7 `cd web && npm ci`, `make web-test`, and `make web-build` pass
 
 ### C — Components
 - [ ] C1 Makefile / CI / go.mod / binary boundaries reviewed

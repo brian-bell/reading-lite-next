@@ -1283,6 +1283,74 @@ func TestConventions_DockerStaysOutOfDefaultBuild(t *testing.T) {
 	}
 }
 
+// TestConventions_WebCloudflareRunbook pins the issue #27 operator contract:
+// repo-level web targets exist, local Vite dev receives the API base URL, Pages
+// deploys are dry-run-first, and the README documents the named-tunnel path
+// without encouraging bearer-token disclosure.
+func TestConventions_WebCloudflareRunbook(t *testing.T) {
+	root := repoRoot(t)
+
+	makefile := readText(t, filepath.Join(root, "Makefile"))
+	wantTargets := []string{"web-test", "web-build", "web-dev", "deploy-web"}
+	phony := makePhonyTargets(makefile)
+	for _, target := range wantTargets {
+		if !makeTargetExists(makefile, target) {
+			t.Errorf("Makefile missing %s target", target)
+		}
+		if !phony[target] {
+			t.Errorf("Makefile .PHONY missing %s", target)
+		}
+	}
+	webDev := makeTargetRecipe(t, makefile, "web-dev")
+	for _, want := range []string{"VITE_READER_API_BASE_URL", "WEB_API_BASE_URL", "$(NPM) run dev"} {
+		if !strings.Contains(webDev, want) {
+			t.Errorf("web-dev recipe missing %q:\n%s", want, webDev)
+		}
+	}
+	deployWeb := makeTargetRecipe(t, makefile, "deploy-web")
+	for _, want := range []string{"web-build", "DEPLOY_WEB_APPLY", "CLOUDFLARE_PAGES_PROJECT", "pages deploy", "WEB_DIST_DIR"} {
+		if !strings.Contains(deployWeb, want) {
+			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
+		}
+	}
+
+	readme := compactWhitespace(readText(t, filepath.Join(root, "README.md")))
+	for _, want := range []string{
+		"LISTEN_ADDR=127.0.0.1:8080",
+		"cloudflared tunnel route dns",
+		"http://127.0.0.1:8080",
+		"dist",
+		"VITE_READER_API_BASE_URL",
+		"CORS_ALLOWED_ORIGINS",
+		"production",
+		"preview",
+		"make web-test",
+		"make web-build",
+		"make web-dev WEB_API_BASE_URL=https://api.example.com",
+		"make deploy-web",
+		"DEPLOY_WEB_APPLY=1",
+		"readerctl smoke --base-url https://api.example.com --ingest-url https://example.com --token-env READER_API_TOKEN",
+		"submit a reading",
+		"appears in the list",
+		"open the detail",
+		"tunnel API hostname",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README missing %q", want)
+		}
+	}
+	for _, want := range []string{"--token-env", "environment", "command history", "screenshots", "logs"} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README secret-safe smoke guidance missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"--token READER_API_TOKEN", "echo $READER_API_TOKEN", "print the bearer token"} {
+		if strings.Contains(readme, forbidden) {
+			t.Errorf("README should not recommend secret disclosure pattern %q", forbidden)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1469,6 +1537,67 @@ func buildTags(t *testing.T, path string) map[string]bool {
 		}
 	}
 	return tags
+}
+
+func readText(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func makePhonyTargets(makefile string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(makefile, "\n") {
+		if rest, ok := strings.CutPrefix(line, ".PHONY:"); ok {
+			for _, target := range strings.Fields(rest) {
+				out[target] = true
+			}
+		}
+	}
+	return out
+}
+
+func makeTargetExists(makefile, target string) bool {
+	prefix := target + ":"
+	for _, line := range strings.Split(makefile, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func makeTargetRecipe(t *testing.T, makefile, target string) string {
+	t.Helper()
+	lines := strings.Split(makefile, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, target+":") {
+			continue
+		}
+		var recipe []string
+		recipe = append(recipe, line)
+		for _, next := range lines[i+1:] {
+			if next == "" {
+				recipe = append(recipe, next)
+				continue
+			}
+			if strings.HasPrefix(next, "\t") || strings.HasPrefix(next, " ") {
+				recipe = append(recipe, next)
+				continue
+			}
+			break
+		}
+		return strings.Join(recipe, "\n")
+	}
+	t.Fatalf("Makefile target %s not found", target)
+	return ""
+}
+
+func compactWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func assertGeneratedMatchesCommitted(t *testing.T, committedDir, genDir string) {
