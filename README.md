@@ -143,8 +143,9 @@ make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJEC
 The dry run prints the non-secret Wrangler command. The apply path requires
 `CLOUDFLARE_PAGES_PROJECT`; direct deploys should set `WEB_API_BASE_URL` to the tunnel hostname
 so Vite bakes the same API base URL that Pages would receive from
-`VITE_READER_API_BASE_URL`. Apply mode refuses localhost API origins because those would make
-remote browsers call their own machines instead of the tunnel. It also requires
+`VITE_READER_API_BASE_URL`. Apply mode refuses loopback API origins — `localhost`, IP loopback
+ranges, and RFC 6761 `localhost.`/`*.localhost` names — because those would make remote browsers
+call their own machines instead of the tunnel. It also requires
 `WEB_API_BASE_URL` to be an exact `https` origin with no path, query, fragment, credentials, or
 default `:443` port, because the SPA concatenates that raw value with `/api/healthz`; anything
 else would bake a wrong endpoint into the deployed bundle. Wrangler uses its normal login

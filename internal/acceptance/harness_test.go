@@ -1380,6 +1380,11 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"http://[::1]?x=1",
 		"https://[0:0:0:0:0:0:0:1]",
 		"https://[::ffff:127.0.0.1]",
+		// RFC 6761 reserves localhost. and *.localhost for loopback.
+		"https://localhost.",
+		"https://api.localhost",
+		"https://API.LOCALHOST",
+		"https://sub.api.localhost.",
 	} {
 		t.Run("reject loopback apply "+apiBase, func(t *testing.T) {
 			optionalTool(t, "node")
@@ -1441,6 +1446,10 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 	for _, apiBase := range []string{
 		"https://127.example.com",
 		"https://127.0.0.1.example.com",
+		// Real domains that merely contain "localhost" as a label prefix or
+		// suffix must not be mistaken for the reserved loopback names.
+		"https://localhost.example.com",
+		"https://localhostx",
 	} {
 		t.Run("accept non-loopback apply "+apiBase, func(t *testing.T) {
 			optionalTool(t, "node")
