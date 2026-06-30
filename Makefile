@@ -54,39 +54,12 @@ web-dev:
 
 deploy-web:
 	@if [ "$(DEPLOY_WEB_APPLY)" = "1" ]; then \
-	if [ -z "$(CLOUDFLARE_PAGES_PROJECT)" ]; then \
-		printf '%s\n' "CLOUDFLARE_PAGES_PROJECT is required for DEPLOY_WEB_APPLY=1."; \
-		exit 2; \
-	fi; \
-		api_base="$(WEB_API_BASE_URL)"; \
-		case "$$api_base" in \
-			*://*) ;; \
-			*) printf '%s\n' "WEB_API_BASE_URL must be an absolute URL for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
-		esac; \
-		authority="$${api_base#*://}"; \
-		authority="$${authority%%/*}"; \
-		authority="$${authority%%\?*}"; \
-		authority="$${authority%%#*}"; \
-		authority="$${authority##*@}"; \
-		case "$$authority" in \
-			\[*\]*) host="$${authority%%]*}]" ;; \
-			*) host="$${authority%%:*}" ;; \
-		esac; \
-		host="$$(printf '%s' "$$host" | tr '[:upper:]' '[:lower:]')"; \
-		case "$$host" in \
-			localhost|\[::1\]) printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
-			127.*) \
-				if [ -z "$$(printf '%s' "$$host" | tr -d '0-9.')" ]; then \
-					printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2; \
-				fi ;; \
-		esac; \
-		scheme="$${api_base%%://*}"; \
-		scheme="$$(printf '%s' "$$scheme" | tr '[:upper:]' '[:lower:]')"; \
-		case "$$scheme" in \
-			https) ;; \
-			*) printf '%s\n' "WEB_API_BASE_URL must use https for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
-		esac; \
-		fi
+		if [ -z "$(CLOUDFLARE_PAGES_PROJECT)" ]; then \
+			printf '%s\n' "CLOUDFLARE_PAGES_PROJECT is required for DEPLOY_WEB_APPLY=1."; \
+			exit 2; \
+		fi; \
+		env WEB_API_BASE_URL="$(WEB_API_BASE_URL)" node -e 'const net = require("net"); const raw = process.env.WEB_API_BASE_URL || ""; let u; try { u = new URL(raw); } catch (e) { console.error("WEB_API_BASE_URL must be an absolute URL for DEPLOY_WEB_APPLY=1."); process.exit(2); } const host = u.hostname.toLowerCase(); const ip = host.startsWith("[") ? host.slice(1, -1) : host; const fam = net.isIP(ip); const blocked = new net.BlockList(); blocked.addSubnet("127.0.0.0", 8, "ipv4"); blocked.addAddress("::1", "ipv6"); blocked.addSubnet("::ffff:127.0.0.0", 104, "ipv6"); if (host === "localhost" || (fam !== 0 && blocked.check(ip, fam === 4 ? "ipv4" : "ipv6"))) { console.error("WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."); process.exit(2); } if (u.protocol !== "https:") { console.error("WEB_API_BASE_URL must use https for DEPLOY_WEB_APPLY=1."); process.exit(2); }' || exit $$?; \
+	fi
 	$(MAKE) web-build
 	@if [ "$(DEPLOY_WEB_APPLY)" != "1" ]; then \
 		project="$(CLOUDFLARE_PAGES_PROJECT)"; \

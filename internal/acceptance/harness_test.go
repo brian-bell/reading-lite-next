@@ -1314,11 +1314,11 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"CLOUDFLARE_PAGES_PROJECT",
 		"pages deploy",
 		`"$(WEB_DIST_DIR)"`,
-		`*://*`,
-		`tr '[:upper:]' '[:lower:]'`,
-		`localhost|\[::1\]`,
-		`127.*`,
-		`tr -d '0-9.'`,
+		"node -e",
+		"new URL(",
+		"BlockList",
+		"WEB_API_BASE_URL must be an absolute URL",
+		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
 		"WEB_API_BASE_URL must use https",
 	} {
 		if !strings.Contains(deployWeb, want) {
@@ -1373,10 +1373,15 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"https://127.1?x=1",
 		"https://127.0.1.1",
 		"https://127.255.255.255",
+		"https://2130706433",
+		"https://0x7f000001",
 		"http://[::1]",
 		"http://[::1]?x=1",
+		"https://[0:0:0:0:0:0:0:1]",
+		"https://[::ffff:127.0.0.1]",
 	} {
 		t.Run("reject loopback apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
 			out, err := runTool(
 				t,
 				root,
@@ -1407,6 +1412,7 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"ftp://api.example.com",
 	} {
 		t.Run("reject non-https apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
 			out, err := runTool(
 				t,
 				root,
@@ -1436,6 +1442,7 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"https://127.0.0.1.example.com",
 	} {
 		t.Run("accept non-loopback apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
 			out, err := runTool(
 				t,
 				root,
@@ -1452,6 +1459,34 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 			}
 			if strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
 				t.Fatalf("make deploy-web with %s wrongly rejected as loopback:\n%s", apiBase, out)
+			}
+		})
+	}
+	for _, apiBase := range []string{
+		"example.com",
+		"//api.example.com",
+	} {
+		t.Run("reject relative apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be an absolute URL") {
+				t.Fatalf("make deploy-web with %s did not print absolute-URL guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
 			}
 		})
 	}
