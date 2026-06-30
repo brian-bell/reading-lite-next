@@ -302,7 +302,7 @@ Expect **no** changes — the committed `internal/store/storedb/*.go` must match
 ### B7. Web SPA bootstrap package
 
 ```sh
-cd web && npm ci
+npm --prefix web ci
 make web-test
 make web-build
 ```

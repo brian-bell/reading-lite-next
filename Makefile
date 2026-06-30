@@ -44,25 +44,29 @@ run:
 	$(GO) run ./cmd/reader-api
 
 web-test:
-	cd $(WEB_DIR) && $(NPM) test
+	cd "$(WEB_DIR)" && $(NPM) test
 
 web-build:
-	cd $(WEB_DIR) && $(NPM) run build
+	cd "$(WEB_DIR)" && env VITE_READER_API_BASE_URL="$(WEB_API_BASE_URL)" $(NPM) run build
 
 web-dev:
-	cd $(WEB_DIR) && VITE_READER_API_BASE_URL=$(WEB_API_BASE_URL) $(NPM) run dev
+	cd "$(WEB_DIR)" && env VITE_READER_API_BASE_URL="$(WEB_API_BASE_URL)" $(NPM) run dev
 
-deploy-web: web-build
+deploy-web:
+	@if [ "$(DEPLOY_WEB_APPLY)" = "1" ]; then \
+	if [ -z "$(CLOUDFLARE_PAGES_PROJECT)" ]; then \
+		printf '%s\n' "CLOUDFLARE_PAGES_PROJECT is required for DEPLOY_WEB_APPLY=1."; \
+		exit 2; \
+	fi; \
+	env WEB_API_BASE_URL="$(WEB_API_BASE_URL)" node -e 'const raw = process.env.WEB_API_BASE_URL || ""; let u; try { u = new URL(raw); } catch (err) { console.error("WEB_API_BASE_URL must be an absolute URL for DEPLOY_WEB_APPLY=1."); process.exit(2); } const h = u.hostname.toLowerCase(); if (h === "localhost" || h === "127.0.0.1" || h === "[::1]") { console.error("WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."); process.exit(2); }' || exit $$?; \
+	fi
+	$(MAKE) web-build
 	@if [ "$(DEPLOY_WEB_APPLY)" != "1" ]; then \
 		project="$(CLOUDFLARE_PAGES_PROJECT)"; \
 		if [ -z "$$project" ]; then project="<project-name>"; fi; \
 		printf '%s\n' "Dry run only; set DEPLOY_WEB_APPLY=1 to deploy after checking this command."; \
 		printf '%s\n' "Set CLOUDFLARE_PAGES_PROJECT to your non-secret Cloudflare Pages project name."; \
-		printf '%s\n' "$(WRANGLER) pages deploy $(WEB_DIST_DIR) --project-name \"$$project\""; \
+		printf '%s\n' "$(WRANGLER) pages deploy \"$(WEB_DIST_DIR)\" --project-name \"$$project\""; \
 		exit 0; \
 	fi; \
-	if [ -z "$(CLOUDFLARE_PAGES_PROJECT)" ]; then \
-		printf '%s\n' "CLOUDFLARE_PAGES_PROJECT is required for DEPLOY_WEB_APPLY=1."; \
-		exit 2; \
-	fi; \
-	$(WRANGLER) pages deploy $(WEB_DIST_DIR) --project-name "$(CLOUDFLARE_PAGES_PROJECT)"
+	$(WRANGLER) pages deploy "$(WEB_DIST_DIR)" --project-name "$(CLOUDFLARE_PAGES_PROJECT)"

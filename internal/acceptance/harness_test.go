@@ -1302,22 +1302,103 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		}
 	}
 	webDev := makeTargetRecipe(t, makefile, "web-dev")
-	for _, want := range []string{"VITE_READER_API_BASE_URL", "WEB_API_BASE_URL", "$(NPM) run dev"} {
+	for _, want := range []string{`"$(WEB_DIR)"`, "VITE_READER_API_BASE_URL", `"$(WEB_API_BASE_URL)"`, "$(NPM) run dev"} {
 		if !strings.Contains(webDev, want) {
 			t.Errorf("web-dev recipe missing %q:\n%s", want, webDev)
 		}
 	}
 	deployWeb := makeTargetRecipe(t, makefile, "deploy-web")
-	for _, want := range []string{"web-build", "DEPLOY_WEB_APPLY", "CLOUDFLARE_PAGES_PROJECT", "pages deploy", "WEB_DIST_DIR"} {
+	for _, want := range []string{
+		"web-build",
+		"DEPLOY_WEB_APPLY",
+		"CLOUDFLARE_PAGES_PROJECT",
+		"pages deploy",
+		`"$(WEB_DIST_DIR)"`,
+		"new URL(raw)",
+		`h === "localhost"`,
+		`h === "127.0.0.1"`,
+		`h === "[::1]"`,
+	} {
 		if !strings.Contains(deployWeb, want) {
 			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
 		}
 	}
+	webBuild := makeTargetRecipe(t, makefile, "web-build")
+	for _, want := range []string{`"$(WEB_DIR)"`, "VITE_READER_API_BASE_URL", `"$(WEB_API_BASE_URL)"`, "$(NPM) run build"} {
+		if !strings.Contains(webBuild, want) {
+			t.Errorf("web-build recipe missing %q:\n%s", want, webBuild)
+		}
+	}
+	dryRun := runMakeDryRun(t, root, "WEB_API_BASE_URL=https://api.example.com", "deploy-web")
+	for _, want := range []string{
+		`VITE_READER_API_BASE_URL="https://api.example.com"`,
+		"Dry run only; set DEPLOY_WEB_APPLY=1",
+		"npx wrangler pages deploy",
+		`"web/dist"`,
+		`--project-name \"$project\"`,
+	} {
+		if !strings.Contains(dryRun, want) {
+			t.Errorf("make -n deploy-web missing %q:\n%s", want, dryRun)
+		}
+	}
+	applyDryRun := runMakeDryRun(t, root, "WEB_API_BASE_URL=https://api.example.com", "CLOUDFLARE_PAGES_PROJECT=reading-lite", "DEPLOY_WEB_APPLY=1", "deploy-web")
+	for _, want := range []string{
+		`VITE_READER_API_BASE_URL="https://api.example.com"`,
+		`npx wrangler pages deploy "web/dist" --project-name "reading-lite"`,
+	} {
+		if !strings.Contains(applyDryRun, want) {
+			t.Errorf("make -n deploy-web apply path missing %q:\n%s", want, applyDryRun)
+		}
+	}
+	localhostApply := runMakeDryRun(t, root, "CLOUDFLARE_PAGES_PROJECT=reading-lite", "DEPLOY_WEB_APPLY=1", "deploy-web")
+	for _, want := range []string{
+		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
+		"process.exit(2)",
+	} {
+		if !strings.Contains(localhostApply, want) {
+			t.Errorf("make -n deploy-web localhost apply guard missing %q:\n%s", want, localhostApply)
+		}
+	}
+	for _, apiBase := range []string{
+		"http://localhost",
+		"http://localhost?x=1",
+		"https://localhost#frag",
+		"HTTP://LOCALHOST",
+		"http://127.0.0.1",
+		"http://127.0.0.1?x=1",
+		"http://[::1]",
+		"http://[::1]?x=1",
+	} {
+		t.Run("reject loopback apply "+apiBase, func(t *testing.T) {
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
+				t.Fatalf("make deploy-web with %s did not print loopback guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
 
 	readme := compactWhitespace(readText(t, filepath.Join(root, "README.md")))
 	for _, want := range []string{
+		"npm --prefix web ci",
 		"LISTEN_ADDR=127.0.0.1:8080",
 		"cloudflared tunnel route dns",
+		"cloudflared tunnel run <tunnel-name>",
 		"http://127.0.0.1:8080",
 		"dist",
 		"VITE_READER_API_BASE_URL",
@@ -1328,7 +1409,10 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"make web-build",
 		"make web-dev WEB_API_BASE_URL=https://api.example.com",
 		"make deploy-web",
+		"make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite",
+		"make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite DEPLOY_WEB_APPLY=1",
 		"DEPLOY_WEB_APPLY=1",
+		"operator and production smoke should use `--token-env`",
 		"readerctl smoke --base-url https://api.example.com --ingest-url https://example.com --token-env READER_API_TOKEN",
 		"submit a reading",
 		"appears in the list",
@@ -1451,6 +1535,17 @@ func runTool(t *testing.T, dir, name string, args ...string) (string, error) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+func runMakeDryRun(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	makeBin := optionalTool(t, "make")
+	allArgs := append([]string{"-n"}, args...)
+	out, err := runTool(t, root, makeBin, allArgs...)
+	if err != nil {
+		t.Fatalf("make %s failed: %v\n%s", strings.Join(allArgs, " "), err, out)
+	}
+	return out
 }
 
 func goFiles(t *testing.T, dir string, includeTests bool) []string {
