@@ -1320,6 +1320,7 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"WEB_API_BASE_URL must be an absolute URL",
 		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
 		"WEB_API_BASE_URL must use https",
+		"WEB_API_BASE_URL must be an exact https origin",
 	} {
 		if !strings.Contains(deployWeb, want) {
 			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
@@ -1487,6 +1488,70 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 			}
 			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
 				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Values that pass the https and loopback guards but are not the exact
+	// origin the SPA concatenates with "/api/healthz" (paths, queries,
+	// fragments, credentials, or the scheme-shorthand form) must be rejected
+	// before web-build so the deployed bundle never requests a wrong endpoint.
+	for _, apiBase := range []string{
+		"https://api.example.com?x=1",
+		"https://api.example.com#frag",
+		"https://api.example.com/healthz",
+		"https:api.example.com",
+		"https://user@api.example.com",
+		"https://user:pass@api.example.com",
+		"https://api.example.com:443",
+	} {
+		t.Run("reject non-origin apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be an exact https origin") {
+				t.Fatalf("make deploy-web with %s did not print origin guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Exact origins, including a trailing slash or an explicit non-default
+	// port, normalize to a form the SPA concatenates correctly and must pass.
+	for _, apiBase := range []string{
+		"https://api.example.com/",
+		"https://api.example.com:8443",
+	} {
+		t.Run("accept exact origin apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err != nil {
+				t.Fatalf("make deploy-web with %s unexpectedly failed:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "WEB_API_BASE_URL must be an exact https origin") {
+				t.Fatalf("make deploy-web with %s wrongly rejected as non-origin:\n%s", apiBase, out)
 			}
 		})
 	}
