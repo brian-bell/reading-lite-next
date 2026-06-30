@@ -76,6 +76,12 @@ deploy-web:
 		case "$$host" in \
 			localhost|127.0.0.1|\[::1\]) printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
 		esac; \
+		scheme="$${api_base%%://*}"; \
+		scheme="$$(printf '%s' "$$scheme" | tr '[:upper:]' '[:lower:]')"; \
+		case "$$scheme" in \
+			https) ;; \
+			*) printf '%s\n' "WEB_API_BASE_URL must use https for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
+		esac; \
 		fi
 	$(MAKE) web-build
 	@if [ "$(DEPLOY_WEB_APPLY)" != "1" ]; then \

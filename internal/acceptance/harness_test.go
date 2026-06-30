@@ -1317,6 +1317,7 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		`*://*`,
 		`tr '[:upper:]' '[:lower:]'`,
 		`localhost|127.0.0.1|\[::1\]`,
+		"WEB_API_BASE_URL must use https",
 	} {
 		if !strings.Contains(deployWeb, want) {
 			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
@@ -1385,6 +1386,36 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 			}
 			if !strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
 				t.Fatalf("make deploy-web with %s did not print loopback guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	for _, apiBase := range []string{
+		"http://api.example.com",
+		"http://api.example.com?x=1",
+		"http://api.example.com/healthz",
+		"HTTP://API.EXAMPLE.COM",
+		"ftp://api.example.com",
+	} {
+		t.Run("reject non-https apply "+apiBase, func(t *testing.T) {
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must use https") {
+				t.Fatalf("make deploy-web with %s did not print https guard:\n%s", apiBase, out)
 			}
 			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
 				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
