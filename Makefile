@@ -58,8 +58,25 @@ deploy-web:
 		printf '%s\n' "CLOUDFLARE_PAGES_PROJECT is required for DEPLOY_WEB_APPLY=1."; \
 		exit 2; \
 	fi; \
-	env WEB_API_BASE_URL="$(WEB_API_BASE_URL)" node -e 'const raw = process.env.WEB_API_BASE_URL || ""; let u; try { u = new URL(raw); } catch (err) { console.error("WEB_API_BASE_URL must be an absolute URL for DEPLOY_WEB_APPLY=1."); process.exit(2); } const h = u.hostname.toLowerCase(); if (h === "localhost" || h === "127.0.0.1" || h === "[::1]") { console.error("WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."); process.exit(2); }' || exit $$?; \
-	fi
+		api_base="$(WEB_API_BASE_URL)"; \
+		case "$$api_base" in \
+			*://*) ;; \
+			*) printf '%s\n' "WEB_API_BASE_URL must be an absolute URL for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
+		esac; \
+		authority="$${api_base#*://}"; \
+		authority="$${authority%%/*}"; \
+		authority="$${authority%%\?*}"; \
+		authority="$${authority%%#*}"; \
+		authority="$${authority##*@}"; \
+		case "$$authority" in \
+			\[*\]*) host="$${authority%%]*}]" ;; \
+			*) host="$${authority%%:*}" ;; \
+		esac; \
+		host="$$(printf '%s' "$$host" | tr '[:upper:]' '[:lower:]')"; \
+		case "$$host" in \
+			localhost|127.0.0.1|\[::1\]) printf '%s\n' "WEB_API_BASE_URL must be set to the deployed tunnel origin for DEPLOY_WEB_APPLY=1."; exit 2 ;; \
+		esac; \
+		fi
 	$(MAKE) web-build
 	@if [ "$(DEPLOY_WEB_APPLY)" != "1" ]; then \
 		project="$(CLOUDFLARE_PAGES_PROJECT)"; \

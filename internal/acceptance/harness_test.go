@@ -1314,10 +1314,9 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 		"CLOUDFLARE_PAGES_PROJECT",
 		"pages deploy",
 		`"$(WEB_DIST_DIR)"`,
-		"new URL(raw)",
-		`h === "localhost"`,
-		`h === "127.0.0.1"`,
-		`h === "[::1]"`,
+		`*://*`,
+		`tr '[:upper:]' '[:lower:]'`,
+		`localhost|127.0.0.1|\[::1\]`,
 	} {
 		if !strings.Contains(deployWeb, want) {
 			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
@@ -1353,7 +1352,7 @@ func TestConventions_WebCloudflareRunbook(t *testing.T) {
 	localhostApply := runMakeDryRun(t, root, "CLOUDFLARE_PAGES_PROJECT=reading-lite", "DEPLOY_WEB_APPLY=1", "deploy-web")
 	for _, want := range []string{
 		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
-		"process.exit(2)",
+		"exit 2",
 	} {
 		if !strings.Contains(localhostApply, want) {
 			t.Errorf("make -n deploy-web localhost apply guard missing %q:\n%s", want, localhostApply)
