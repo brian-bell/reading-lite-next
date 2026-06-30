@@ -44,13 +44,13 @@ make build
 make verify
 ```
 
-The web package is intentionally not wired into the Go `Makefile` targets yet. Run its checks
-from `web/`:
+The web package has repo-level convenience targets plus the package-local npm scripts:
 
 ```sh
-cd web && npm ci
-cd web && npm test
-cd web && npm run build
+npm --prefix web ci
+make web-test
+make web-build
+make web-dev WEB_API_BASE_URL=http://127.0.0.1:8080
 ```
 
 `make verify` runs the blackbox verification harness in `internal/acceptance/` with the
@@ -83,8 +83,89 @@ buffer settings, `PG_MAX_CONNS`, and `LISTEN_ADDR`. Optional `FETCH_TIMEOUT`,
 `https://app.example.com,http://localhost:5173`; unset leaves browser CORS closed.
 
 `readerctl` supports `smoke` and dry-run `deploy`/`staging` planning from the default binary.
-Smoke can authenticate with `--token` or `--token-env`; deploy/staging smoke plans use
-`--smoke-token-env` so secrets stay out of rendered step arguments. Stateful commands such as
+Smoke supports `--token` for disposable local tests, but operator and production smoke should
+use `--token-env`; deploy/staging smoke plans use `--smoke-token-env` so secrets stay out of
+rendered step arguments. Stateful commands such as
 `import`, `audit`, `recover`, and `drop` are tested in `internal/readerctl` with injected
 dependencies; the default binary still refuses them until production dependency construction is
 added there.
+
+## Cloudflare Pages + Tunnel Runbook
+
+This operator path runs the Vite SPA on Cloudflare Pages while keeping `reader-api` bound to the
+local host and reachable through a stable named Cloudflare Tunnel.
+
+API runtime setup:
+
+- Run `reader-api` with `LISTEN_ADDR=127.0.0.1:8080` so it only accepts local connections.
+- Set `CORS_ALLOWED_ORIGINS` to the exact Pages origins that browsers will use. Include the
+  production Pages/custom origin and every preview origin you intend to test, for example
+  `https://reading-lite.pages.dev,https://<preview>.reading-lite.pages.dev`. Origins must not
+  include wildcards, paths, query strings, fragments, or trailing slashes.
+
+Named tunnel routing:
+
+- Create or reuse a stable named tunnel, then route a hostname such as `api.example.com` to it:
+  `cloudflared tunnel route dns <tunnel-name> api.example.com`.
+- Use tunnel ingress that forwards the hostname to the locally bound API:
+
+```yaml
+ingress:
+  - hostname: api.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+```
+
+- Run the named tunnel with that ingress config, for example `cloudflared tunnel run <tunnel-name>`,
+  or install it as a service using the same named tunnel configuration. Before Pages smoke, verify
+  the tunnel reaches the API without a bearer token: `curl https://api.example.com/api/healthz`.
+
+Pages build settings:
+
+- Project root: `web`
+- Build command when the Pages project root is `web`: `npm ci && npm run build`
+- Build output directory: `dist`
+- Environment variable for production and preview builds:
+  `VITE_READER_API_BASE_URL=https://api.example.com`
+
+Local and deploy commands:
+
+```sh
+make web-test
+make web-build
+make web-dev WEB_API_BASE_URL=https://api.example.com
+make deploy-web
+make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite
+make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite DEPLOY_WEB_APPLY=1
+```
+
+`make deploy-web` runs `web-build` first and is dry-run-only unless `DEPLOY_WEB_APPLY=1` is set.
+The dry run prints the non-secret Wrangler command. The apply path requires
+`CLOUDFLARE_PAGES_PROJECT`; direct deploys should set `WEB_API_BASE_URL` to the tunnel hostname
+so Vite bakes the same API base URL that Pages would receive from
+`VITE_READER_API_BASE_URL`. Apply mode refuses loopback API origins — `localhost`, IP loopback
+ranges, and RFC 6761 `localhost.`/`*.localhost` names — because those would make remote browsers
+call their own machines instead of the tunnel. It also requires
+`WEB_API_BASE_URL` to be an exact `https` origin with no path, query, fragment, credentials, or
+default `:443` port, because the SPA concatenates that raw value with `/api/healthz`; anything
+else would bake a wrong endpoint into the deployed bundle. Wrangler uses its normal login
+state or `CLOUDFLARE_API_TOKEN` from the environment. The target does not print token values.
+`WRANGLER` defaults to `npx wrangler`, which may install or use Wrangler outside the repo
+lockfile. Treat `WRANGLER` as a command string with optional arguments; if your Wrangler
+executable path contains spaces, wrap it in a small script and point `WRANGLER` at that script.
+
+Secret-safe smoke:
+
+- Keep bearer tokens in environment variables or interactive browser input. Do not put tokens in
+  command history, screenshots, or logs.
+- Current CLI tunnel smoke:
+
+```sh
+readerctl smoke --base-url https://api.example.com --ingest-url https://example.com --token-env READER_API_TOKEN
+```
+
+This validates health plus authenticated submit/ingest through the tunnel.
+
+- Future browser smoke, once list/detail/submit UI slices exist: open the Pages origin, paste the
+  token only in the SPA token control, submit a reading, verify it appears in the list, open the
+  detail view, and confirm browser network requests use the tunnel API hostname.

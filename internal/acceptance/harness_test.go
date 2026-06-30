@@ -1283,6 +1283,330 @@ func TestConventions_DockerStaysOutOfDefaultBuild(t *testing.T) {
 	}
 }
 
+// TestConventions_WebCloudflareRunbook pins the issue #27 operator contract:
+// repo-level web targets exist, local Vite dev receives the API base URL, Pages
+// deploys are dry-run-first, and the README documents the named-tunnel path
+// without encouraging bearer-token disclosure.
+func TestConventions_WebCloudflareRunbook(t *testing.T) {
+	root := repoRoot(t)
+
+	makefile := readText(t, filepath.Join(root, "Makefile"))
+	wantTargets := []string{"web-test", "web-build", "web-dev", "deploy-web"}
+	phony := makePhonyTargets(makefile)
+	for _, target := range wantTargets {
+		if !makeTargetExists(makefile, target) {
+			t.Errorf("Makefile missing %s target", target)
+		}
+		if !phony[target] {
+			t.Errorf("Makefile .PHONY missing %s", target)
+		}
+	}
+	webDev := makeTargetRecipe(t, makefile, "web-dev")
+	for _, want := range []string{`"$(WEB_DIR)"`, "VITE_READER_API_BASE_URL", `"$(WEB_API_BASE_URL)"`, "$(NPM) run dev"} {
+		if !strings.Contains(webDev, want) {
+			t.Errorf("web-dev recipe missing %q:\n%s", want, webDev)
+		}
+	}
+	deployWeb := makeTargetRecipe(t, makefile, "deploy-web")
+	for _, want := range []string{
+		"web-build",
+		"DEPLOY_WEB_APPLY",
+		"CLOUDFLARE_PAGES_PROJECT",
+		"pages deploy",
+		`"$(WEB_DIST_DIR)"`,
+		"node -e",
+		"new URL(",
+		"BlockList",
+		"WEB_API_BASE_URL must be an absolute URL",
+		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
+		"WEB_API_BASE_URL must use https",
+		"WEB_API_BASE_URL must be an exact https origin",
+	} {
+		if !strings.Contains(deployWeb, want) {
+			t.Errorf("deploy-web recipe missing %q:\n%s", want, deployWeb)
+		}
+	}
+	webBuild := makeTargetRecipe(t, makefile, "web-build")
+	for _, want := range []string{`"$(WEB_DIR)"`, "VITE_READER_API_BASE_URL", `"$(WEB_API_BASE_URL)"`, "$(NPM) run build"} {
+		if !strings.Contains(webBuild, want) {
+			t.Errorf("web-build recipe missing %q:\n%s", want, webBuild)
+		}
+	}
+	dryRun := runMakeDryRun(t, root, "WEB_API_BASE_URL=https://api.example.com", "deploy-web")
+	for _, want := range []string{
+		`VITE_READER_API_BASE_URL="https://api.example.com"`,
+		"Dry run only; set DEPLOY_WEB_APPLY=1",
+		"npx wrangler pages deploy",
+		`"web/dist"`,
+		`--project-name \"$project\"`,
+	} {
+		if !strings.Contains(dryRun, want) {
+			t.Errorf("make -n deploy-web missing %q:\n%s", want, dryRun)
+		}
+	}
+	applyDryRun := runMakeDryRun(t, root, "WEB_API_BASE_URL=https://api.example.com", "CLOUDFLARE_PAGES_PROJECT=reading-lite", "DEPLOY_WEB_APPLY=1", "deploy-web")
+	for _, want := range []string{
+		`VITE_READER_API_BASE_URL="https://api.example.com"`,
+		`npx wrangler pages deploy "web/dist" --project-name "reading-lite"`,
+	} {
+		if !strings.Contains(applyDryRun, want) {
+			t.Errorf("make -n deploy-web apply path missing %q:\n%s", want, applyDryRun)
+		}
+	}
+	localhostApply := runMakeDryRun(t, root, "CLOUDFLARE_PAGES_PROJECT=reading-lite", "DEPLOY_WEB_APPLY=1", "deploy-web")
+	for _, want := range []string{
+		"WEB_API_BASE_URL must be set to the deployed tunnel origin",
+		"exit 2",
+	} {
+		if !strings.Contains(localhostApply, want) {
+			t.Errorf("make -n deploy-web localhost apply guard missing %q:\n%s", want, localhostApply)
+		}
+	}
+	for _, apiBase := range []string{
+		"http://localhost",
+		"http://localhost?x=1",
+		"https://localhost#frag",
+		"HTTP://LOCALHOST",
+		"http://127.0.0.1",
+		"http://127.0.0.1?x=1",
+		"https://127.0.0.2",
+		"https://127.1",
+		"https://127.1?x=1",
+		"https://127.0.1.1",
+		"https://127.255.255.255",
+		"https://2130706433",
+		"https://0x7f000001",
+		"http://[::1]",
+		"http://[::1]?x=1",
+		"https://[0:0:0:0:0:0:0:1]",
+		"https://[::ffff:127.0.0.1]",
+		// RFC 6761 reserves localhost. and *.localhost for loopback.
+		"https://localhost.",
+		"https://api.localhost",
+		"https://API.LOCALHOST",
+		"https://sub.api.localhost.",
+	} {
+		t.Run("reject loopback apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
+				t.Fatalf("make deploy-web with %s did not print loopback guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	for _, apiBase := range []string{
+		"http://api.example.com",
+		"http://api.example.com?x=1",
+		"http://api.example.com/healthz",
+		"HTTP://API.EXAMPLE.COM",
+		"ftp://api.example.com",
+	} {
+		t.Run("reject non-https apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must use https") {
+				t.Fatalf("make deploy-web with %s did not print https guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Hostnames that merely start with "127." but are not numeric IPv4
+	// addresses (e.g. real DNS names) must not be rejected as loopback.
+	for _, apiBase := range []string{
+		"https://127.example.com",
+		"https://127.0.0.1.example.com",
+		// Real domains that merely contain "localhost" as a label prefix or
+		// suffix must not be mistaken for the reserved loopback names.
+		"https://localhost.example.com",
+		"https://localhostx",
+	} {
+		t.Run("accept non-loopback apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err != nil {
+				t.Fatalf("make deploy-web with %s unexpectedly failed:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "WEB_API_BASE_URL must be set to the deployed tunnel origin") {
+				t.Fatalf("make deploy-web with %s wrongly rejected as loopback:\n%s", apiBase, out)
+			}
+		})
+	}
+	for _, apiBase := range []string{
+		"example.com",
+		"//api.example.com",
+	} {
+		t.Run("reject relative apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be an absolute URL") {
+				t.Fatalf("make deploy-web with %s did not print absolute-URL guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Values that pass the https and loopback guards but are not the exact
+	// origin the SPA concatenates with "/api/healthz" (paths, queries,
+	// fragments, credentials, or the scheme-shorthand form) must be rejected
+	// before web-build so the deployed bundle never requests a wrong endpoint.
+	for _, apiBase := range []string{
+		"https://api.example.com?x=1",
+		"https://api.example.com#frag",
+		"https://api.example.com/healthz",
+		"https:api.example.com",
+		"https://user@api.example.com",
+		"https://user:pass@api.example.com",
+		"https://api.example.com:443",
+	} {
+		t.Run("reject non-origin apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err == nil {
+				t.Fatalf("make deploy-web with %s unexpectedly succeeded:\n%s", apiBase, out)
+			}
+			if !strings.Contains(out, "WEB_API_BASE_URL must be an exact https origin") {
+				t.Fatalf("make deploy-web with %s did not print origin guard:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "web-build") || strings.Contains(out, "pages deploy") {
+				t.Fatalf("make deploy-web with %s reached build/deploy after guard:\n%s", apiBase, out)
+			}
+		})
+	}
+	// Exact origins, including a trailing slash or an explicit non-default
+	// port, normalize to a form the SPA concatenates correctly and must pass.
+	for _, apiBase := range []string{
+		"https://api.example.com/",
+		"https://api.example.com:8443",
+	} {
+		t.Run("accept exact origin apply "+apiBase, func(t *testing.T) {
+			optionalTool(t, "node")
+			out, err := runTool(
+				t,
+				root,
+				optionalTool(t, "make"),
+				"deploy-web",
+				"NPM=true",
+				"WRANGLER=true",
+				"DEPLOY_WEB_APPLY=1",
+				"CLOUDFLARE_PAGES_PROJECT=reading-lite",
+				"WEB_API_BASE_URL="+apiBase,
+			)
+			if err != nil {
+				t.Fatalf("make deploy-web with %s unexpectedly failed:\n%s", apiBase, out)
+			}
+			if strings.Contains(out, "WEB_API_BASE_URL must be an exact https origin") {
+				t.Fatalf("make deploy-web with %s wrongly rejected as non-origin:\n%s", apiBase, out)
+			}
+		})
+	}
+
+	readme := compactWhitespace(readText(t, filepath.Join(root, "README.md")))
+	for _, want := range []string{
+		"npm --prefix web ci",
+		"LISTEN_ADDR=127.0.0.1:8080",
+		"cloudflared tunnel route dns",
+		"cloudflared tunnel run <tunnel-name>",
+		"http://127.0.0.1:8080",
+		"dist",
+		"VITE_READER_API_BASE_URL",
+		"CORS_ALLOWED_ORIGINS",
+		"production",
+		"preview",
+		"make web-test",
+		"make web-build",
+		"make web-dev WEB_API_BASE_URL=https://api.example.com",
+		"make deploy-web",
+		"make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite",
+		"make deploy-web WEB_API_BASE_URL=https://api.example.com CLOUDFLARE_PAGES_PROJECT=reading-lite DEPLOY_WEB_APPLY=1",
+		"DEPLOY_WEB_APPLY=1",
+		"operator and production smoke should use `--token-env`",
+		"readerctl smoke --base-url https://api.example.com --ingest-url https://example.com --token-env READER_API_TOKEN",
+		"submit a reading",
+		"appears in the list",
+		"open the detail",
+		"tunnel API hostname",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README missing %q", want)
+		}
+	}
+	for _, want := range []string{"--token-env", "environment", "command history", "screenshots", "logs"} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README secret-safe smoke guidance missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"--token READER_API_TOKEN", "echo $READER_API_TOKEN", "print the bearer token"} {
+		if strings.Contains(readme, forbidden) {
+			t.Errorf("README should not recommend secret disclosure pattern %q", forbidden)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1385,6 +1709,17 @@ func runTool(t *testing.T, dir, name string, args ...string) (string, error) {
 	return string(out), err
 }
 
+func runMakeDryRun(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	makeBin := optionalTool(t, "make")
+	allArgs := append([]string{"-n"}, args...)
+	out, err := runTool(t, root, makeBin, allArgs...)
+	if err != nil {
+		t.Fatalf("make %s failed: %v\n%s", strings.Join(allArgs, " "), err, out)
+	}
+	return out
+}
+
 func goFiles(t *testing.T, dir string, includeTests bool) []string {
 	t.Helper()
 	var out []string
@@ -1469,6 +1804,67 @@ func buildTags(t *testing.T, path string) map[string]bool {
 		}
 	}
 	return tags
+}
+
+func readText(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func makePhonyTargets(makefile string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(makefile, "\n") {
+		if rest, ok := strings.CutPrefix(line, ".PHONY:"); ok {
+			for _, target := range strings.Fields(rest) {
+				out[target] = true
+			}
+		}
+	}
+	return out
+}
+
+func makeTargetExists(makefile, target string) bool {
+	prefix := target + ":"
+	for _, line := range strings.Split(makefile, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func makeTargetRecipe(t *testing.T, makefile, target string) string {
+	t.Helper()
+	lines := strings.Split(makefile, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, target+":") {
+			continue
+		}
+		var recipe []string
+		recipe = append(recipe, line)
+		for _, next := range lines[i+1:] {
+			if next == "" {
+				recipe = append(recipe, next)
+				continue
+			}
+			if strings.HasPrefix(next, "\t") || strings.HasPrefix(next, " ") {
+				recipe = append(recipe, next)
+				continue
+			}
+			break
+		}
+		return strings.Join(recipe, "\n")
+	}
+	t.Fatalf("Makefile target %s not found", target)
+	return ""
+}
+
+func compactWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func assertGeneratedMatchesCommitted(t *testing.T, committedDir, genDir string) {
