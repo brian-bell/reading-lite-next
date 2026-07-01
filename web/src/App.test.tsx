@@ -825,6 +825,66 @@ describe('App', () => {
     expect(readingCalls(fetchImpl)).toHaveLength(3);
   });
 
+  it('does not restart a paginated poll while a later page is still in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const slowPoll = deferred<Response>();
+    let firstPageLoads = 0;
+    let secondPageLoads = 0;
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=cursor-1')) {
+        secondPageLoads += 1;
+        if (secondPageLoads === 1) {
+          return readingsResponse([reading({ id: 'second', title: 'Second article' })], { total: 2 });
+        }
+        return slowPoll.promise;
+      }
+
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'processing', status: 'pending', title: 'Pending article' })], {
+          nextCursor: 'cursor-1',
+          total: 2,
+        });
+      }
+      return readingsResponse([reading({ id: 'processing', status: 'running', title: 'Running article' })], {
+        nextCursor: 'cursor-1',
+        total: 2,
+      });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Second article')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(4);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(4);
+
+    await act(async () => {
+      slowPoll.resolve(readingsResponse([reading({ id: 'second', title: 'Fresh second article' })], { total: 2 }));
+      await slowPoll.promise;
+    });
+    expect(screen.getByText('Running article')).toBeInTheDocument();
+    expect(screen.getByText('Fresh second article')).toBeInTheDocument();
+  });
+
   it('ignores in-flight polling responses after the token is cleared', async () => {
     vi.useFakeTimers();
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');

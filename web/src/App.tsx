@@ -165,8 +165,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
 
       const requestID = readingsRequestID.current + 1;
       readingsRequestID.current = requestID;
+      readingsLoadingRef.current = { firstPage: true, nextPage: false };
       if (force) {
-        readingsLoadingRef.current = { firstPage: true, nextPage: false };
         setReadingsLoading(true);
         setReadingsLoadingMore(false);
       }
@@ -219,10 +219,12 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           setTotal(null);
         }
       } finally {
-        if (force && readingsRequestID.current === requestID) {
+        if (readingsRequestID.current === requestID) {
           readingsLoadingRef.current = { firstPage: false, nextPage: false };
-          setReadingsLoading(false);
-          setReadingsLoadingMore(false);
+          if (force) {
+            setReadingsLoading(false);
+            setReadingsLoadingMore(false);
+          }
         }
       }
     },
