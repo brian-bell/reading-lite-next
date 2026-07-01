@@ -103,4 +103,115 @@ describe('createAPIClient', () => {
       status: 200,
     });
   });
+
+  it('fetches authenticated readings from the configured base URL', async () => {
+    const readings = {
+      readings: [
+        {
+          id: 'reading-1',
+          url: 'https://example.com/article',
+          status: 'ready',
+          title: 'Example article',
+          site: 'Example',
+          summary: 'A short summary.',
+          tags: ['go', 'reading'],
+          created_at: '2026-06-28T12:00:00Z',
+          updated_at: '2026-06-28T12:10:00Z',
+        },
+      ],
+      total: 1,
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(readings), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).resolves.toEqual(readings);
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings', {
+      headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' },
+    });
+  });
+
+  it('normalizes null reading tags from the Go API to an empty list', async () => {
+    const readings = {
+      readings: [
+        {
+          id: 'reading-1',
+          url: 'https://example.com/article',
+          status: 'pending',
+          tags: null,
+          created_at: '2026-06-28T12:00:00Z',
+          updated_at: '2026-06-28T12:10:00Z',
+        },
+      ],
+      total: 1,
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(readings), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).resolves.toEqual({
+      readings: [{ ...readings.readings[0], tags: [] }],
+      total: 1,
+    });
+  });
+
+  it('serializes the optional readings cursor without dropping a base URL path prefix', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ readings: [], total: 0 }), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://host/prefix/', fetchImpl });
+
+    await client.listReadings({ token: 'stored-token', cursor: 'next cursor' });
+
+    expect(fetchImpl).toHaveBeenCalledWith('https://host/prefix/api/readings?cursor=next+cursor', {
+      headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' },
+    });
+  });
+
+  it('rejects missing API base URL for readings without calling fetch', async () => {
+    const fetchImpl = vi.fn();
+    const client = createAPIClient({ baseURL: '', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toMatchObject({
+      code: 'missing_config',
+      message: 'VITE_READER_API_BASE_URL is required',
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('turns readings Go error envelopes into APIError values', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { code: 'unauthorized', message: 'missing or invalid bearer token' } }),
+          { status: 401 },
+        ),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toBeInstanceOf(APIError);
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toMatchObject({
+      code: 'unauthorized',
+      message: 'missing or invalid bearer token',
+      status: 401,
+    });
+  });
+
+  it('rejects non-OK readings responses even when the body looks like a list document', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ readings: [], total: 0 }), { status: 500 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toMatchObject({
+      code: 'http_error',
+      message: 'Request failed with status 500',
+      status: 500,
+    });
+  });
+
+  it('rejects successful readings responses that are not list documents', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ readings: [{ id: 'missing-fields' }] }), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a readings list document',
+      status: 200,
+    });
+  });
 });
