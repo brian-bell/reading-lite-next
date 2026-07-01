@@ -500,22 +500,27 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     try {
       const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
       const result = await client.reprocess({ token: requestToken, id });
-      if (reprocessRequestID.current !== requestID || loadToken().trim() !== requestToken) {
+      if (loadToken().trim() !== requestToken) {
         return;
       }
       // The 202 body is authoritative: the backend cleared the checkpoint and
-      // re-enqueued synchronously. Apply its status, clear any prior failure/stale
-      // overlay so the processing view is clean, and flip the matching list item.
+      // re-enqueued synchronously. Always flip the matching list item so
+      // navigation away from detail cannot hide a completed user action.
       clearInFlightReadings(fetchImpl);
       readingsRequestID.current += 1;
       readingsLoadingRef.current = { firstPage: false, nextPage: false };
       setReadingsLoading(false);
       setReadingsLoadingMore(false);
+      setReadings((list) => list.map((item) => (item.id === id ? resetListItemForReprocess(item, result.status) : item)));
+      if (reprocessRequestID.current !== requestID) {
+        return;
+      }
+      // The still-visible detail view can also drop stale request/content state
+      // and clear any prior failure/stale overlay for a clean processing view.
       rawRequestID.current += 1;
       setRawDownloading(false);
       setRawError('');
       setDetail((current) => (current && current.id === id ? resetDetailForReprocess(current, result.status) : current));
-      setReadings((list) => list.map((item) => (item.id === id ? resetListItemForReprocess(item, result.status) : item)));
       // The re-enqueued reading no longer has current content; drop any stale
       // markdown so a later render can't surface it. Mirrors fetchDetail's
       // non-ready reset (the processing view short-circuits on status anyway).

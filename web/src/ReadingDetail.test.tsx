@@ -1228,7 +1228,7 @@ describe('Reprocess', () => {
     expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
   });
 
-  it('discards a superseded reprocess response after navigating back to the list', async () => {
+  it('updates the list for a successful reprocess after navigating back', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();
     const reprocessDeferred = deferred<Response>();
@@ -1255,8 +1255,8 @@ describe('Reprocess', () => {
 
     // The superseded response must not resurrect the detail view.
     expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
-    // And the list item must not have been flipped by the stale response.
     const list = screen.getByRole('list', { name: 'Readings' });
-    expect(within(list).getByLabelText('Status: Ready')).toBeInTheDocument();
+    expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
   });
 });
