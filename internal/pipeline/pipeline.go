@@ -139,13 +139,14 @@ func (p *Pipeline) Process(ctx context.Context, id string) dispatch.Result {
 		if err != nil {
 			return dispatch.Classify(err)
 		}
-		// Unlike the fresh path below, this re-entry upsert is not gated by a
-		// guarded content checkpoint, so against a forced reprocess it is fenced
-		// only by ctx cancellation: forceClaim cancels the stale runCtx, and both
-		// vector adapters honor it (vector.Memory checks ctx.Err; vector.Postgres
-		// runs pool.Exec(ctx)), so a cancelled stale upsert never writes. A
-		// generation-fenced Upsert that would also stop a hypothetical
-		// non-context-aware adapter is deferred follow-up.
+		// Unlike the fresh path below, this re-entry upsert has no preceding
+		// guarded content checkpoint. Vectors.Upsert is itself generation-fenced
+		// on r.StartedAt (structurally inspired by, but not semantically
+		// identical to, ContentFields.ExpectedStartedAt: the store fence
+		// compares against an external live-authority row and reports a real
+		// conflict, while the vector fence is self-referential/monotonic and
+		// fails open as a silent no-op), so a late stale write from this path is
+		// rejected at the index regardless of ctx cancellation.
 		diag.ensureTiming("index")
 		stopVector := diag.start(p, "vector_upsert")
 		if err := p.upsertVector(ctx, r, c); err != nil {
@@ -405,7 +406,7 @@ func (p *Pipeline) upsertVector(ctx context.Context, r reading.Reading, c conten
 			return err
 		}
 	}
-	return p.Vectors.Upsert(ctx, r.ID, vec)
+	return p.Vectors.Upsert(ctx, r.ID, vec, r.StartedAt)
 }
 
 // hydrate turns vector matches into snapshot items by loading each match's

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -197,9 +198,9 @@ type seedingVectorIndex struct {
 	pool *pgxpool.Pool
 }
 
-func (s *seedingVectorIndex) Upsert(ctx context.Context, id string, vec []float32) error {
+func (s *seedingVectorIndex) Upsert(ctx context.Context, id string, vec []float32, generation *time.Time) error {
 	if len(vec) != vector.Dim {
-		return vector.NewPostgres(s.pool).Upsert(ctx, id, vec) // returns ErrDimension without touching the DB
+		return vector.NewPostgres(s.pool).Upsert(ctx, id, vec, generation) // returns ErrDimension without touching the DB
 	}
 	if _, err := s.pool.Exec(ctx, `
 insert into readings (id, url, url_key, status, source_kind, created_at, updated_at)
@@ -208,7 +209,7 @@ on conflict (id) do nothing`,
 		id, "https://example.com/"+id, "veckey-"+id); err != nil {
 		return fmt.Errorf("seed reading %q: %w", id, err)
 	}
-	return vector.NewPostgres(s.pool).Upsert(ctx, id, vec)
+	return vector.NewPostgres(s.pool).Upsert(ctx, id, vec, generation)
 }
 
 func (s *seedingVectorIndex) Query(ctx context.Context, vec []float32, topK int, excludeID string) ([]vector.Match, error) {

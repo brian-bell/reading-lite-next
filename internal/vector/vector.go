@@ -13,6 +13,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 )
 
 // Dim is the embedding dimension every indexed vector must carry.
@@ -32,8 +33,24 @@ type Match struct {
 // Index stores reading embeddings and answers nearest-neighbor queries. It is
 // the VectorIndex port: the production adapter is pgvector, [Memory] the fake.
 type Index interface {
-	// Upsert stores or replaces the vector for id. The vector must have length Dim.
-	Upsert(ctx context.Context, id string, vec []float32) error
+	// Upsert stores or replaces the vector for id. The vector must have length
+	// Dim.
+	//
+	// generation, when non-nil, fences the write to the run that produced vec:
+	// if the index already holds a vector for id recorded at a later
+	// generation, Upsert leaves the stored vector unchanged and returns nil (a
+	// silent no-op, not an error — a stale write should never fail the caller's
+	// run, it should just lose quietly). An equal generation always succeeds
+	// (an idempotent retry of the same run re-upserting its own vector).
+	//
+	// generation == nil writes unconditionally, matching the pre-fence
+	// behavior — but this cuts both ways: a nil-generation Upsert against a row
+	// that already carries an established non-nil generation still overwrites
+	// it and clears the stored generation back to nil, silently un-fencing
+	// that row for any future caller. The port only protects rows whose
+	// callers consistently pass a non-nil generation; it does not enforce that
+	// on your behalf.
+	Upsert(ctx context.Context, id string, vec []float32, generation *time.Time) error
 	// Query returns up to topK matches ranked by descending cosine similarity,
 	// omitting excludeID (matched exactly; the zero value "" excludes nothing).
 	// The query vector must have length Dim.
@@ -42,20 +59,27 @@ type Index interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// entry is one stored vector plus the generation it was last written at.
+type entry struct {
+	vec        []float32
+	generation *time.Time
+}
+
 // Memory is a concurrency-safe in-memory [Index] backed by exact cosine
 // similarity over a map.
 type Memory struct {
 	mu   sync.RWMutex
-	vecs map[string][]float32
+	vecs map[string]entry
 }
 
 // NewMemory returns an empty in-memory vector index.
 func NewMemory() *Memory {
-	return &Memory{vecs: map[string][]float32{}}
+	return &Memory{vecs: map[string]entry{}}
 }
 
-// Upsert stores a copy of vec under id, replacing any existing vector.
-func (m *Memory) Upsert(ctx context.Context, id string, vec []float32) error {
+// Upsert stores a copy of vec under id, replacing any existing vector, subject
+// to the generation fence described on [Index.Upsert].
+func (m *Memory) Upsert(ctx context.Context, id string, vec []float32, generation *time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -66,8 +90,23 @@ func (m *Memory) Upsert(ctx context.Context, id string, vec []float32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.vecs[id] = slices.Clone(vec)
+	if existing, ok := m.vecs[id]; ok && generation != nil && existing.generation != nil &&
+		existing.generation.After(*generation) {
+		return nil
+	}
+
+	m.vecs[id] = entry{vec: slices.Clone(vec), generation: cloneTime(generation)}
 	return nil
+}
+
+// cloneTime returns a defensive copy of t so the caller cannot mutate stored
+// state through an aliased pointer.
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
 }
 
 // Query ranks stored vectors by cosine similarity to vec and returns the top
@@ -91,7 +130,7 @@ func (m *Memory) Query(ctx context.Context, vec []float32, topK int, excludeID s
 		if excludeID != "" && id == excludeID {
 			continue
 		}
-		matches = append(matches, Match{ID: id, Score: cosine(vec, stored)})
+		matches = append(matches, Match{ID: id, Score: cosine(vec, stored.vec)})
 	}
 	m.mu.RUnlock()
 

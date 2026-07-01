@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
@@ -47,11 +48,11 @@ type seedingIndex struct {
 	idx  *vector.Postgres
 }
 
-func (s *seedingIndex) Upsert(ctx context.Context, id string, vec []float32) error {
+func (s *seedingIndex) Upsert(ctx context.Context, id string, vec []float32, generation *time.Time) error {
 	// Dimension rejection must happen before touching the DB, matching the port
 	// contract (and avoiding a stray seeded row for an invalid upsert).
 	if len(vec) != vector.Dim {
-		return s.idx.Upsert(ctx, id, vec)
+		return s.idx.Upsert(ctx, id, vec, generation)
 	}
 	// Seed only the row's existence (never any vector data); "do nothing" on
 	// conflict so the contract's UpsertReplaces case is decided entirely by the
@@ -63,7 +64,7 @@ on conflict (id) do nothing`,
 		id, "https://example.com/"+id, "veckey-"+id); err != nil {
 		return fmt.Errorf("seed reading %q: %w", id, err)
 	}
-	return s.idx.Upsert(ctx, id, vec)
+	return s.idx.Upsert(ctx, id, vec, generation)
 }
 
 func (s *seedingIndex) Query(ctx context.Context, vec []float32, topK int, excludeID string) ([]vector.Match, error) {

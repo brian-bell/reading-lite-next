@@ -133,7 +133,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 	// it, proving upsert + query + hydrate end to end. It must be ready: hydrate
 	// only snapshots ready readings.
 	neighbor := h.seed(t, "neighbor", "https://example.com/neighbor")
-	if err := h.vectors.Upsert(context.Background(), neighbor.ID, unitVec()); err != nil {
+	if err := h.vectors.Upsert(context.Background(), neighbor.ID, unitVec(), nil); err != nil {
 		t.Fatalf("seed neighbor vector: %v", err)
 	}
 	if err := h.store.UpdateContent(context.Background(), neighbor.ID, store.ContentFields{Title: "Neighbor Title", Now: epoch}); err != nil {
@@ -823,6 +823,67 @@ func TestPipeline_StaleRunCannotWriteContentAfterReprocess(t *testing.T) {
 	got := h.get(t, "r1")
 	if got.ContentKey != "" || got.Title != "" || got.Summary != "" {
 		t.Fatalf("stale content was written after reprocess: %+v", got)
+	}
+}
+
+// TestPipeline_StaleReuseUpsertCannotOverwriteReplacementVector proves the
+// generation fence (issue #9): the reuse path's vector upsert is fenced on
+// r.StartedAt, so a run holding an older lease cannot clobber a vector a
+// replacement run already wrote at a later generation — independent of ctx
+// cancellation, since ctx is never cancelled in this test.
+func TestPipeline_StaleReuseUpsertCannotOverwriteReplacementVector(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.seed(t, "r1", "https://example.com/post")
+
+	earlier := epoch.Add(-10 * time.Minute)
+	later := epoch.Add(-time.Minute)
+
+	// Drive the real store into a Running state with an older lease and a
+	// checkpointed content_key, so Process takes the reuse path.
+	if err := h.store.UpdateStatus(context.Background(), "r1", reading.Running, store.StatusFields{
+		Now:       epoch,
+		StartedAt: &earlier,
+	}); err != nil {
+		t.Fatalf("seed running status: %v", err)
+	}
+	if err := h.blobs.Put(context.Background(), "readings/r1/content.md", []byte("# Old\n\nOld body."), "text/markdown"); err != nil {
+		t.Fatalf("seed content blob: %v", err)
+	}
+	if err := h.store.UpdateContent(context.Background(), "r1", store.ContentFields{
+		Now:        epoch,
+		Title:      "Old Title",
+		ContentKey: "readings/r1/content.md",
+	}); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+
+	// The replacement run already wrote its fresh vector at the later
+	// generation. Its direction must be orthogonal to the harness's default
+	// embedder output (unitVec, direction (1,0,0,...)) so a stale unfenced
+	// overwrite is unambiguously detectable as a score collapse, not a
+	// same-direction coincidence.
+	replacementVec := make([]float32, vector.Dim)
+	replacementVec[1] = 1
+	if err := h.vectors.Upsert(context.Background(), "r1", replacementVec, &later); err != nil {
+		t.Fatalf("seed replacement vector: %v", err)
+	}
+
+	res := h.pipeline.Process(context.Background(), "r1")
+	if res.Outcome != dispatch.Done {
+		t.Fatalf("Process result = %+v, want Done", res)
+	}
+
+	if h.embedder.Calls() != 1 {
+		t.Fatalf("embedder calls = %d, want 1 (reuse path must re-embed to upsert)", h.embedder.Calls())
+	}
+	got, err := h.vectors.Query(context.Background(), replacementVec, 1, "")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "r1" || got[0].Score < 0.99 {
+		t.Fatalf("replacement vector was overwritten by stale reuse upsert: %+v", got)
 	}
 }
 

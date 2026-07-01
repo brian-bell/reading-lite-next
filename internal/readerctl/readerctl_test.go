@@ -395,7 +395,7 @@ func TestRun_DropYesDeletesRawContentVectorThenMetadata(t *testing.T) {
 	saveReading(t, cmd.Store, readingWithKeys("r1", "https://r1.test", reading.Ready, time.Unix(1, 0), "raw", "content"))
 	putBlob(t, cmd.Blobs, "raw")
 	putBlob(t, cmd.Blobs, "content")
-	if err := cmd.Vector.Upsert(context.Background(), "r1", make([]float32, vector.Dim)); err != nil {
+	if err := cmd.Vector.Upsert(context.Background(), "r1", make([]float32, vector.Dim), nil); err != nil {
 		t.Fatalf("Vector.Upsert() error = %v", err)
 	}
 

@@ -24,7 +24,7 @@ func TestMemory_StoresCopies(t *testing.T) {
 	idx := vector.NewMemory()
 	v := make([]float32, vector.Dim)
 	v[0] = 1
-	if err := idx.Upsert(ctx, "a", v); err != nil {
+	if err := idx.Upsert(ctx, "a", v, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	v[0] = 0
@@ -45,7 +45,7 @@ func TestMemory_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	idx := vector.NewMemory()
-	if err := idx.Upsert(ctx, "a", queryVec(1, 0)); err == nil {
+	if err := idx.Upsert(ctx, "a", queryVec(1, 0), nil); err == nil {
 		t.Fatal("Upsert on cancelled ctx = nil, want error")
 	}
 	if _, err := idx.Query(ctx, queryVec(1, 0), 1, ""); err == nil {
@@ -67,7 +67,7 @@ func TestMemory_ConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			v := queryVec(float32(i), 1)
-			_ = idx.Upsert(ctx, "shared", v)
+			_ = idx.Upsert(ctx, "shared", v, nil)
 			_, _ = idx.Query(ctx, v, 5, "")
 			_ = idx.Delete(ctx, "shared")
 		}()

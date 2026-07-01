@@ -3,6 +3,7 @@ package vector
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
@@ -25,15 +26,22 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
 
-// Upsert stores or replaces the vector for id. The vector must have length [Dim].
-func (p *Postgres) Upsert(ctx context.Context, id string, vec []float32) error {
+// Upsert stores or replaces the vector for id. The vector must have length
+// [Dim]. generation fences the write per [Index.Upsert]: a stale write against
+// an already-newer-generation row resolves the ON CONFLICT as a no-op (0 rows
+// touched, original row untouched), matching Memory's silent no-op.
+func (p *Postgres) Upsert(ctx context.Context, id string, vec []float32, generation *time.Time) error {
 	if len(vec) != Dim {
 		return ErrDimension
 	}
 	_, err := p.pool.Exec(ctx, `
-insert into reading_vectors (reading_id, embedding) values ($1, $2::vector)
-on conflict (reading_id) do update set embedding = excluded.embedding`,
-		id, pgvector.NewVector(vec).String())
+insert into reading_vectors (reading_id, embedding, generation) values ($1, $2::vector, $3)
+on conflict (reading_id) do update
+  set embedding = excluded.embedding, generation = excluded.generation
+  where excluded.generation is null
+     or reading_vectors.generation is null
+     or excluded.generation >= reading_vectors.generation`,
+		id, pgvector.NewVector(vec).String(), generation)
 	if err != nil {
 		return fmt.Errorf("vector: upsert %q: %w", id, err)
 	}

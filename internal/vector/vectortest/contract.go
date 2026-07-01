@@ -9,6 +9,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/bbell/reading-lite/internal/vector"
 )
@@ -185,11 +186,69 @@ func RunContract(t *testing.T, newIndex Factory) {
 		idx := newIndex(t)
 		short := make([]float32, vector.Dim-1)
 
-		if err := idx.Upsert(ctx, "a", short); !errors.Is(err, vector.ErrDimension) {
+		if err := idx.Upsert(ctx, "a", short, nil); !errors.Is(err, vector.ErrDimension) {
 			t.Fatalf("Upsert wrong dim = %v, want ErrDimension", err)
 		}
 		if _, err := idx.Query(ctx, short, 10, ""); !errors.Is(err, vector.ErrDimension) {
 			t.Fatalf("Query wrong dim = %v, want ErrDimension", err)
+		}
+	})
+
+	t.Run("GenerationFenceRejectsStaleUpsert", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		idx := newIndex(t)
+		older := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+		newer := older.Add(time.Hour)
+
+		mustUpsertAt(t, idx, "a", vec(1, 0), &newer)
+
+		// A stale write from an older generation is a silent no-op, not an
+		// error, and must not overwrite the newer vector.
+		if err := idx.Upsert(ctx, "a", vec(0, 1), &older); err != nil {
+			t.Fatalf("Upsert stale generation = %v, want nil (silent no-op)", err)
+		}
+		got, err := idx.Query(ctx, vec(1, 0), 1, "")
+		if err != nil {
+			t.Fatalf("Query after stale upsert: %v", err)
+		}
+		if len(got) != 1 || math.Abs(got[0].Score-1) > 1e-6 {
+			t.Fatalf("stale generation overwrote newer vector: %v, want [a] at score ~1.0", got)
+		}
+
+		// An equal generation (idempotent retry of the same run) still applies.
+		mustUpsertAt(t, idx, "a", vec(0, 1), &newer)
+		got, err = idx.Query(ctx, vec(0, 1), 1, "")
+		if err != nil {
+			t.Fatalf("Query after same-generation upsert: %v", err)
+		}
+		if len(got) != 1 || math.Abs(got[0].Score-1) > 1e-6 {
+			t.Fatalf("same-generation upsert did not apply: %v, want [a] at score ~1.0", got)
+		}
+
+		// A nil generation always applies (unfenced).
+		mustUpsertAt(t, idx, "a", vec(1, 0), nil)
+		got, err = idx.Query(ctx, vec(1, 0), 1, "")
+		if err != nil {
+			t.Fatalf("Query after unfenced upsert: %v", err)
+		}
+		if len(got) != 1 || math.Abs(got[0].Score-1) > 1e-6 {
+			t.Fatalf("unfenced upsert did not apply: %v, want [a] at score ~1.0", got)
+		}
+
+		// A row that has never carried a generation (e.g. a pre-migration
+		// reading_vectors row, whose generation column starts NULL) accepts its
+		// first fenced write unconditionally, since there is no established
+		// generation to compare against.
+		mustUpsertAt(t, idx, "b", vec(1, 0), nil)
+		mustUpsertAt(t, idx, "b", vec(0, 1), &newer)
+		got, err = idx.Query(ctx, vec(0, 1), 1, "")
+		if err != nil {
+			t.Fatalf("Query after first-fenced-write-on-unfenced-row: %v", err)
+		}
+		if !equalStrings(matchIDs(got), []string{"b"}) || math.Abs(got[0].Score-1) > 1e-6 {
+			t.Fatalf("first fenced write on a never-fenced row was rejected: %v, want [b] at score ~1.0", got)
 		}
 	})
 }
@@ -205,8 +264,18 @@ func vec(components ...float32) []float32 {
 
 func mustUpsert(t *testing.T, idx vector.Index, id string, v []float32) {
 	t.Helper()
-	if err := idx.Upsert(context.Background(), id, v); err != nil {
+	if err := idx.Upsert(context.Background(), id, v, nil); err != nil {
 		t.Fatalf("Upsert %q: %v", id, err)
+	}
+}
+
+// mustUpsertAt is like mustUpsert but carries an explicit generation fence,
+// for the generation-fence contract case below. mustUpsert (nil generation)
+// stays untouched for the other, unfenced contract cases above.
+func mustUpsertAt(t *testing.T, idx vector.Index, id string, v []float32, generation *time.Time) {
+	t.Helper()
+	if err := idx.Upsert(context.Background(), id, v, generation); err != nil {
+		t.Fatalf("Upsert %q at %v: %v", id, generation, err)
 	}
 }
 
