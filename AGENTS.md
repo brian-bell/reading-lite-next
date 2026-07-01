@@ -9,9 +9,10 @@ The production `cmd/reader-api` binary validates env config, runs embedded store
 wires production adapters, starts dispatcher workers, runs startup recovery, serves the HTTP
 API, reports dependency health, handles exact-origin CORS for configured SPA origins, and shuts
 down gracefully. `cmd/readerctl` delegates to the tested `internal/readerctl` command core, but
-stateful default-binary dependency wiring is still deferred. The current `web/` tracer bullet
-reads `VITE_READER_API_BASE_URL`, stores a bearer token in `localStorage`, and displays
-`/api/healthz`.
+stateful default-binary dependency wiring is still deferred. The `web/` SPA reads
+`VITE_READER_API_BASE_URL`, stores a bearer token in `localStorage`, shows `/api/healthz`, and
+drives the authenticated reading workflow: list with live processing polls, URL submission,
+a reading detail view with content/raw fetch, and a reprocess action.
 
 ## Structure
 
@@ -42,9 +43,11 @@ reads `VITE_READER_API_BASE_URL`, stores a bearer token in `localStorage`, and d
   health/dependency checks, DTO mapping, cursor encoding, blob streaming, and delegation to
   `readingops`.
 - `internal/bookmarks/` is the shared bookmark parser for HTTP and `readerctl`.
-- `web/` is the isolated Vite/React/TypeScript SPA package. It currently implements only the
-  bootstrap utility: configured API base URL, unauthenticated health fetches, typed API errors,
-  local bearer-token persistence, and a focused health/status screen.
+- `web/` is the isolated Vite/React/TypeScript SPA package: configured API base URL, typed API
+  client with the Go error envelope, local bearer-token persistence, health/status screen, an
+  authenticated reading list with cursor paging and live processing polls, URL submission, and a
+  reading detail view (summary/tags/similar/diagnostics, markdown content, raw download, and a
+  reprocess action) with race-safe request-id guards.
 - `.github/workflows/ci.yml`, `Makefile`, `.golangci.yml`, `sqlc.yaml`, and `go.mod` define the
   project tooling and generated-code conventions.
 

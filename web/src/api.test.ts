@@ -440,4 +440,59 @@ describe('createAPIClient', () => {
       status: 404,
     });
   });
+
+  it('reprocesses a reading with bearer auth and no request body', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 'reading 1', status: 'pending' }), { status: 202 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    await expect(client.reprocess({ token: ' secret ', id: 'reading 1' })).resolves.toEqual({
+      id: 'reading 1',
+      status: 'pending',
+    });
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings/reading%201/reprocess', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret',
+      },
+    });
+  });
+
+  it('turns reprocess Go error envelopes into APIError values', async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error: { code: 'not_found', message: 'reading not found' } }), { status: 404 }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    const request = client.reprocess({ token: 'stored-token', id: 'missing' });
+    await expect(request).rejects.toBeInstanceOf(APIError);
+    await expect(request).rejects.toMatchObject({
+      code: 'not_found',
+      message: 'reading not found',
+      status: 404,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects malformed reprocess success responses', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 42, status: 'queued' }), { status: 202 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.reprocess({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a reprocess document',
+      status: 202,
+    });
+  });
+
+  it('rejects missing API base URL for reprocess without calling fetch', async () => {
+    const fetchImpl = vi.fn();
+    const client = createAPIClient({ baseURL: '', fetchImpl });
+
+    await expect(client.reprocess({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'missing_config',
+      message: 'VITE_READER_API_BASE_URL is required',
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });

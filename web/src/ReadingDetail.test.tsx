@@ -68,8 +68,16 @@ function fetchRoutes(handlers: {
   detail?: (id: string) => Response | Promise<Response>;
   content?: (id: string) => Response | Promise<Response>;
   raw?: (id: string) => Response | Promise<Response>;
+  reprocess?: (id: string) => Response | Promise<Response>;
 } = {}) {
-  const { readings = () => readingsResponse([]), health = () => jsonResponse(okHealth), detail, content, raw } = handlers;
+  const {
+    readings = () => readingsResponse([]),
+    health = () => jsonResponse(okHealth),
+    detail,
+    content,
+    raw,
+    reprocess,
+  } = handlers;
   return vi.fn(async (input: string) => {
     const url = new URL(input);
     if (url.pathname === '/api/healthz') {
@@ -77,6 +85,13 @@ function fetchRoutes(handlers: {
     }
     if (url.pathname === '/api/readings') {
       return readings();
+    }
+    const reprocessMatch = url.pathname.match(/^\/api\/readings\/([^/]+)\/reprocess$/);
+    if (reprocessMatch) {
+      if (!reprocess) {
+        throw new Error(`unexpected reprocess request: ${input}`);
+      }
+      return reprocess(reprocessMatch[1]);
     }
     const contentMatch = url.pathname.match(/^\/api\/readings\/([^/]+)\/content$/);
     if (contentMatch) {
@@ -414,6 +429,57 @@ describe('ReadingDetail', () => {
       expect(createObjectURL).not.toHaveBeenCalled();
       expect(clickSpy).not.toHaveBeenCalled();
       expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
+    } finally {
+      clickSpy.mockRestore();
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+    }
+  });
+
+  it('does not trigger a stale raw download after reprocess succeeds', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const rawDeferred = deferred<Response>();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: () => rawDeferred.promise,
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Example article' }));
+      expect(await screen.findByText('Body text.')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Download raw source' }));
+      await user.click(screen.getByRole('button', { name: /reprocess/i }));
+      expect(await screen.findByText('Processing...')).toBeInTheDocument();
+
+      await act(async () => {
+        rawDeferred.resolve(
+          new Response(bytes, {
+            status: 200,
+            headers: { 'Content-Disposition': 'attachment; filename="raw-content"' },
+          }),
+        );
+        await rawDeferred.promise;
+        await Promise.resolve();
+      });
+
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(clickSpy).not.toHaveBeenCalled();
+      expect(screen.getByText('Processing...')).toBeInTheDocument();
     } finally {
       clickSpy.mockRestore();
       URL.createObjectURL = originalCreateObjectURL;
@@ -760,5 +826,437 @@ describe('ReadingDetail', () => {
     });
 
     expect(screen.getByText('Ready content')).toBeInTheDocument();
+  });
+});
+
+describe('Reprocess', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('reprocesses a ready reading, flipping it and its list item to pending and showing the processing view', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    let reprocessCalls = 0;
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: (id) => {
+        reprocessCalls += 1;
+        return jsonResponse({ id, status: 'pending' }, 202);
+      },
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('Body text.')).toBeInTheDocument();
+    expect(screen.getAllByText('A concise summary.')).toHaveLength(2);
+    expect(screen.getByRole('link', { name: 'Related reading' })).toBeInTheDocument();
+    expect(screen.getByRole('table', { name: 'Timings' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /reprocess/i }));
+
+    expect(await screen.findByText('Processing...')).toBeInTheDocument();
+    expect(reprocessCalls).toBe(1);
+    expect(screen.queryByRole('button', { name: /reprocess/i })).not.toBeInTheDocument();
+    expect(screen.queryByText('Body text.')).not.toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Related reading' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('table', { name: 'Timings' })).not.toBeInTheDocument();
+
+    const list = screen.getByRole('list', { name: 'Readings' });
+    expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
+  });
+
+  it('exposes reprocess for a failed reading and clears its error on success', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'failed' })]),
+      detail: () => jsonResponse(detailReading({ status: 'failed', error: 'extraction failed: timeout' })),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('extraction failed: timeout')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /reprocess/i }));
+
+    expect(await screen.findByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('extraction failed: timeout')).not.toBeInTheDocument();
+  });
+
+  it('does not expose reprocess for a fresh pending reading', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'pending' })]),
+      detail: () => jsonResponse(detailReading({ status: 'pending' })),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reprocess/i })).not.toBeInTheDocument();
+  });
+
+  it('exposes reprocess for a stale running reading', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'running' })]),
+      detail: () => jsonResponse(detailReading({ status: 'running', stale_reason: 'processing stalled after 10m0s' })),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+
+    expect(await screen.findByRole('button', { name: /reprocess/i })).toBeInTheDocument();
+  });
+
+  it('exposes reprocess for a stale pending reading', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'pending' })]),
+      detail: () => jsonResponse(detailReading({ status: 'pending', stale_reason: 'queued longer than 10m0s' })),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+
+    expect(await screen.findByRole('button', { name: /reprocess/i })).toBeInTheDocument();
+  });
+
+  it('issues a single reprocess and shows a busy state under a rapid double-click', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let reprocessCalls = 0;
+    const gate = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: (id) => {
+        reprocessCalls += 1;
+        void id;
+        return gate.promise;
+      },
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('Body text.')).toBeInTheDocument();
+
+    const button = screen.getByRole('button', { name: /reprocess/i });
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('aria-busy', 'true');
+    expect(reprocessCalls).toBe(1);
+
+    await act(async () => {
+      gate.resolve(jsonResponse({ id: 'reading-1', status: 'pending' }, 202));
+      await gate.promise;
+      await Promise.resolve();
+    });
+
+    expect(reprocessCalls).toBe(1);
+  });
+
+  it('renders a reprocess failure inline without losing the detail view or flipping status', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: () => jsonResponse({ error: { code: 'internal', message: 'reprocess exploded' } }, 500),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('Body text.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /reprocess/i }));
+
+    expect(await screen.findByText('reprocess exploded')).toBeInTheDocument();
+    // Detail view stays mounted with its heading and content; status is unchanged.
+    const region = screen.getByRole('region', { name: 'Reading detail' });
+    expect(within(region).getByRole('heading', { name: 'Example article', level: 3 })).toBeInTheDocument();
+    expect(screen.getByText('Body text.')).toBeInTheDocument();
+    expect(within(region).getByLabelText('Status: Ready')).toBeInTheDocument();
+    const button = screen.getByRole('button', { name: /reprocess/i });
+    expect(button).toBeEnabled();
+    expect(button).not.toHaveAttribute('aria-busy', 'true');
+  });
+
+  it('resumes polling after reprocess until the reading is ready again', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let detailCalls = 0;
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => {
+        detailCalls += 1;
+        if (detailCalls === 1) {
+          return jsonResponse(detailReading({ status: 'ready' }));
+        }
+        if (detailCalls === 2) {
+          return jsonResponse(detailReading({ status: 'running' }));
+        }
+        return jsonResponse(detailReading({ status: 'ready' }));
+      },
+      content: (id) => new Response(`Content for ${id}`, { status: 200 }),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Example article' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Content for reading-1')).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: /reprocess/i }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+
+    // Poll re-engages from the pending flip: running, then ready with content.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Content for reading-1')).toBeInTheDocument();
+  });
+
+  it('keeps the authoritative reprocess status when a detail poll resolves stale', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let detailCalls = 0;
+    const slowPoll = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'running' })]),
+      detail: () => {
+        detailCalls += 1;
+        if (detailCalls === 1) {
+          return jsonResponse(detailReading({ status: 'running', stale_reason: 'processing stalled after 10m0s' }));
+        }
+        if (detailCalls === 2) {
+          return slowPoll.promise;
+        }
+        return jsonResponse(detailReading({ status: 'running', stale_reason: 'processing stalled after 10m0s' }));
+      },
+      content: () => new Response('Ready content', { status: 200 }),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Example article' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(detailCalls).toBe(1);
+
+    // A poll tick starts a slow detail request that stays in flight.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailCalls).toBe(2);
+
+    // Reprocess resolves while that poll is still in flight; its 202 is authoritative.
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: /reprocess/i }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reprocess/i })).not.toBeInTheDocument();
+
+    // The stale in-flight poll now resolves; it must not overwrite the pending status
+    // with its older "ready" answer and pull in ready content.
+    await act(async () => {
+      slowPoll.resolve(jsonResponse(detailReading({ status: 'ready' })));
+      await slowPoll.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('Ready content')).not.toBeInTheDocument();
+  });
+
+  it('keeps the authoritative reprocess status when a list poll resolves stale', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let readingsCalls = 0;
+    const staleListPoll = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => {
+        readingsCalls += 1;
+        if (readingsCalls === 1) {
+          return readingsResponse([
+            reading(),
+            reading({
+              id: 'reading-2',
+              url: 'https://example.com/other',
+              status: 'running',
+              title: 'Other processing article',
+              summary: undefined,
+            }),
+          ]);
+        }
+        return staleListPoll.promise;
+      },
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Other processing article')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(readingsCalls).toBe(2);
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Example article' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Body text.')).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: /reprocess/i }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+
+    await act(async () => {
+      staleListPoll.resolve(
+        readingsResponse([
+          reading(),
+          reading({
+            id: 'reading-2',
+            url: 'https://example.com/other',
+            status: 'ready',
+            title: 'Other ready article',
+            summary: undefined,
+          }),
+        ]),
+      );
+      await staleListPoll.promise;
+      await Promise.resolve();
+    });
+
+    const list = screen.getByRole('list', { name: 'Readings' });
+    expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+  });
+
+  it('updates the list for a successful reprocess after navigating back', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const reprocessDeferred = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: () => reprocessDeferred.promise,
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('Body text.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /reprocess/i }));
+    await user.click(screen.getByRole('button', { name: 'Back to list' }));
+
+    await act(async () => {
+      reprocessDeferred.resolve(jsonResponse({ id: 'reading-1', status: 'pending' }, 202));
+      await reprocessDeferred.promise;
+      await Promise.resolve();
+    });
+
+    // The superseded response must not resurrect the detail view.
+    expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
+    const list = screen.getByRole('list', { name: 'Readings' });
+    expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
   });
 });
