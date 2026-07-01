@@ -508,6 +508,12 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       // overlay so the processing view is clean, and flip the matching list item.
       setDetail((current) => (current && current.id === id ? { ...current, status: result.status, error: '', stale_reason: '' } : current));
       setReadings((list) => list.map((item) => (item.id === id ? { ...item, status: result.status } : item)));
+      // The re-enqueued reading no longer has current content; drop any stale
+      // markdown so a later render can't surface it. Mirrors fetchDetail's
+      // non-ready reset (the processing view short-circuits on status anyway).
+      setContent('');
+      setContentState('idle');
+      setContentError('');
       // Invalidate any in-flight detail poll so its late response cannot overwrite
       // the authoritative status; the detail-poll effect re-arms from the flip.
       detailRequestID.current += 1;

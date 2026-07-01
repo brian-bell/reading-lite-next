@@ -869,6 +869,22 @@ describe('Reprocess', () => {
     expect(await screen.findByRole('button', { name: /reprocess/i })).toBeInTheDocument();
   });
 
+  it('exposes reprocess for a stale pending reading', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'pending' })]),
+      detail: () => jsonResponse(detailReading({ status: 'pending', stale_reason: 'queued longer than 10m0s' })),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+
+    expect(await screen.findByRole('button', { name: /reprocess/i })).toBeInTheDocument();
+  });
+
   it('issues a single reprocess and shows a busy state under a rapid double-click', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     let reprocessCalls = 0;
