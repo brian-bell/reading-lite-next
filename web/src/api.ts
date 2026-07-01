@@ -35,6 +35,8 @@ export type SubmitURLDocument = {
   status: ReadingStatus;
 };
 
+export type ReprocessDocument = SubmitURLDocument;
+
 export type SimilarItem = {
   id: string;
   score: number;
@@ -93,6 +95,7 @@ export type APIClient = {
   health(): Promise<HealthDocument>;
   listReadings(options: { token: string; cursor?: string }): Promise<ReadingsListDocument>;
   submitURL(options: { token: string; url: string }): Promise<SubmitURLDocument>;
+  reprocess(options: { token: string; id: string }): Promise<ReprocessDocument>;
   getReading(options: { token: string; id: string }): Promise<ReadingDetail>;
   getContent(options: { token: string; id: string }): Promise<string>;
   getRawBlob(options: { token: string; id: string }): Promise<RawBlob>;
@@ -178,6 +181,27 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
         return body;
       }
       throw new APIError('invalid_response', 'API response was not a submit URL document', response.status);
+    },
+
+    async reprocess({ token, id }: { token: string; id: string }): Promise<ReprocessDocument> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const response = await fetchImpl(`${normalizedBaseURL}/api/readings/${encodeURIComponent(id)}/reprocess`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token.trim()}`,
+        },
+      });
+      const body = await responseBody(response);
+      if (!response.ok) {
+        throw errorFromBody(response, body);
+      }
+      if (isSubmitURLDocument(body)) {
+        return body;
+      }
+      throw new APIError('invalid_response', 'API response was not a reprocess document', response.status);
     },
 
     async getReading({ token, id }: { token: string; id: string }): Promise<ReadingDetail> {

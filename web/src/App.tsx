@@ -60,11 +60,15 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const [contentError, setContentError] = useState('');
   const [rawDownloading, setRawDownloading] = useState(false);
   const [rawError, setRawError] = useState('');
+  const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessError, setReprocessError] = useState('');
   const readingsRequestID = useRef(0);
   const readingsLoadingRef = useRef({ firstPage: false, nextPage: false });
   const detailRequestID = useRef(0);
   const detailFetchInFlight = useRef(false);
   const rawRequestID = useRef(0);
+  const reprocessRequestID = useRef(0);
+  const reprocessInFlight = useRef(false);
 
   const refreshHealth = useCallback(async () => {
     setLoading(true);
@@ -384,6 +388,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const handleSelectReading = useCallback(
     (id: string) => {
       rawRequestID.current += 1;
+      reprocessRequestID.current += 1;
+      reprocessInFlight.current = false;
       setSelectedReadingID(id);
       setDetail(null);
       setDetailError('');
@@ -392,6 +398,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       setContentError('');
       setRawDownloading(false);
       setRawError('');
+      setReprocessing(false);
+      setReprocessError('');
       void fetchDetail(id);
     },
     [fetchDetail],
@@ -401,6 +409,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     detailRequestID.current += 1;
     detailFetchInFlight.current = false;
     rawRequestID.current += 1;
+    reprocessRequestID.current += 1;
+    reprocessInFlight.current = false;
     setSelectedReadingID(undefined);
     setDetail(null);
     setDetailLoading(false);
@@ -410,6 +420,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     setContentError('');
     setRawDownloading(false);
     setRawError('');
+    setReprocessing(false);
+    setReprocessError('');
   }, []);
 
   const handleRetryContent = useCallback(() => {
@@ -466,6 +478,52 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       }
     }
   }, [fetchImpl, rawDownloading, runtimeEnv, selectedReadingID]);
+
+  const handleReprocess = useCallback(async () => {
+    // Ref guard (not the `reprocessing` state) so a rapid double-click or a
+    // fake-timer path that fires before React re-renders the disabled button
+    // still cannot double-submit.
+    if (selectedReadingID === undefined || reprocessInFlight.current) {
+      return;
+    }
+    reprocessInFlight.current = true;
+    // Snapshot a dedicated reprocess-request token. Selecting another reading,
+    // backing out, or changing the token bumps reprocessRequestID (and clears
+    // the busy/error state), so a response that arrives afterwards cannot flip a
+    // stale reading, write a superseded error, or leave the button stuck busy.
+    const requestID = reprocessRequestID.current + 1;
+    reprocessRequestID.current = requestID;
+    const id = selectedReadingID;
+    const requestToken = loadToken().trim();
+    setReprocessing(true);
+    setReprocessError('');
+    try {
+      const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
+      const result = await client.reprocess({ token: requestToken, id });
+      if (reprocessRequestID.current !== requestID || loadToken().trim() !== requestToken) {
+        return;
+      }
+      // The 202 body is authoritative: the backend cleared the checkpoint and
+      // re-enqueued synchronously. Apply its status, clear any prior failure/stale
+      // overlay so the processing view is clean, and flip the matching list item.
+      setDetail((current) => (current && current.id === id ? { ...current, status: result.status, error: '', stale_reason: '' } : current));
+      setReadings((list) => list.map((item) => (item.id === id ? { ...item, status: result.status } : item)));
+      // Invalidate any in-flight detail poll so its late response cannot overwrite
+      // the authoritative status; the detail-poll effect re-arms from the flip.
+      detailRequestID.current += 1;
+      detailFetchInFlight.current = false;
+    } catch (err) {
+      if (reprocessRequestID.current !== requestID || loadToken().trim() !== requestToken) {
+        return;
+      }
+      setReprocessError(messageFromError(err, 'Unable to reprocess reading'));
+    } finally {
+      if (reprocessRequestID.current === requestID) {
+        reprocessInFlight.current = false;
+        setReprocessing(false);
+      }
+    }
+  }, [runtimeEnv, fetchImpl, selectedReadingID]);
 
   const isDetailProcessing = detail !== null && (detail.status === 'pending' || detail.status === 'running');
 
@@ -607,9 +665,12 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
             contentError={contentError}
             rawDownloading={rawDownloading}
             rawError={rawError}
+            reprocessing={reprocessing}
+            reprocessError={reprocessError}
             onBack={handleBackToList}
             onRetryContent={handleRetryContent}
             onDownloadRaw={() => void handleDownloadRaw()}
+            onReprocess={() => void handleReprocess()}
           />
         ) : null}
       </section>
@@ -690,6 +751,13 @@ function sameStrings(left: string[], right: string[]): boolean {
 
 function hasProcessingReadings(readings: ReadingListItem[]): boolean {
   return readings.some((reading) => reading.status === 'pending' || reading.status === 'running');
+}
+
+function canReprocess(reading: ReadingDetail): boolean {
+  // Terminal readings can always be re-run; stale in-flight readings can be
+  // forced. Fresh pending/running readings are already queued, so the backend
+  // would no-op — hide the control for them.
+  return reading.status === 'ready' || reading.status === 'failed' || Boolean(reading.stale_reason);
 }
 
 function isUnauthorizedError(err: unknown): boolean {
@@ -777,9 +845,12 @@ function ReadingDetailView({
   contentError,
   rawDownloading,
   rawError,
+  reprocessing,
+  reprocessError,
   onBack,
   onRetryContent,
   onDownloadRaw,
+  onReprocess,
 }: {
   reading: ReadingDetail | null;
   loading: boolean;
@@ -789,9 +860,12 @@ function ReadingDetailView({
   contentError: string;
   rawDownloading: boolean;
   rawError: string;
+  reprocessing: boolean;
+  reprocessError: string;
   onBack: () => void;
   onRetryContent: () => void;
   onDownloadRaw: () => void;
+  onReprocess: () => void;
 }) {
   return (
     <div className="reading-detail" role="region" aria-label="Reading detail">
@@ -846,6 +920,25 @@ function ReadingDetailView({
               </p>
             ) : null}
           </div>
+
+          {canReprocess(reading) ? (
+            <div className="reprocess">
+              <button
+                type="button"
+                className="secondary"
+                disabled={reprocessing}
+                aria-busy={reprocessing}
+                onClick={onReprocess}
+              >
+                Reprocess
+              </button>
+              {reprocessError ? (
+                <p role="alert" className="error-message">
+                  {reprocessError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </>
       ) : null}
     </div>
