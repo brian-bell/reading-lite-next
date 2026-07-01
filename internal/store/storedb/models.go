@@ -72,6 +72,7 @@ type Reading struct {
 }
 
 type ReadingVector struct {
-	ReadingID string
-	Embedding *pgvector.Vector
+	ReadingID  string
+	Embedding  *pgvector.Vector
+	Generation pgtype.Timestamptz
 }
