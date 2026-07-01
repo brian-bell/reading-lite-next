@@ -263,4 +263,181 @@ describe('createAPIClient', () => {
       status: 200,
     });
   });
+
+  it('fetches a reading detail document with all optional fields present', async () => {
+    const detail = {
+      id: 'reading-1',
+      url: 'https://example.com/article',
+      status: 'ready',
+      title: 'Example article',
+      site: 'Example',
+      summary: 'A concise summary.',
+      tags: ['go', 'reading'],
+      word_count: 512,
+      summary_json: { key_points: ['one'] },
+      similar_json: [{ id: 'reading-2', score: 0.91, title: 'Related', url: 'https://example.com/related' }],
+      diagnostics_json: {
+        source: 'fetch',
+        extraction_mode: 'readability',
+        similar_count: 1,
+        reused: false,
+        timings_ms: { fetch: 12.5, extract: 8 },
+      },
+      created_at: '2026-06-28T12:00:00Z',
+      updated_at: '2026-06-28T12:10:00Z',
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(detail), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    await expect(client.getReading({ token: 'stored-token', id: 'reading-1' })).resolves.toEqual(detail);
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings/reading-1', {
+      headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' },
+    });
+  });
+
+  it('fetches a reading detail document with all optional fields absent', async () => {
+    const detail = {
+      id: 'reading-1',
+      url: 'https://example.com/article',
+      status: 'pending',
+      created_at: '2026-06-28T12:00:00Z',
+      updated_at: '2026-06-28T12:10:00Z',
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(detail), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getReading({ token: 'stored-token', id: 'reading-1' })).resolves.toEqual({
+      ...detail,
+      similar_json: [],
+    });
+  });
+
+  it('normalizes null tags and null similar_json on a reading detail document', async () => {
+    const detail = {
+      id: 'reading-1',
+      url: 'https://example.com/article',
+      status: 'ready',
+      tags: null,
+      similar_json: null,
+      created_at: '2026-06-28T12:00:00Z',
+      updated_at: '2026-06-28T12:10:00Z',
+    };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(detail), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getReading({ token: 'stored-token', id: 'reading-1' })).resolves.toEqual({
+      ...detail,
+      tags: [],
+      similar_json: [],
+    });
+  });
+
+  it('rejects a 404 reading detail response as an APIError', async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error: { code: 'not_found', message: 'reading not found' } }), { status: 404 }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getReading({ token: 'stored-token', id: 'missing' })).rejects.toMatchObject({
+      code: 'not_found',
+      message: 'reading not found',
+      status: 404,
+    });
+  });
+
+  it('rejects an unauthorized reading detail response as an APIError', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'missing or invalid bearer token' } }), {
+          status: 401,
+        }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getReading({ token: 'bad-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'unauthorized',
+      status: 401,
+    });
+  });
+
+  it('rejects a malformed reading detail body', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 42 }), { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getReading({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a reading detail document',
+      status: 200,
+    });
+  });
+
+  it('fetches extracted content as raw text', async () => {
+    const fetchImpl = vi.fn(async () => new Response('# Heading\n\nBody text.', { status: 200 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    await expect(client.getContent({ token: 'stored-token', id: 'reading-1' })).resolves.toBe('# Heading\n\nBody text.');
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings/reading-1/content', {
+      headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' },
+    });
+  });
+
+  it('rejects a 404 content response as not_found', async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error: { code: 'not_found', message: 'blob not found' } }), { status: 404 }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getContent({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'not_found',
+      message: 'blob not found',
+      status: 404,
+    });
+  });
+
+  it('falls back to an http_error for a non-JSON content error body', async () => {
+    const fetchImpl = vi.fn(async () => new Response('upstream exploded', { status: 502, statusText: 'Bad Gateway' }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getContent({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'http_error',
+      message: 'Request failed with status 502',
+      status: 502,
+    });
+  });
+
+  it('fetches a raw blob download', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(bytes, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Disposition': 'attachment; filename="raw-content"',
+          },
+        }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    const result = await client.getRawBlob({ token: 'stored-token', id: 'reading-1' });
+    expect(result.filename).toBe('raw-content');
+    expect(result.blob).toBeInstanceOf(Blob);
+    await expect(result.blob.arrayBuffer()).resolves.toEqual(bytes.buffer);
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings/reading-1/raw', {
+      headers: { Authorization: 'Bearer stored-token' },
+    });
+  });
+
+  it('rejects a 404 raw blob response as not_found', async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error: { code: 'not_found', message: 'blob not found' } }), { status: 404 }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.getRawBlob({ token: 'stored-token', id: 'reading-1' })).rejects.toMatchObject({
+      code: 'not_found',
+      message: 'blob not found',
+      status: 404,
+    });
+  });
 });

@@ -35,12 +35,47 @@ export type SubmitURLDocument = {
   status: ReadingStatus;
 };
 
+export type SimilarItem = {
+  id: string;
+  score: number;
+  title?: string;
+  url?: string;
+};
+
+export type DiagnosticsJSON = {
+  source: string;
+  extraction_mode?: string;
+  similar_count: number;
+  reused?: boolean;
+  notify_error?: string;
+  timings_ms?: Record<string, number>;
+};
+
+export type ReadingDetail = ReadingListItem & {
+  summary_json?: unknown;
+  similar_json: SimilarItem[];
+  diagnostics_json?: DiagnosticsJSON;
+  stale_reason?: string;
+};
+
+export type RawBlob = {
+  blob: Blob;
+  filename: string;
+};
+
 type ReadingListItemWire = Omit<ReadingListItem, 'tags'> & {
   tags?: string[] | null;
 };
 
 type ReadingsListDocumentWire = Omit<ReadingsListDocument, 'readings'> & {
   readings: ReadingListItemWire[];
+};
+
+type ReadingDetailWire = ReadingListItemWire & {
+  summary_json?: unknown;
+  similar_json?: SimilarItem[] | null;
+  diagnostics_json?: DiagnosticsJSON | null;
+  stale_reason?: string;
 };
 
 type ViteEnv = {
@@ -58,6 +93,9 @@ export type APIClient = {
   health(): Promise<HealthDocument>;
   listReadings(options: { token: string; cursor?: string }): Promise<ReadingsListDocument>;
   submitURL(options: { token: string; url: string }): Promise<SubmitURLDocument>;
+  getReading(options: { token: string; id: string }): Promise<ReadingDetail>;
+  getContent(options: { token: string; id: string }): Promise<string>;
+  getRawBlob(options: { token: string; id: string }): Promise<RawBlob>;
 };
 
 export class APIError extends Error {
@@ -141,6 +179,50 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
       }
       throw new APIError('invalid_response', 'API response was not a submit URL document', response.status);
     },
+
+    async getReading({ token, id }: { token: string; id: string }): Promise<ReadingDetail> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const response = await fetchImpl(`${normalizedBaseURL}/api/readings/${encodeURIComponent(id)}`, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+      const body = await responseBody(response);
+      if (!response.ok) {
+        throw errorFromBody(response, body);
+      }
+      if (isReadingDetail(body)) {
+        return normalizeReadingDetail(body);
+      }
+      throw new APIError('invalid_response', 'API response was not a reading detail document', response.status);
+    },
+
+    async getContent({ token, id }: { token: string; id: string }): Promise<string> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const response = await fetchImpl(`${normalizedBaseURL}/api/readings/${encodeURIComponent(id)}/content`, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        throw await errorFromResponse(response);
+      }
+      return response.text();
+    },
+
+    async getRawBlob({ token, id }: { token: string; id: string }): Promise<RawBlob> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const response = await fetchImpl(`${normalizedBaseURL}/api/readings/${encodeURIComponent(id)}/raw`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        throw await errorFromResponse(response);
+      }
+      const blob = await response.blob();
+      return { blob, filename: filenameFromContentDisposition(response.headers.get('Content-Disposition')) };
+    },
   };
 }
 
@@ -163,6 +245,21 @@ function errorFromBody(response: Response, body: unknown): APIError {
     }
   }
   return new APIError('http_error', `Request failed with status ${response.status}`, response.status);
+}
+
+async function errorFromResponse(response: Response): Promise<APIError> {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return new APIError('http_error', `Request failed with status ${response.status}`, response.status);
+  }
+  return errorFromBody(response, body);
+}
+
+function filenameFromContentDisposition(header: string | null): string {
+  const match = header?.match(/filename="?([^"]+)"?/);
+  return match?.[1] ?? 'raw-content';
 }
 
 function isHealthDocument(body: unknown): body is HealthDocument {
@@ -205,6 +302,64 @@ function isReadingListItem(value: unknown): value is ReadingListItemWire {
     optionalNumber(value.word_count) &&
     optionalNullableStringArray(value.tags)
   );
+}
+
+function isReadingDetail(value: unknown): value is ReadingDetailWire {
+  if (!isReadingListItem(value) || !isRecord(value)) {
+    return false;
+  }
+  const detail = value as Record<string, unknown>;
+  return (
+    optionalNullableSimilarArray(detail.similar_json) &&
+    (detail.diagnostics_json === undefined || detail.diagnostics_json === null || isDiagnosticsJSON(detail.diagnostics_json)) &&
+    optionalString(detail.stale_reason)
+  );
+}
+
+function optionalNullableSimilarArray(value: unknown): boolean {
+  return value === undefined || value === null || (Array.isArray(value) && value.every(isSimilarItem));
+}
+
+function isSimilarItem(value: unknown): value is SimilarItem {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.id === 'string' &&
+    typeof value.score === 'number' &&
+    Number.isFinite(value.score) &&
+    optionalString(value.title) &&
+    optionalString(value.url)
+  );
+}
+
+function isDiagnosticsJSON(value: unknown): value is DiagnosticsJSON {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.source === 'string' &&
+    typeof value.similar_count === 'number' &&
+    Number.isFinite(value.similar_count) &&
+    optionalString(value.extraction_mode) &&
+    optionalBoolean(value.reused) &&
+    optionalString(value.notify_error) &&
+    isTimingsMS(value.timings_ms)
+  );
+}
+
+function isTimingsMS(value: unknown): value is Record<string, number> {
+  if (value === undefined) {
+    return true;
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  return Object.values(value).every((entry) => typeof entry === 'number' && Number.isFinite(entry));
+}
+
+function optionalBoolean(value: unknown): boolean {
+  return value === undefined || typeof value === 'boolean';
 }
 
 function isSubmitURLDocument(value: unknown): value is SubmitURLDocument {
@@ -259,6 +414,16 @@ function normalizeReadingsListDocument(body: ReadingsListDocumentWire): Readings
       }
       return { ...rest, tags };
     }),
+  };
+}
+
+function normalizeReadingDetail(body: ReadingDetailWire): ReadingDetail {
+  const { tags, similar_json: similarJSON, diagnostics_json: diagnosticsJSON, ...rest } = body;
+  return {
+    ...rest,
+    ...(tags === undefined ? {} : { tags: tags ?? [] }),
+    similar_json: similarJSON ?? [],
+    ...(diagnosticsJSON == null ? {} : { diagnostics_json: diagnosticsJSON }),
   };
 }
 
