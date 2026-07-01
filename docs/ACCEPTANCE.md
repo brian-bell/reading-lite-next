@@ -569,7 +569,10 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
   with `Mode ∈ {readability, raw_dom, raw_only}`; `embed.Embedder.Embed → []float32` of
   `embed.Dim == 1536`; `summarize.Summarizer.Summarize(SummaryInput) → Summary{Title,Summary,Tags,JSON}`;
   `notify.Notifier.Notify(Email{From,To,Subject,HTML})`; `blobs.Blobs` Put/Get/Delete;
-  `vector.Index` Upsert/Query/Delete with `Match{ID,Score}`.
+  `vector.Index` Upsert/Query/Delete with `Match{ID,Score}`. `Upsert` also takes a
+  `generation *time.Time` (issue #9 hardening, post-Phase-6): a strictly-older
+  generation than the one already stored is a silent no-op, closing the
+  reuse-path stale-write window without relying on `ctx` cancellation.
 - [ ] **Fakes are faithful doubles.** Each scriptable fake (`fetch`/`extract`/`embed`/
   `summarize`/`notify`) returns a scripted result, can be scripted to error, records its
   call count + inputs behind a mutex, and returns defensive copies (mutating a returned
@@ -587,7 +590,10 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
   vectors with `ErrDimension` on both `Upsert` and `Query`.
 - [ ] **Shared conformance suite.** `vectortest.RunContract` holds `QueryRanksByCosine`,
   `ExcludesSelf`, `DeleteRemoves` (the §6 cases) plus `UpsertReplaces`, `TopKBounds`,
-  `EmptyIndexReturnsNoMatches`, and `RejectsWrongDimension`. It takes a `Factory`, so the
+  `EmptyExcludeIDExcludesNothing`, `EmptyIndexReturnsNoMatches`, `RejectsWrongDimension`,
+  and (issue #9 hardening) `GenerationFenceRejectsStaleUpsert` — proving a stale-generation
+  `Upsert` is a no-op, an equal/newer/nil generation still applies, and a nil write
+  un-fences a row for any later caller. It takes a `Factory`, so the
   Phase 6 pgvector adapter reuses it verbatim under `-tags integration` (C12) — the same
   fake↔Postgres parity mechanism `storetest` uses.
 - [ ] **Port/fake files stay SDK-free.** The Phase 4 port + fake files themselves import no real
@@ -693,7 +699,11 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
   `vectortest.RunContract` as `vector.Memory`, run two ways: under `//go:build integration`
   (`internal/vector/postgres_test.go`) and inside `make verify` via the harness's `postgres` vector
   backend (`TestAcceptance_VectorIndexContract`, skips without Docker). A seed wrapper supplies the
-  FK-required `readings` row the bare-id contract upserts omit. **Proven locally** — all 8 contract
+  FK-required `readings` row the bare-id contract upserts omit. `Upsert` is generation-fenced
+  (issue #9 hardening): `reading_vectors` gained a nullable `generation` column
+  (`migrations/0003_vector_generation_fence.sql`) and the upsert is a conditional
+  `on conflict ... do update ... where` guard, so a stale write against an
+  already-newer-generation row resolves as a no-op. **Proven locally** — all 9 contract
   subtests pass against real pgvector in both paths.
 - [ ] **`blobs.R2`** (S3-compatible). Path-style `Put`/`Get`/`Delete` against a custom endpoint
   (aws-sdk-go-v2), mapping a missing key to `blobs.ErrNotFound`. The default run does a full
