@@ -81,7 +81,8 @@ Required env includes `READER_API_TOKEN`, `DATABASE_URL` with TLS `sslmode=requi
 which also requires `ANTHROPIC_API_KEY`; set `SUMMARY_PROVIDER=openai` to use the OpenAI
 Responses summarizer with the existing `OPENAI_API_KEY`. Optional OpenAI summarizer knobs are
 `SUMMARY_OPENAI_MODEL` (default `gpt-5.5`), `SUMMARY_OPENAI_REASONING_EFFORT` (default
-`medium`), and `SUMMARY_OPENAI_MAX_OUTPUT_TOKENS` (default `25000`). Optional `FETCH_TIMEOUT`,
+`medium`), and `SUMMARY_OPENAI_MAX_OUTPUT_TOKENS` (default `25000`, minimum `16` per the
+OpenAI Responses API). Optional `FETCH_TIMEOUT`,
 `FETCH_MAX_BYTES`, and `SHUTDOWN_TIMEOUT` use safe defaults. Optional
 `CORS_ALLOWED_ORIGINS` is a comma-separated exact allowlist such as
 `https://app.example.com,http://localhost:5173`; unset leaves browser CORS closed.

@@ -233,6 +233,29 @@ func TestLoadEnv_SummaryProviderSelectsOpenAIWithoutAnthropicKey(t *testing.T) {
 	}
 }
 
+func TestLoadEnv_SummaryOpenAIMaxOutputTokensFloor(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.LoadEnv(validEnv("SUMMARY_OPENAI_MAX_OUTPUT_TOKENS=15"))
+	if err == nil {
+		t.Fatal("LoadEnv = nil error, want floor validation for max output tokens below 16")
+	}
+	if !strings.Contains(err.Error(), "SUMMARY_OPENAI_MAX_OUTPUT_TOKENS") {
+		t.Fatalf("error = %q, want SUMMARY_OPENAI_MAX_OUTPUT_TOKENS named", err)
+	}
+	if !strings.Contains(err.Error(), "16") {
+		t.Fatalf("error = %q, want the OpenAI floor 16 stated", err)
+	}
+
+	cfg, err := config.LoadEnv(validEnv("SUMMARY_OPENAI_MAX_OUTPUT_TOKENS=16"))
+	if err != nil {
+		t.Fatalf("LoadEnv with floor value 16: %v", err)
+	}
+	if cfg.Summary.OpenAI.MaxOutputTokens != 16 {
+		t.Fatalf("MaxOutputTokens = %d, want 16", cfg.Summary.OpenAI.MaxOutputTokens)
+	}
+}
+
 func TestLoadEnv_SummaryProviderValidation(t *testing.T) {
 	t.Parallel()
 

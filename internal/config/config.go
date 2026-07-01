@@ -33,6 +33,8 @@ const (
 	DefaultSummaryOpenAIReasoningEffort = "medium"
 	// DefaultSummaryOpenAIMaxOutputTokens reserves room for reasoning and visible output.
 	DefaultSummaryOpenAIMaxOutputTokens = 25000
+	// MinSummaryOpenAIMaxOutputTokens is the OpenAI Responses API minimum for max_output_tokens.
+	MinSummaryOpenAIMaxOutputTokens = 16
 )
 
 // SummaryProvider identifies the production summarizer adapter.
@@ -122,7 +124,7 @@ func LoadEnv(environ []string) (Config, error) {
 		OpenAI: SummaryOpenAIConfig{
 			Model:           optional(values, "SUMMARY_OPENAI_MODEL", DefaultSummaryOpenAIModel),
 			ReasoningEffort: optionalSummaryOpenAIReasoningEffort(values, &errs),
-			MaxOutputTokens: optionalPositiveInt(values, "SUMMARY_OPENAI_MAX_OUTPUT_TOKENS", DefaultSummaryOpenAIMaxOutputTokens, &errs),
+			MaxOutputTokens: optionalSummaryOpenAIMaxOutputTokens(values, &errs),
 		},
 	}
 	cfg.AnthropicAPIKey = strings.TrimSpace(values["ANTHROPIC_API_KEY"])
@@ -243,6 +245,22 @@ func optionalSummaryOpenAIReasoningEffort(values map[string]string, errs *fieldE
 		*errs = append(*errs, fieldError{name: "SUMMARY_OPENAI_REASONING_EFFORT", problem: "must be none, minimal, low, medium, high, or xhigh"})
 		return DefaultSummaryOpenAIReasoningEffort
 	}
+}
+
+func optionalSummaryOpenAIMaxOutputTokens(values map[string]string, errs *fieldErrors) int {
+	raw := strings.TrimSpace(values["SUMMARY_OPENAI_MAX_OUTPUT_TOKENS"])
+	if raw == "" {
+		return DefaultSummaryOpenAIMaxOutputTokens
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < MinSummaryOpenAIMaxOutputTokens {
+		*errs = append(*errs, fieldError{
+			name:    "SUMMARY_OPENAI_MAX_OUTPUT_TOKENS",
+			problem: fmt.Sprintf("must be an integer of at least %d", MinSummaryOpenAIMaxOutputTokens),
+		})
+		return 0
+	}
+	return n
 }
 
 func requiredDuration(values map[string]string, name string, errs *fieldErrors) time.Duration {
