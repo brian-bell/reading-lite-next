@@ -1,8 +1,9 @@
-// Package summarize defines the article-summarization port and an in-memory fake.
+// Package summarize defines the article-summarization port and adapters.
 //
-// The production adapter is Anthropic with a forced emit_reading tool call
-// (Phase 6) and an Anthropic Message Batches client for operator batch workflows;
-// [Fake] is the scriptable double used by pipeline tests.
+// Production can select Anthropic with a forced emit_reading tool call or OpenAI
+// Responses with strict structured output. Anthropic also implements Message
+// Batches for operator batch workflows; [Fake] is the scriptable double used by
+// pipeline tests.
 package summarize
 
 import (
@@ -34,7 +35,7 @@ type Summary struct {
 	Summary string
 	// Tags are the suggested tags for the reading.
 	Tags []string
-	// JSON is the raw structured emit_reading payload, persisted as summary_json.
+	// JSON is the raw structured provider payload, persisted as summary_json.
 	JSON json.RawMessage
 }
 

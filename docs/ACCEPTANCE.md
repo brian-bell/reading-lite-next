@@ -28,7 +28,7 @@
 > web→ready happy path, the Reddit permanent-failure-with-guidance path, and the
 > rate-limit requeue. The Phase 6 real adapters (C12) are automated as well:
 > `TestAcceptance_RealAdapters` drives the HTTP adapters (`fetch.HTTP`, `embed.OpenAI`,
-> `summarize.Anthropic`, `notify.Resend`) against `httptest` upstreams — proving request
+> `summarize.Anthropic`, `summarize.OpenAI`, `notify.Resend`) against `httptest` upstreams — proving request
 > shape, the forced `emit_reading` tool path, and that upstream errors classify through
 > `dispatch.Classify` — and compile-time `var _ Port = (*Adapter)(nil)` assertions pin every
 > production adapter to its port. The Phase 7 extraction internals (C13) are automated as well:
@@ -98,7 +98,7 @@ Vite/React health-check SPA under `web/`:
 | Processing pipeline (orchestration) | `internal/pipeline/pipeline.go` | 5 |
 | HTTP fetch adapter (UA/timeout/size-cap/redirect/scheme) | `internal/fetch/http.go` | 6 |
 | OpenAI embeddings adapter | `internal/embed/openai.go` | 6 |
-| Anthropic summarizer + Message Batches client (forced `emit_reading` tool use) | `internal/summarize/anthropic.go`, `internal/summarize/anthropic_batch.go` | 6 |
+| Runtime-selectable summarizers + Anthropic Message Batches client | `internal/summarize/anthropic.go`, `internal/summarize/openai.go`, `internal/summarize/anthropic_batch.go` | 6 |
 | Resend notification adapter | `internal/notify/resend.go` | 6 |
 | Shared HTTP error classification (`ClassifyResponse`/`RetryAfter`) | `internal/httpx/httpx.go` | 6 |
 | pgvector similarity adapter | `internal/vector/postgres.go` | 6 |
@@ -611,7 +611,7 @@ fidelity, and (for the two backends that carry real behavior) the conformance.
   are part of `make verify`.
 
 > Note: C10 covers only the fakes/in-memory backends. The real adapters — `fetch.HTTP`,
-> `embed.OpenAI`, `summarize.Anthropic`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
+> `embed.OpenAI`, `summarize.Anthropic`, `summarize.OpenAI`, `notify.Resend`, `blobs.R2`, `vector.Postgres` — and
 > the integration arm of `vectortest.RunContract` are **Phase 6**, verified in **C12**. The
 > ports are wired into the Phase 5 pipeline (C11); the real adapters are wired into the
 > production API runtime in Phase 11 (C17).
@@ -684,6 +684,10 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
 - [ ] **`embed.OpenAI`.** POSTs `/v1/embeddings` with `Bearer` auth and `model=text-embedding-3-small`,
   parses `data[0].embedding`, and maps 429/4xx/5xx via `httpx`. Tests: `TestOpenAI_*` (request shape,
   rate-limit→`Requeue`, 4xx→`Fail`, 5xx→`Retry`).
+- [ ] **Runtime-selectable summarizers.** `SUMMARY_PROVIDER` defaults to `anthropic`; `SUMMARY_PROVIDER=openai`
+  selects OpenAI Responses with the existing `OPENAI_API_KEY`, `SUMMARY_OPENAI_MODEL`,
+  `SUMMARY_OPENAI_REASONING_EFFORT`, and `SUMMARY_OPENAI_MAX_OUTPUT_TOKENS`. Safe config logs include
+  provider/model/effort/token settings but never API keys or raw provider payloads.
 - [ ] **`summarize.Anthropic`.** POSTs `/v1/messages` with `x-api-key`/`anthropic-version`, a single
   `emit_reading` tool, and `tool_choice={type:tool,name:emit_reading}` (**forced tool use**); parses
   the `tool_use` block's `input` into `Summary` (raw input preserved as `summary_json`). A response
@@ -692,6 +696,12 @@ adapter against TDD plan §8 and confirm the request shape, the happy parse, and
   forced-tool request builder; result JSONL is validated by expected `custom_id` and returns
   `succeeded`, `errored`, `canceled`, and `expired` outcomes in request order. 429 →
   `RateLimitError`. Tests: `TestAnthropic_*`, `TestAnthropicBatch_*`, `TestParseBatchResults_*`.
+- [ ] **`summarize.OpenAI`.** POSTs `/v1/responses` with `Bearer` auth, `model=gpt-5.5`,
+  `reasoning.effort=medium`, `max_output_tokens=25000`, `store=false`, and strict `text.format`
+  JSON schema `reading_summary`; parses exactly one completed-message `output_text` JSON object into
+  `Summary` (raw JSON preserved as `summary_json`) and rejects incomplete, refusal, missing, duplicate,
+  invalid JSON, or blank title/summary responses. 429/4xx/5xx map through `httpx`. Tests:
+  `TestOpenAI_*`.
 - [ ] **`notify.Resend`.** POSTs `/emails` (`from`/`to`/`subject`/`html`) with `Bearer` auth; any
   non-2xx is an error (the pipeline swallows it — no retry classification needed). Tests: `TestResend_*`.
 - [ ] **`vector.Postgres`** (integration). `Upsert`/`Query`/`Delete` over `reading_vectors`, ranking
@@ -1073,8 +1083,8 @@ skipped/blocked (write why).
   coverage; `TestAcceptance_PipelineProcess` green
 - [ ] C12 real adapters: each Phase 6 adapter matches §8 — `fetch.HTTP` (UA/timeout/size-cap/
   redirect→FinalURL/scheme reject, private/special-use address block, proxy disabled in production,
-  **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` (request shape, forced `emit_reading`
-  tool, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`), `notify.Resend` (shape + non-2xx
+  **429→Requeue**), `embed.OpenAI` + `summarize.Anthropic` + `summarize.OpenAI` (request shape,
+  forced `emit_reading` or strict Responses `text.format`, 429→Requeue/4xx→Fail/5xx→Retry via `internal/httpx`), `notify.Resend` (shape + non-2xx
   error), `vector.Postgres` (`vectortest.RunContract` under integration **and** the harness's
   pgvector backend), `blobs.R2` (httptest round-trip + MinIO under integration); compile-time port
   conformance + `TestAcceptance_RealAdapters` green

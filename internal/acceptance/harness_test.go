@@ -82,6 +82,7 @@ var (
 	_ fetch.Fetcher         = (*fetch.HTTP)(nil)
 	_ embed.Embedder        = (*embed.OpenAI)(nil)
 	_ summarize.Summarizer  = (*summarize.Anthropic)(nil)
+	_ summarize.Summarizer  = (*summarize.OpenAI)(nil)
 	_ summarize.BatchClient = (*summarize.Anthropic)(nil)
 	_ notify.Notifier       = (*notify.Resend)(nil)
 	_ vector.Index          = (*vector.Postgres)(nil)
@@ -885,6 +886,77 @@ func TestAcceptance_RealAdapters(t *testing.T) {
 		defer blank.Close()
 		if _, err := summarize.NewAnthropic("k", summarize.WithBaseURL(blank.URL)).Summarize(ctx, summarize.SummaryInput{Markdown: "body"}); err == nil {
 			t.Fatal("blank emit_reading input = nil error, want an error (no blank summary accepted)")
+		}
+	})
+
+	t.Run("OpenAISummarizeResponsesShape", func(t *testing.T) {
+		var gotPath, gotAuth string
+		var got struct {
+			Model           string `json:"model"`
+			MaxOutputTokens int    `json:"max_output_tokens"`
+			Store           bool   `json:"store"`
+			Reasoning       struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
+			Input []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"input"`
+			Text struct {
+				Format struct {
+					Type   string          `json:"type"`
+					Name   string          `json:"name"`
+					Strict bool            `json:"strict"`
+					Schema json.RawMessage `json:"schema"`
+				} `json:"format"`
+			} `json:"text"`
+			Tools []json.RawMessage `json:"tools"`
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotAuth = r.Header.Get("Authorization")
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[\"go\"]}"}]}]}`))
+		}))
+		defer srv.Close()
+
+		out, err := summarize.NewOpenAI("k", summarize.WithOpenAIBaseURL(srv.URL)).Summarize(ctx, summarize.SummaryInput{Markdown: "body"})
+		if err != nil {
+			t.Fatalf("Summarize: %v", err)
+		}
+		if gotPath != "/v1/responses" || gotAuth != "Bearer k" {
+			t.Fatalf("request path/auth = %q/%q, want /v1/responses bearer", gotPath, gotAuth)
+		}
+		if got.Model != "gpt-5.5" || got.Reasoning.Effort != "medium" || got.MaxOutputTokens != 25000 || got.Store {
+			t.Fatalf("request defaults = model %q effort %q max %d store %v, want gpt-5.5/medium/25000/false", got.Model, got.Reasoning.Effort, got.MaxOutputTokens, got.Store)
+		}
+		if got.Text.Format.Type != "json_schema" || got.Text.Format.Name != "reading_summary" || !got.Text.Format.Strict {
+			t.Fatalf("text.format = %+v, want strict reading_summary json_schema", got.Text.Format)
+		}
+		var schema struct {
+			AdditionalProperties bool `json:"additionalProperties"`
+		}
+		if err := json.Unmarshal(got.Text.Format.Schema, &schema); err != nil || schema.AdditionalProperties {
+			t.Fatalf("schema = %s err=%v, want additionalProperties=false", got.Text.Format.Schema, err)
+		}
+		if len(got.Tools) != 0 {
+			t.Fatalf("tools = %v, want none for OpenAI summarizer", got.Tools)
+		}
+		if out.Title != "T" || out.Summary != "S" || string(out.JSON) != `{"title":"T","summary":"S","tags":["go"]}` {
+			t.Fatalf("summary = %+v raw=%s, want parsed output_text JSON", out, out.JSON)
+		}
+	})
+
+	t.Run("OpenAISummarizeClassifiesUpstreamErrors", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "20")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+
+		_, err := summarize.NewOpenAI("k", summarize.WithOpenAIBaseURL(srv.URL)).Summarize(ctx, summarize.SummaryInput{Markdown: "body"})
+		if got := dispatch.Classify(err); got.Outcome != dispatch.Requeue || got.After != 20*time.Second {
+			t.Fatalf("Classify(OpenAI summarize 429) = %v/%v, want Requeue/20s", got.Outcome, got.After)
 		}
 	})
 

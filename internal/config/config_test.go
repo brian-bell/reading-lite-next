@@ -47,6 +47,12 @@ func TestLoadEnv_MinimalValidConfigWithDefaults(t *testing.T) {
 	if cfg.Notify.From != "reader@example.com" || cfg.Notify.To != "me@example.com" {
 		t.Fatalf("notify = %q/%q, want configured addresses", cfg.Notify.From, cfg.Notify.To)
 	}
+	if cfg.Summary.Provider != config.SummaryProviderAnthropic {
+		t.Fatalf("Summary.Provider = %q, want anthropic default", cfg.Summary.Provider)
+	}
+	if cfg.Summary.OpenAI.Model != "gpt-5.5" || cfg.Summary.OpenAI.ReasoningEffort != "medium" || cfg.Summary.OpenAI.MaxOutputTokens != 25000 {
+		t.Fatalf("OpenAI summary defaults = %+v, want gpt-5.5/medium/25000", cfg.Summary.OpenAI)
+	}
 }
 
 func TestLoadEnv_CORSAllowedOriginsDefaultsToNone(t *testing.T) {
@@ -186,6 +192,7 @@ func TestLoadEnv_TuningRequiresPositiveValues(t *testing.T) {
 	for _, field := range []string{
 		"PENDING_TTL", "RUNNING_TTL", "MAX_ATTEMPTS", "WORKER_CONCURRENCY",
 		"DISPATCH_BUFFER", "PG_MAX_CONNS", "FETCH_TIMEOUT", "FETCH_MAX_BYTES", "SHUTDOWN_TIMEOUT",
+		"SUMMARY_OPENAI_MAX_OUTPUT_TOKENS",
 	} {
 		t.Run(field, func(t *testing.T) {
 			_, err := config.LoadEnv(validEnv(field + "=0"))
@@ -194,6 +201,61 @@ func TestLoadEnv_TuningRequiresPositiveValues(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), field) {
 				t.Fatalf("error = %q, want %s named", err, field)
+			}
+		})
+	}
+}
+
+func TestLoadEnv_SummaryProviderSelectsOpenAIWithoutAnthropicKey(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadEnv(validEnv(
+		"SUMMARY_PROVIDER=openai",
+		"ANTHROPIC_API_KEY=",
+		"SUMMARY_OPENAI_MODEL=gpt-5.5-mini",
+		"SUMMARY_OPENAI_REASONING_EFFORT=high",
+		"SUMMARY_OPENAI_MAX_OUTPUT_TOKENS=32000",
+	))
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+	if cfg.OpenAIAPIKey != "openai-key" {
+		t.Fatalf("OpenAIAPIKey = %q, want embedding/summarizer key", cfg.OpenAIAPIKey)
+	}
+	if cfg.AnthropicAPIKey != "" {
+		t.Fatalf("AnthropicAPIKey = %q, want empty allowed for OpenAI summarizer", cfg.AnthropicAPIKey)
+	}
+	if cfg.Summary.Provider != config.SummaryProviderOpenAI {
+		t.Fatalf("Summary.Provider = %q, want openai", cfg.Summary.Provider)
+	}
+	if cfg.Summary.OpenAI.Model != "gpt-5.5-mini" || cfg.Summary.OpenAI.ReasoningEffort != "high" || cfg.Summary.OpenAI.MaxOutputTokens != 32000 {
+		t.Fatalf("OpenAI summary config = %+v, want override values", cfg.Summary.OpenAI)
+	}
+}
+
+func TestLoadEnv_SummaryProviderValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		env   []string
+		field string
+	}{
+		{"invalid provider", []string{"SUMMARY_PROVIDER=bogus"}, "SUMMARY_PROVIDER"},
+		{"invalid reasoning effort", []string{"SUMMARY_OPENAI_REASONING_EFFORT=huge"}, "SUMMARY_OPENAI_REASONING_EFFORT"},
+		{"non integer max tokens", []string{"SUMMARY_OPENAI_MAX_OUTPUT_TOKENS=lots"}, "SUMMARY_OPENAI_MAX_OUTPUT_TOKENS"},
+		{"anthropic provider requires key", []string{"SUMMARY_PROVIDER=anthropic", "ANTHROPIC_API_KEY="}, "ANTHROPIC_API_KEY"},
+		{"default provider requires key", []string{"ANTHROPIC_API_KEY="}, "ANTHROPIC_API_KEY"},
+		{"openai provider still requires openai key", []string{"SUMMARY_PROVIDER=openai", "OPENAI_API_KEY="}, "OPENAI_API_KEY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.LoadEnv(validEnv(tc.env...))
+			if err == nil {
+				t.Fatal("LoadEnv = nil error, want validation failure")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("error = %q, want %s named", err, tc.field)
 			}
 		})
 	}
@@ -234,7 +296,7 @@ func TestLoadEnv_AdapterAndNotificationFieldsRequired(t *testing.T) {
 	t.Parallel()
 
 	for _, field := range []string{
-		"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+		"OPENAI_API_KEY", "R2_ENDPOINT", "R2_ACCESS_KEY_ID",
 		"R2_SECRET_ACCESS_KEY", "R2_BUCKET", "RESEND_API_KEY", "NOTIFY_FROM", "NOTIFY_TO",
 	} {
 		t.Run(field, func(t *testing.T) {
@@ -271,6 +333,11 @@ func TestConfig_SafeFieldsExcludeSecrets(t *testing.T) {
 	for _, want := range []string{"listen_addr", "worker_concurrency", "pg_max_conns", "r2_bucket", "notify_from"} {
 		if !strings.Contains(logValue, want) {
 			t.Fatalf("LogValue %q missing operational field %s", logValue, want)
+		}
+	}
+	for _, want := range []string{`"summary_provider":"anthropic"`, `"summary_openai_model":"gpt-5.5"`, `"summary_openai_reasoning_effort":"medium"`, `"summary_openai_max_output_tokens":25000`} {
+		if !strings.Contains(logValue, want) {
+			t.Fatalf("LogValue %q missing summary field %s", logValue, want)
 		}
 	}
 }
