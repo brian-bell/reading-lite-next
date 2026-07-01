@@ -63,6 +63,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const readingsRequestID = useRef(0);
   const readingsLoadingRef = useRef({ firstPage: false, nextPage: false });
   const detailRequestID = useRef(0);
+  const detailFetchInFlight = useRef(false);
 
   const refreshHealth = useCallback(async () => {
     setLoading(true);
@@ -346,6 +347,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     async (id: string) => {
       const requestID = detailRequestID.current + 1;
       detailRequestID.current = requestID;
+      detailFetchInFlight.current = true;
       setDetailLoading(true);
       setDetailError('');
       try {
@@ -369,6 +371,10 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         }
         setDetailError(messageFromError(err, 'Unable to load reading detail'));
         setDetailLoading(false);
+      } finally {
+        if (detailRequestID.current === requestID) {
+          detailFetchInFlight.current = false;
+        }
       }
     },
     [fetchContent, fetchImpl, runtimeEnv],
@@ -390,6 +396,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
 
   const handleBackToList = useCallback(() => {
     detailRequestID.current += 1;
+    detailFetchInFlight.current = false;
     setSelectedReadingID(undefined);
     setDetail(null);
     setDetailLoading(false);
@@ -442,6 +449,9 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       return;
     }
     const intervalID = window.setInterval(() => {
+      if (detailFetchInFlight.current) {
+        return;
+      }
       void fetchDetail(selectedReadingID);
     }, PROCESSING_POLL_INTERVAL_MS);
     return () => window.clearInterval(intervalID);
@@ -467,9 +477,13 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           <button
             type="button"
             onClick={() => {
+              const previousToken = loadToken().trim();
               saveToken(token);
               const storedToken = loadToken();
               setToken(storedToken);
+              if (storedToken.trim() !== previousToken) {
+                handleBackToList();
+              }
               void loadReadings({ tokenOverride: storedToken });
             }}
           >

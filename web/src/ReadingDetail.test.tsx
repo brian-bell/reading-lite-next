@@ -260,6 +260,94 @@ describe('ReadingDetail', () => {
     expect(screen.queryByText('Secret body text.')).not.toBeInTheDocument();
   });
 
+  it('clears the open reading detail and content when the bearer token is replaced', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('# Heading\n\nSecret body text.', { status: 200 }),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByRole('region', { name: 'Reading detail' })).toBeInTheDocument();
+    expect(await screen.findByText('Secret body text.')).toBeInTheDocument();
+
+    const tokenInput = screen.getByLabelText('Bearer token');
+    await user.clear(tokenInput);
+    await user.type(tokenInput, 'different-token');
+    await user.click(screen.getByRole('button', { name: 'Save token' }));
+
+    expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Secret body text.')).not.toBeInTheDocument();
+  });
+
+  it('does not start an overlapping detail poll while a slow poll is still in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let detailCalls = 0;
+    const slowPoll = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading({ status: 'running' })]),
+      detail: () => {
+        detailCalls += 1;
+        if (detailCalls === 1) {
+          return jsonResponse(detailReading({ status: 'running' }));
+        }
+        if (detailCalls === 2) {
+          return slowPoll.promise;
+        }
+        return jsonResponse(detailReading({ status: 'ready' }));
+      },
+      content: () => new Response('Ready content', { status: 200 }),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Example article' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(detailCalls).toBe(1);
+
+    // First poll tick starts a slow detail request that stays in flight.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailCalls).toBe(2);
+
+    // Second poll tick while the request is still in flight must not start another.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailCalls).toBe(2);
+
+    // The in-flight poll resolves to ready and its result is applied.
+    await act(async () => {
+      slowPoll.resolve(jsonResponse(detailReading({ status: 'ready' })));
+      await slowPoll.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Ready content')).toBeInTheDocument();
+  });
+
   it('shows a friendly empty state when extracted content is missing', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();
