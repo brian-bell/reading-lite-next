@@ -239,6 +239,27 @@ describe('ReadingDetail', () => {
     expect(screen.queryByRole('heading', { name: 'Reading A', level: 3 })).not.toBeInTheDocument();
   });
 
+  it('clears the open reading detail and content when the bearer token is cleared', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('# Heading\n\nSecret body text.', { status: 200 }),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByRole('region', { name: 'Reading detail' })).toBeInTheDocument();
+    expect(await screen.findByText('Secret body text.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Clear token' }));
+
+    expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Secret body text.')).not.toBeInTheDocument();
+  });
+
   it('shows a friendly empty state when extracted content is missing', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();

@@ -484,6 +484,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
               setSubmitError('');
               setSubmitMessage('');
               resetReadingsForMissingToken();
+              handleBackToList();
             }}
           >
             Clear token
