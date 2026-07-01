@@ -168,6 +168,12 @@ func TestOpenAI_ResponseValidation(t *testing.T) {
 			wantOutcome: dispatch.Retry,
 		},
 		{
+			name:        "content filtered incomplete fails permanently",
+			body:        `{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}`,
+			wantText:    "content_filter",
+			wantOutcome: dispatch.Fail,
+		},
+		{
 			name:        "non completed status",
 			body:        `{"status":"failed","output":[]}`,
 			wantText:    "status",

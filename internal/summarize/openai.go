@@ -202,6 +202,12 @@ func parseOpenAIResponse(resp openAIResponse) (Summary, error) {
 	switch resp.Status {
 	case "completed":
 	case "incomplete":
+		// A content filter is a deterministic safety block like a refusal, so
+		// retrying it only repeats the billable request; other incomplete
+		// reasons (e.g. max_output_tokens) may succeed on retry.
+		if resp.IncompleteDetails.Reason == "content_filter" {
+			return Summary{}, fmt.Errorf("%w: summarize: response incomplete: %s", dispatch.ErrPermanent, resp.IncompleteDetails.Reason)
+		}
 		return Summary{}, fmt.Errorf("summarize: response incomplete: %s", resp.IncompleteDetails.Reason)
 	default:
 		return Summary{}, fmt.Errorf("summarize: response status %q is not completed", resp.Status)
