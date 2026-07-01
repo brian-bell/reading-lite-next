@@ -436,6 +436,57 @@ describe('ReadingDetail', () => {
     }
   });
 
+  it('does not trigger a stale raw download after reprocess succeeds', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const rawDeferred = deferred<Response>();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: () => rawDeferred.promise,
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Example article' }));
+      expect(await screen.findByText('Body text.')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Download raw source' }));
+      await user.click(screen.getByRole('button', { name: /reprocess/i }));
+      expect(await screen.findByText('Processing...')).toBeInTheDocument();
+
+      await act(async () => {
+        rawDeferred.resolve(
+          new Response(bytes, {
+            status: 200,
+            headers: { 'Content-Disposition': 'attachment; filename="raw-content"' },
+          }),
+        );
+        await rawDeferred.promise;
+        await Promise.resolve();
+      });
+
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(clickSpy).not.toHaveBeenCalled();
+      expect(screen.getByText('Processing...')).toBeInTheDocument();
+    } finally {
+      clickSpy.mockRestore();
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+    }
+  });
+
   it('does not write a superseded raw error into a newly selected reading', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();

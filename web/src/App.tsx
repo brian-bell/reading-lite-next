@@ -511,6 +511,9 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       readingsLoadingRef.current = { firstPage: false, nextPage: false };
       setReadingsLoading(false);
       setReadingsLoadingMore(false);
+      rawRequestID.current += 1;
+      setRawDownloading(false);
+      setRawError('');
       setDetail((current) => (current && current.id === id ? resetDetailForReprocess(current, result.status) : current));
       setReadings((list) => list.map((item) => (item.id === id ? resetListItemForReprocess(item, result.status) : item)));
       // The re-enqueued reading no longer has current content; drop any stale
