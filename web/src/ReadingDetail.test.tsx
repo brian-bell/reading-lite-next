@@ -348,6 +348,120 @@ describe('ReadingDetail', () => {
     expect(screen.getByText('Ready content')).toBeInTheDocument();
   });
 
+  it('renders the detail without crashing when diagnostics omit timings_ms', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () =>
+        jsonResponse({
+          ...reading(),
+          similar_json: [],
+          diagnostics_json: { source: 'fetch', extraction_mode: 'readability', similar_count: 0 },
+        }),
+      content: () => new Response('Body text.', { status: 200 }),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+
+    expect(await screen.findByText('Body text.')).toBeInTheDocument();
+    expect(screen.queryByText('Timings (ms)')).not.toBeInTheDocument();
+  });
+
+  it('does not trigger a download or error when a raw fetch resolves after navigating back', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const rawDeferred = deferred<Response>();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: () => rawDeferred.promise,
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Example article' }));
+      await user.click(await screen.findByRole('button', { name: 'Download raw source' }));
+
+      // Navigate back to the list before the raw fetch resolves.
+      await user.click(screen.getByRole('button', { name: 'Back to list' }));
+
+      // The stale raw response must not create/click an object URL or surface an error.
+      await act(async () => {
+        rawDeferred.resolve(
+          new Response(bytes, {
+            status: 200,
+            headers: { 'Content-Disposition': 'attachment; filename="raw-content"' },
+          }),
+        );
+        await rawDeferred.promise;
+        await Promise.resolve();
+      });
+
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(clickSpy).not.toHaveBeenCalled();
+      expect(screen.queryByRole('region', { name: 'Reading detail' })).not.toBeInTheDocument();
+    } finally {
+      clickSpy.mockRestore();
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+    }
+  });
+
+  it('does not write a superseded raw error into a newly selected reading', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const readingA = reading({ id: 'reading-a', title: 'Reading A' });
+    const readingB = reading({ id: 'reading-b', title: 'Reading B' });
+    const rawDeferred = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([readingA, readingB]),
+      detail: (id) => jsonResponse(detailReading({ id, title: id === 'reading-a' ? 'Reading A' : 'Reading B' })),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: () => rawDeferred.promise,
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    URL.createObjectURL = createObjectURL;
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Reading A' }));
+      await user.click(await screen.findByRole('button', { name: 'Download raw source' }));
+
+      // Switch to reading B while A's raw fetch is still in flight.
+      await user.click(screen.getByRole('button', { name: 'Reading B' }));
+      expect(await screen.findByRole('heading', { name: 'Reading B', level: 3 })).toBeInTheDocument();
+
+      // A's raw fetch now fails; its error must not leak into B's panel.
+      await act(async () => {
+        rawDeferred.resolve(jsonResponse({ error: { code: 'not_found', message: 'A raw missing' } }, 404));
+        await rawDeferred.promise;
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByText('A raw missing')).not.toBeInTheDocument();
+      expect(createObjectURL).not.toHaveBeenCalled();
+    } finally {
+      URL.createObjectURL = originalCreateObjectURL;
+    }
+  });
+
   it('shows a friendly empty state when extracted content is missing', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();

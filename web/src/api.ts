@@ -48,7 +48,7 @@ export type DiagnosticsJSON = {
   similar_count: number;
   reused?: boolean;
   notify_error?: string;
-  timings_ms: Record<string, number>;
+  timings_ms?: Record<string, number>;
 };
 
 export type ReadingDetail = ReadingListItem & {
