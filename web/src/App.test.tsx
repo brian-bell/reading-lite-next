@@ -643,6 +643,64 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
   });
 
+  it('ignores load-more clicks while a background poll refresh is in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let firstPageLoads = 0;
+    const pollPage = deferred<Response>();
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=cursor-1')) {
+        return readingsResponse([reading({ id: 'second', title: 'Second article' })], {
+          total: 2,
+          nextCursor: 'cursor-2',
+        });
+      }
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Pending article' })], {
+          total: 2,
+          nextCursor: 'cursor-1',
+        });
+      }
+      return pollPage.promise;
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(1);
+
+    // The background poll fires and its first-page refresh is in flight. Non-force refreshes leave
+    // the visible loading flags false, so the Load more button stays enabled and clickable.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    // Clicking Load more mid-poll must be ignored; otherwise it bumps the request ID and the
+    // fresher poll response is discarded in favor of a stale next-cursor page.
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    });
+    expect(readingCalls(fetchImpl).some(([url]) => String(url).endsWith('?cursor=cursor-1'))).toBe(false);
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    // The poll resolves and its fresh response wins.
+    await act(async () => {
+      pollPage.resolve(
+        readingsResponse([reading({ id: 'pending', status: 'ready', title: 'Ready article' })], {
+          total: 2,
+          nextCursor: 'cursor-1',
+        }),
+      );
+      await pollPage.promise;
+    });
+    expect(screen.getByText('Ready article')).toBeInTheDocument();
+  });
+
   it('keeps current readings and cursor usable when loading more fails', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();

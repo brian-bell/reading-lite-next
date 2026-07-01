@@ -250,7 +250,13 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   }, [hasActiveVisibleReading, refreshVisibleReadings, token]);
 
   const handleLoadMore = useCallback(() => {
-    if (nextCursor === undefined || readingsLoading || readingsLoadingMore) {
+    if (
+      nextCursor === undefined ||
+      readingsLoading ||
+      readingsLoadingMore ||
+      readingsLoadingRef.current.firstPage ||
+      readingsLoadingRef.current.nextPage
+    ) {
       return;
     }
     void loadReadings({ cursor: nextCursor, tokenOverride: loadToken() });
