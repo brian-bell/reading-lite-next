@@ -132,6 +132,18 @@ func TestOpenAI_ResponseValidation(t *testing.T) {
 			wantOutcome: dispatch.Fail,
 		},
 		{
+			name:        "refusal without message status fails permanently",
+			body:        `{"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]}`,
+			wantText:    "refusal",
+			wantOutcome: dispatch.Fail,
+		},
+		{
+			name:        "refusal with incomplete response status fails permanently",
+			body:        `{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","status":"incomplete","content":[{"type":"refusal","refusal":"no"}]}]}`,
+			wantText:    "refusal",
+			wantOutcome: dispatch.Fail,
+		},
+		{
 			name:        "missing output text",
 			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[]}]}`,
 			wantText:    "one output_text",

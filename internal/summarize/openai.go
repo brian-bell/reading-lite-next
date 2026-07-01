@@ -187,6 +187,18 @@ func (o *OpenAI) responseRequest(in SummaryInput) openAIRequest {
 }
 
 func parseOpenAIResponse(resp openAIResponse) (Summary, error) {
+	// Scan for refusals before any shape validation: refusals are
+	// deterministic safety refusals, and OpenAI's documented refusal sample
+	// omits the message status field, so a status guard running first would
+	// misclassify the refusal as retryable and repeat the billable request.
+	for _, item := range resp.Output {
+		for _, content := range item.Content {
+			if content.Type == "refusal" {
+				return Summary{}, fmt.Errorf("%w: summarize: response refusal: %s", dispatch.ErrPermanent, content.Refusal)
+			}
+		}
+	}
+
 	switch resp.Status {
 	case "completed":
 	case "incomplete":
@@ -204,11 +216,6 @@ func parseOpenAIResponse(resp openAIResponse) (Summary, error) {
 			return Summary{}, fmt.Errorf("summarize: output message status %q is not completed", item.Status)
 		}
 		for _, content := range item.Content {
-			if content.Type == "refusal" {
-				// Structured Outputs refusals are deterministic safety refusals,
-				// so retrying the same content would only repeat billable calls.
-				return Summary{}, fmt.Errorf("%w: summarize: response refusal: %s", dispatch.ErrPermanent, content.Refusal)
-			}
 			if content.Type != "output_text" {
 				continue
 			}
