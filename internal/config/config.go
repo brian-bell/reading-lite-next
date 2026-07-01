@@ -24,6 +24,27 @@ const (
 	DefaultShutdownTimeout = 10 * time.Second
 	// DefaultR2Region is Cloudflare R2's default signing region.
 	DefaultR2Region = "auto"
+	// DefaultSummaryProvider preserves the existing Anthropic summarizer unless
+	// OpenAI is explicitly selected.
+	DefaultSummaryProvider = SummaryProviderAnthropic
+	// DefaultSummaryOpenAIModel is the OpenAI Responses model for summaries.
+	DefaultSummaryOpenAIModel = "gpt-5.5"
+	// DefaultSummaryOpenAIReasoningEffort is the Responses reasoning effort for summaries.
+	DefaultSummaryOpenAIReasoningEffort = "medium"
+	// DefaultSummaryOpenAIMaxOutputTokens reserves room for reasoning and visible output.
+	DefaultSummaryOpenAIMaxOutputTokens = 25000
+	// MinSummaryOpenAIMaxOutputTokens is the OpenAI Responses API minimum for max_output_tokens.
+	MinSummaryOpenAIMaxOutputTokens = 16
+)
+
+// SummaryProvider identifies the production summarizer adapter.
+type SummaryProvider string
+
+const (
+	// SummaryProviderAnthropic selects the Anthropic Messages summarizer.
+	SummaryProviderAnthropic SummaryProvider = "anthropic"
+	// SummaryProviderOpenAI selects the OpenAI Responses summarizer.
+	SummaryProviderOpenAI SummaryProvider = "openai"
 )
 
 // Config is the complete production reader-api runtime configuration.
@@ -32,6 +53,7 @@ type Config struct {
 	DatabaseURL        string
 	OpenAIAPIKey       string
 	AnthropicAPIKey    string
+	Summary            SummaryConfig
 	R2                 R2Config
 	ResendAPIKey       string
 	Notify             NotifyConfig
@@ -46,6 +68,19 @@ type Config struct {
 	FetchMaxBytes      int64
 	ShutdownTimeout    time.Duration
 	CORSAllowedOrigins []string
+}
+
+// SummaryConfig holds summarizer provider selection and provider-specific knobs.
+type SummaryConfig struct {
+	Provider SummaryProvider
+	OpenAI   SummaryOpenAIConfig
+}
+
+// SummaryOpenAIConfig holds OpenAI Responses summarizer options.
+type SummaryOpenAIConfig struct {
+	Model           string
+	ReasoningEffort string
+	MaxOutputTokens int
 }
 
 // R2Config holds the S3-compatible object-store configuration.
@@ -71,7 +106,6 @@ func LoadEnv(environ []string) (Config, error) {
 		APIToken:           required(values, "READER_API_TOKEN", &errs),
 		DatabaseURL:        required(values, "DATABASE_URL", &errs),
 		OpenAIAPIKey:       required(values, "OPENAI_API_KEY", &errs),
-		AnthropicAPIKey:    required(values, "ANTHROPIC_API_KEY", &errs),
 		ResendAPIKey:       required(values, "RESEND_API_KEY", &errs),
 		PendingTTL:         requiredDuration(values, "PENDING_TTL", &errs),
 		RunningTTL:         requiredDuration(values, "RUNNING_TTL", &errs),
@@ -84,6 +118,18 @@ func LoadEnv(environ []string) (Config, error) {
 		FetchMaxBytes:      int64(optionalPositiveInt(values, "FETCH_MAX_BYTES", DefaultFetchMaxBytes, &errs)),
 		ShutdownTimeout:    optionalDuration(values, "SHUTDOWN_TIMEOUT", DefaultShutdownTimeout, &errs),
 		CORSAllowedOrigins: optionalCORSAllowedOrigins(values, &errs),
+	}
+	cfg.Summary = SummaryConfig{
+		Provider: optionalSummaryProvider(values, &errs),
+		OpenAI: SummaryOpenAIConfig{
+			Model:           optional(values, "SUMMARY_OPENAI_MODEL", DefaultSummaryOpenAIModel),
+			ReasoningEffort: optionalSummaryOpenAIReasoningEffort(values, &errs),
+			MaxOutputTokens: optionalSummaryOpenAIMaxOutputTokens(values, &errs),
+		},
+	}
+	cfg.AnthropicAPIKey = strings.TrimSpace(values["ANTHROPIC_API_KEY"])
+	if cfg.Summary.Provider == SummaryProviderAnthropic && cfg.AnthropicAPIKey == "" {
+		errs = append(errs, fieldError{name: "ANTHROPIC_API_KEY", problem: "is required"})
 	}
 	cfg.R2 = R2Config{
 		Endpoint:        required(values, "R2_ENDPOINT", &errs),
@@ -114,21 +160,25 @@ func LoadEnv(environ []string) (Config, error) {
 // SafeFields returns operational config fields that are safe to log.
 func (c Config) SafeFields() map[string]any {
 	return map[string]any{
-		"listen_addr":               c.ListenAddr,
-		"pending_ttl":               c.PendingTTL.String(),
-		"running_ttl":               c.RunningTTL.String(),
-		"max_attempts":              c.MaxAttempts,
-		"worker_concurrency":        c.WorkerConcurrency,
-		"dispatch_buffer":           c.DispatchBuffer,
-		"pg_max_conns":              c.PGMaxConns,
-		"r2_region":                 c.R2.Region,
-		"r2_bucket":                 c.R2.Bucket,
-		"fetch_timeout":             c.FetchTimeout.String(),
-		"fetch_max_bytes":           c.FetchMaxBytes,
-		"shutdown_timeout":          c.ShutdownTimeout.String(),
-		"cors_allowed_origin_count": len(c.CORSAllowedOrigins),
-		"notify_from":               c.Notify.From,
-		"notify_to":                 c.Notify.To,
+		"listen_addr":                      c.ListenAddr,
+		"pending_ttl":                      c.PendingTTL.String(),
+		"running_ttl":                      c.RunningTTL.String(),
+		"max_attempts":                     c.MaxAttempts,
+		"worker_concurrency":               c.WorkerConcurrency,
+		"dispatch_buffer":                  c.DispatchBuffer,
+		"pg_max_conns":                     c.PGMaxConns,
+		"r2_region":                        c.R2.Region,
+		"r2_bucket":                        c.R2.Bucket,
+		"fetch_timeout":                    c.FetchTimeout.String(),
+		"fetch_max_bytes":                  c.FetchMaxBytes,
+		"shutdown_timeout":                 c.ShutdownTimeout.String(),
+		"summary_provider":                 string(c.Summary.Provider),
+		"summary_openai_model":             c.Summary.OpenAI.Model,
+		"summary_openai_reasoning_effort":  c.Summary.OpenAI.ReasoningEffort,
+		"summary_openai_max_output_tokens": c.Summary.OpenAI.MaxOutputTokens,
+		"cors_allowed_origin_count":        len(c.CORSAllowedOrigins),
+		"notify_from":                      c.Notify.From,
+		"notify_to":                        c.Notify.To,
 	}
 }
 
@@ -167,6 +217,50 @@ func optional(values map[string]string, name, def string) string {
 		return v
 	}
 	return def
+}
+
+func optionalSummaryProvider(values map[string]string, errs *fieldErrors) SummaryProvider {
+	raw := strings.ToLower(strings.TrimSpace(values["SUMMARY_PROVIDER"]))
+	if raw == "" {
+		return DefaultSummaryProvider
+	}
+	switch SummaryProvider(raw) {
+	case SummaryProviderAnthropic, SummaryProviderOpenAI:
+		return SummaryProvider(raw)
+	default:
+		*errs = append(*errs, fieldError{name: "SUMMARY_PROVIDER", problem: "must be anthropic or openai"})
+		return DefaultSummaryProvider
+	}
+}
+
+func optionalSummaryOpenAIReasoningEffort(values map[string]string, errs *fieldErrors) string {
+	raw := strings.ToLower(strings.TrimSpace(values["SUMMARY_OPENAI_REASONING_EFFORT"]))
+	if raw == "" {
+		return DefaultSummaryOpenAIReasoningEffort
+	}
+	switch raw {
+	case "none", "minimal", "low", "medium", "high", "xhigh":
+		return raw
+	default:
+		*errs = append(*errs, fieldError{name: "SUMMARY_OPENAI_REASONING_EFFORT", problem: "must be none, minimal, low, medium, high, or xhigh"})
+		return DefaultSummaryOpenAIReasoningEffort
+	}
+}
+
+func optionalSummaryOpenAIMaxOutputTokens(values map[string]string, errs *fieldErrors) int {
+	raw := strings.TrimSpace(values["SUMMARY_OPENAI_MAX_OUTPUT_TOKENS"])
+	if raw == "" {
+		return DefaultSummaryOpenAIMaxOutputTokens
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < MinSummaryOpenAIMaxOutputTokens {
+		*errs = append(*errs, fieldError{
+			name:    "SUMMARY_OPENAI_MAX_OUTPUT_TOKENS",
+			problem: fmt.Sprintf("must be an integer of at least %d", MinSummaryOpenAIMaxOutputTokens),
+		})
+		return 0
+	}
+	return n
 }
 
 func requiredDuration(values map[string]string, name string, errs *fieldErrors) time.Duration {

@@ -1,5 +1,5 @@
 // Package httpx holds helpers shared by the HTTP service adapters
-// (embed.OpenAI, summarize.Anthropic): mapping a non-2xx response to a
+// (embed.OpenAI, summarize.Anthropic, summarize.OpenAI): mapping a non-2xx response to a
 // dispatcher-classified error and parsing the Retry-After header. Centralizing
 // this keeps every adapter's error semantics identical to dispatch.Classify, so
 // the dispatcher and the pipeline route upstream failures the same way.

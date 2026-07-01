@@ -356,10 +356,29 @@ func BuildProductionComponents(_ context.Context, cfg config.Config, pool Pool) 
 		YouTube:    extract.NewYouTube(),
 		Embedder:   embed.NewOpenAI(cfg.OpenAIAPIKey),
 		Vectors:    vector.NewPostgres(pgxPool),
-		Summarizer: summarize.NewAnthropic(cfg.AnthropicAPIKey),
+		Summarizer: BuildSummarizer(cfg),
 		Notifier:   notify.NewResend(cfg.ResendAPIKey),
 		Clock:      clock.System{},
 	}, nil
+}
+
+// BuildSummarizer constructs the configured production summarizer adapter.
+func BuildSummarizer(cfg config.Config, openAIOptions ...summarize.OpenAIOption) summarize.Summarizer {
+	switch cfg.Summary.Provider {
+	case config.SummaryProviderOpenAI:
+		opts := []summarize.OpenAIOption{
+			summarize.WithOpenAIModel(cfg.Summary.OpenAI.Model),
+			summarize.WithOpenAIReasoningEffort(cfg.Summary.OpenAI.ReasoningEffort),
+			summarize.WithOpenAIMaxOutputTokens(cfg.Summary.OpenAI.MaxOutputTokens),
+		}
+		opts = append(opts, openAIOptions...)
+		return summarize.NewOpenAI(
+			cfg.OpenAIAPIKey,
+			opts...,
+		)
+	default:
+		return summarize.NewAnthropic(cfg.AnthropicAPIKey)
+	}
 }
 
 func serve(s *http.Server) error {
