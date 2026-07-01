@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import ReactMarkdown from 'react-markdown';
 
 import './App.css';
 import {
   APIError,
   createAPIClient,
   resolveAPIBaseURL,
+  type DiagnosticsJSON,
   type HealthDocument,
+  type ReadingDetail,
   type ReadingListItem,
   type ReadingsListDocument,
   type ReadingStatus,
+  type SimilarItem,
 } from './api';
 import { clearToken, loadToken, saveToken } from './tokenStorage';
 
@@ -28,6 +32,8 @@ const readingsAuthMessage = 'Save a bearer token to load your reading list.';
 export const PROCESSING_POLL_INTERVAL_MS = 4000;
 const inFlightReadingsByFetch = new WeakMap<FetchImpl, Map<string, Promise<ReadingsListDocument>>>();
 
+type ContentState = 'idle' | 'loading' | 'ready' | 'missing' | 'error';
+
 export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const runtimeEnv = env ?? (import.meta.env as AppEnv);
   const [token, setToken] = useState(() => loadToken());
@@ -45,8 +51,18 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [submitMessage, setSubmitMessage] = useState('');
+  const [selectedReadingID, setSelectedReadingID] = useState<string | undefined>();
+  const [detail, setDetail] = useState<ReadingDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [content, setContent] = useState('');
+  const [contentState, setContentState] = useState<ContentState>('idle');
+  const [contentError, setContentError] = useState('');
+  const [rawDownloading, setRawDownloading] = useState(false);
+  const [rawError, setRawError] = useState('');
   const readingsRequestID = useRef(0);
   const readingsLoadingRef = useRef({ firstPage: false, nextPage: false });
+  const detailRequestID = useRef(0);
 
   const refreshHealth = useCallback(async () => {
     setLoading(true);
@@ -299,6 +315,133 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     [fetchImpl, refreshVisibleReadings, runtimeEnv, submitLoading, submitURL],
   );
 
+  const fetchContent = useCallback(
+    async (id: string, requestID: number) => {
+      setContentState('loading');
+      setContentError('');
+      try {
+        const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
+        const text = await client.getContent({ token: loadToken().trim(), id });
+        if (detailRequestID.current !== requestID) {
+          return;
+        }
+        setContent(text);
+        setContentState('ready');
+      } catch (err) {
+        if (detailRequestID.current !== requestID) {
+          return;
+        }
+        if (isNotFoundError(err)) {
+          setContentState('missing');
+        } else {
+          setContentState('error');
+          setContentError(readingsErrorMessage(err));
+        }
+      }
+    },
+    [fetchImpl, runtimeEnv],
+  );
+
+  const fetchDetail = useCallback(
+    async (id: string) => {
+      const requestID = detailRequestID.current + 1;
+      detailRequestID.current = requestID;
+      setDetailLoading(true);
+      setDetailError('');
+      try {
+        const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
+        const result = await client.getReading({ token: loadToken().trim(), id });
+        if (detailRequestID.current !== requestID) {
+          return;
+        }
+        setDetail(result);
+        setDetailLoading(false);
+        if (result.status === 'ready') {
+          void fetchContent(id, requestID);
+        } else {
+          setContent('');
+          setContentState('idle');
+          setContentError('');
+        }
+      } catch (err) {
+        if (detailRequestID.current !== requestID) {
+          return;
+        }
+        setDetailError(readingsErrorMessage(err));
+        setDetailLoading(false);
+      }
+    },
+    [fetchContent, fetchImpl, runtimeEnv],
+  );
+
+  const handleSelectReading = useCallback(
+    (id: string) => {
+      setSelectedReadingID(id);
+      setDetail(null);
+      setDetailError('');
+      setContent('');
+      setContentState('idle');
+      setContentError('');
+      setRawError('');
+      void fetchDetail(id);
+    },
+    [fetchDetail],
+  );
+
+  const handleBackToList = useCallback(() => {
+    detailRequestID.current += 1;
+    setSelectedReadingID(undefined);
+    setDetail(null);
+    setDetailLoading(false);
+    setDetailError('');
+    setContent('');
+    setContentState('idle');
+    setContentError('');
+    setRawError('');
+  }, []);
+
+  const handleRetryContent = useCallback(() => {
+    if (selectedReadingID === undefined) {
+      return;
+    }
+    void fetchContent(selectedReadingID, detailRequestID.current);
+  }, [fetchContent, selectedReadingID]);
+
+  const handleDownloadRaw = useCallback(async () => {
+    if (selectedReadingID === undefined || rawDownloading) {
+      return;
+    }
+    setRawDownloading(true);
+    setRawError('');
+    try {
+      const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
+      const { blob, filename } = await client.getRawBlob({ token: loadToken().trim(), id: selectedReadingID });
+      const objectURL = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectURL;
+      anchor.download = filename;
+      anchor.click();
+      URL.revokeObjectURL(objectURL);
+    } catch (err) {
+      setRawError(readingsErrorMessage(err));
+    } finally {
+      setRawDownloading(false);
+    }
+  }, [fetchImpl, rawDownloading, runtimeEnv, selectedReadingID]);
+
+  const isDetailProcessing = detail !== null && (detail.status === 'pending' || detail.status === 'running');
+
+  useEffect(() => {
+    const normalizedToken = loadToken().trim();
+    if (selectedReadingID === undefined || !isDetailProcessing || normalizedToken === '') {
+      return;
+    }
+    const intervalID = window.setInterval(() => {
+      void fetchDetail(selectedReadingID);
+    }, PROCESSING_POLL_INTERVAL_MS);
+    return () => window.clearInterval(intervalID);
+  }, [selectedReadingID, isDetailProcessing, fetchDetail]);
+
   const canSubmitURL = loadToken().trim() !== '' && submitURL.trim() !== '' && !submitLoading;
 
   return (
@@ -396,7 +539,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         {!readingsLoading && readings.length === 0 && total === 0 && readingsError === '' ? (
           <p className="muted">No readings yet.</p>
         ) : null}
-        {readings.length > 0 ? <ReadingList readings={readings} /> : null}
+        {readings.length > 0 ? <ReadingList readings={readings} onSelect={handleSelectReading} /> : null}
         {nextCursor !== undefined ? (
           <button
             type="button"
@@ -406,6 +549,22 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           >
             Load more
           </button>
+        ) : null}
+
+        {selectedReadingID !== undefined ? (
+          <ReadingDetailView
+            reading={detail}
+            loading={detailLoading}
+            error={detailError}
+            content={content}
+            contentState={contentState}
+            contentError={contentError}
+            rawDownloading={rawDownloading}
+            rawError={rawError}
+            onBack={handleBackToList}
+            onRetryContent={handleRetryContent}
+            onDownloadRaw={() => void handleDownloadRaw()}
+          />
         ) : null}
       </section>
     </main>
@@ -491,6 +650,10 @@ function isUnauthorizedError(err: unknown): boolean {
   return err instanceof APIError && (err.status === 401 || err.code === 'unauthorized');
 }
 
+function isNotFoundError(err: unknown): boolean {
+  return err instanceof APIError && (err.status === 404 || err.code === 'not_found');
+}
+
 function HealthSummary({ health }: { health: HealthDocument }) {
   return (
     <div className="health-summary">
@@ -510,13 +673,15 @@ function HealthSummary({ health }: { health: HealthDocument }) {
   );
 }
 
-function ReadingList({ readings }: { readings: ReadingListItem[] }) {
+function ReadingList({ readings, onSelect }: { readings: ReadingListItem[]; onSelect: (id: string) => void }) {
   return (
     <ul className="reading-list" aria-label="Readings">
       {readings.map((reading) => (
         <li key={reading.id} className="reading-item">
           <div className="reading-item-heading">
-            <h3>{reading.title || reading.url}</h3>
+            <button type="button" className="reading-item-link" onClick={() => onSelect(reading.id)}>
+              {reading.title || reading.url}
+            </button>
             <StatusBadge status={reading.status} />
           </div>
           <p className="reading-meta">{reading.site || reading.url}</p>
@@ -555,6 +720,179 @@ function statusLabel(status: ReadingStatus): string {
     case 'failed':
       return 'Failed';
   }
+}
+
+function ReadingDetailView({
+  reading,
+  loading,
+  error,
+  content,
+  contentState,
+  contentError,
+  rawDownloading,
+  rawError,
+  onBack,
+  onRetryContent,
+  onDownloadRaw,
+}: {
+  reading: ReadingDetail | null;
+  loading: boolean;
+  error: string;
+  content: string;
+  contentState: ContentState;
+  contentError: string;
+  rawDownloading: boolean;
+  rawError: string;
+  onBack: () => void;
+  onRetryContent: () => void;
+  onDownloadRaw: () => void;
+}) {
+  return (
+    <div className="reading-detail" role="region" aria-label="Reading detail">
+      <div className="section-heading">
+        <h2>Reading detail</h2>
+        <button type="button" className="secondary" onClick={onBack}>
+          Back to list
+        </button>
+      </div>
+
+      {loading ? <p className="muted">Loading reading...</p> : null}
+      {error ? (
+        <p role="alert" className="error-message">
+          {error}
+        </p>
+      ) : null}
+
+      {reading ? (
+        <>
+          <div className="reading-item-heading">
+            <h3>{reading.title || reading.url}</h3>
+            <StatusBadge status={reading.status} />
+          </div>
+          <p className="reading-meta">{reading.site || reading.url}</p>
+          {reading.summary ? <p className="reading-summary">{reading.summary}</p> : null}
+          {reading.tags && reading.tags.length > 0 ? (
+            <ul className="tag-list" aria-label="Tags">
+              {reading.tags.map((tag) => (
+                <li key={tag}>{tag}</li>
+              ))}
+            </ul>
+          ) : null}
+
+          <SimilarReadings items={reading.similar_json} />
+          <DiagnosticsTimings diagnostics={reading.diagnostics_json} />
+
+          <ReadingDetailContent
+            reading={reading}
+            content={content}
+            contentState={contentState}
+            contentError={contentError}
+            onRetry={onRetryContent}
+          />
+
+          <div className="raw-download">
+            <button type="button" className="secondary" disabled={rawDownloading} onClick={onDownloadRaw}>
+              Download raw source
+            </button>
+            {rawError ? (
+              <p role="alert" className="error-message">
+                {rawError}
+              </p>
+            ) : null}
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function SimilarReadings({ items }: { items: SimilarItem[] }) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="similar-readings">
+      <h4>Similar readings</h4>
+      <ul aria-label="Similar readings">
+        {items.map((item) => (
+          <li key={item.id}>
+            {item.url ? <a href={item.url}>{item.title || item.url}</a> : item.title || item.id}
+            <span className="similar-score"> ({item.score.toFixed(2)})</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function DiagnosticsTimings({ diagnostics }: { diagnostics?: DiagnosticsJSON }) {
+  const entries = diagnostics ? Object.entries(diagnostics.timings_ms) : [];
+  if (entries.length === 0) {
+    return null;
+  }
+  return (
+    <div className="diagnostics-timings">
+      <h4>Timings (ms)</h4>
+      <table aria-label="Timings">
+        <tbody>
+          {entries.map(([key, ms]) => (
+            <tr key={key}>
+              <th scope="row">{key}</th>
+              <td>{ms}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ReadingDetailContent({
+  reading,
+  content,
+  contentState,
+  contentError,
+  onRetry,
+}: {
+  reading: ReadingDetail;
+  content: string;
+  contentState: ContentState;
+  contentError: string;
+  onRetry: () => void;
+}) {
+  if (reading.status === 'pending' || reading.status === 'running') {
+    return <p className="muted">Processing...</p>;
+  }
+  if (reading.status === 'failed') {
+    return (
+      <p role="alert" className="error-message">
+        {reading.error || reading.stale_reason || 'Processing failed.'}
+      </p>
+    );
+  }
+  if (contentState === 'missing') {
+    return <p className="muted">No content available.</p>;
+  }
+  if (contentState === 'error') {
+    return (
+      <div>
+        <p role="alert" className="error-message">
+          {contentError}
+        </p>
+        <button type="button" className="secondary" onClick={onRetry}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+  if (contentState !== 'ready') {
+    return <p className="muted">Loading content...</p>;
+  }
+  return (
+    <div className="reading-content">
+      <ReactMarkdown>{content}</ReactMarkdown>
+    </div>
+  );
 }
 
 function errorMessage(err: unknown): string {
