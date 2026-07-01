@@ -30,6 +30,11 @@ export type ReadingsListDocument = {
   next_cursor?: string;
 };
 
+export type SubmitURLDocument = {
+  id: string;
+  status: ReadingStatus;
+};
+
 type ReadingListItemWire = Omit<ReadingListItem, 'tags'> & {
   tags?: string[] | null;
 };
@@ -52,6 +57,7 @@ type APIClientOptions = {
 export type APIClient = {
   health(): Promise<HealthDocument>;
   listReadings(options: { token: string; cursor?: string }): Promise<ReadingsListDocument>;
+  submitURL(options: { token: string; url: string }): Promise<SubmitURLDocument>;
 };
 
 export class APIError extends Error {
@@ -111,6 +117,29 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
         return normalizeReadingsListDocument(body);
       }
       throw new APIError('invalid_response', 'API response was not a readings list document', response.status);
+    },
+
+    async submitURL({ token, url }: { token: string; url: string }): Promise<SubmitURLDocument> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const response = await fetchImpl(`${normalizedBaseURL}/api/readings`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({ url }),
+      });
+      const body = await responseBody(response);
+      if (!response.ok) {
+        throw errorFromBody(response, body);
+      }
+      if (isSubmitURLDocument(body)) {
+        return body;
+      }
+      throw new APIError('invalid_response', 'API response was not a submit URL document', response.status);
     },
   };
 }
@@ -176,6 +205,10 @@ function isReadingListItem(value: unknown): value is ReadingListItemWire {
     optionalNumber(value.word_count) &&
     optionalNullableStringArray(value.tags)
   );
+}
+
+function isSubmitURLDocument(value: unknown): value is SubmitURLDocument {
+  return isRecord(value) && typeof value.id === 'string' && isReadingStatus(value.status);
 }
 
 function isReadingStatus(value: unknown): value is ReadingStatus {

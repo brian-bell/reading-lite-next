@@ -3,11 +3,11 @@
 import '@testing-library/jest-dom/vitest';
 
 import { StrictMode } from 'react';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import App from './App';
+import App, { PROCESSING_POLL_INTERVAL_MS } from './App';
 import { TOKEN_STORAGE_KEY } from './tokenStorage';
 
 const okHealth = {
@@ -88,6 +88,10 @@ function healthCalls(fetchImpl: ReturnType<typeof vi.fn>) {
   return fetchImpl.mock.calls.filter(([url]) => String(url).includes('/api/healthz'));
 }
 
+function submitCalls(fetchImpl: ReturnType<typeof vi.fn>) {
+  return readingCalls(fetchImpl).filter(([, init]) => init?.method === 'POST');
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((innerResolve) => {
@@ -98,6 +102,7 @@ function deferred<T>() {
 
 describe('App', () => {
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -366,6 +371,202 @@ describe('App', () => {
     ]);
   });
 
+  it('submits a URL and refreshes the visible reading list', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    let listLoads = 0;
+    const fetchImpl = fetchRoutes((url, init) => {
+      if (init?.method === 'POST') {
+        return jsonResponse({ id: 'new-reading', status: 'pending' }, 201);
+      }
+      listLoads += 1;
+      if (listLoads === 1) {
+        return readingsResponse([reading({ id: 'old-reading', title: 'Existing article' })], { total: 1 });
+      }
+      return readingsResponse(
+        [
+          reading({ id: 'new-reading', title: 'Freshly submitted article', url: 'https://example.com/post' }),
+          reading({ id: 'old-reading', title: 'Existing article' }),
+        ],
+        { total: 2 },
+      );
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('Existing article')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('URL'), 'https://example.com/post');
+    await user.click(screen.getByRole('button', { name: 'Add reading' }));
+
+    expect(await screen.findByText('Freshly submitted article')).toBeInTheDocument();
+    expect(screen.getByText('Existing article')).toBeInTheDocument();
+    expect(screen.getByLabelText('URL')).toHaveValue('');
+    expect(screen.getByText('Submitted URL. Status: pending.')).toBeInTheDocument();
+
+    expect(readingCalls(fetchImpl).map(([url, init]) => [url, init])).toEqual([
+      [
+        'https://api.example.com/api/readings',
+        { headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' } },
+      ],
+      [
+        'https://api.example.com/api/readings',
+        {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer stored-token',
+          },
+          body: JSON.stringify({ url: 'https://example.com/post' }),
+        },
+      ],
+      [
+        'https://api.example.com/api/readings',
+        { headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' } },
+      ],
+    ]);
+  });
+
+  it('shows submit errors without clearing existing readings', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes((_url, init) => {
+      if (init?.method === 'POST') {
+        return jsonResponse({ error: { code: 'invalid_url', message: 'invalid reading url' } }, 400);
+      }
+      return readingsResponse([reading({ id: 'old-reading', title: 'Existing article' })], { total: 1 });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('Existing article')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('URL'), 'https://bad.example/post');
+    await user.click(screen.getByRole('button', { name: 'Add reading' }));
+
+    expect(await screen.findByText('invalid reading url')).toBeInTheDocument();
+    expect(screen.getByText('Existing article')).toBeInTheDocument();
+    expect(screen.queryByText('Submitted URL. Status:')).not.toBeInTheDocument();
+  });
+
+  it('submits a URL and refreshes the same visible page depth with fresh cursors', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const fetchImpl = fetchRoutes((url, init) => {
+      if (init?.method === 'POST') {
+        return jsonResponse({ id: 'new-reading', status: 'pending' }, 201);
+      }
+      if (url.endsWith('?cursor=old-page-2')) {
+        return readingsResponse([reading({ id: 'second', title: 'Second visible article' })], {
+          total: 2,
+        });
+      }
+      if (url.endsWith('?cursor=fresh-page-2')) {
+        return readingsResponse([reading({ id: 'first', title: 'First visible article' })], {
+          total: 3,
+          nextCursor: 'fresh-page-3',
+        });
+      }
+      return readingCalls(fetchImpl).length < 3
+        ? readingsResponse([reading({ id: 'first', title: 'First visible article' })], {
+            total: 2,
+            nextCursor: 'old-page-2',
+          })
+        : readingsResponse([reading({ id: 'new-reading', title: 'Freshly submitted article' })], {
+            total: 3,
+            nextCursor: 'fresh-page-2',
+          });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('First visible article')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(await screen.findByText('Second visible article')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('URL'), 'https://example.com/post');
+    await user.click(screen.getByRole('button', { name: 'Add reading' }));
+
+    expect(await screen.findByText('Freshly submitted article')).toBeInTheDocument();
+    expect(screen.getByText('First visible article')).toBeInTheDocument();
+    expect(screen.queryByText('Second visible article')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
+    expect(readingCalls(fetchImpl).map(([url, init]) => [url, init?.method ?? 'GET'])).toEqual([
+      ['https://api.example.com/api/readings', 'GET'],
+      ['https://api.example.com/api/readings?cursor=old-page-2', 'GET'],
+      ['https://api.example.com/api/readings', 'POST'],
+      ['https://api.example.com/api/readings', 'GET'],
+      ['https://api.example.com/api/readings?cursor=fresh-page-2', 'GET'],
+    ]);
+  });
+
+  it('prevents duplicate submit requests while a URL is being submitted', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const submitted = deferred<Response>();
+    const fetchImpl = fetchRoutes((_url, init) => {
+      if (init?.method === 'POST') {
+        return submitted.promise;
+      }
+      return readingsResponse([reading({ id: 'old-reading', title: 'Existing article' })], { total: 1 });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('Existing article')).toBeInTheDocument();
+    await user.type(screen.getByLabelText('URL'), 'https://example.com/post');
+
+    const button = screen.getByRole('button', { name: 'Add reading' });
+    await user.click(button);
+    await user.click(button);
+
+    expect(button).toBeDisabled();
+    expect(submitCalls(fetchImpl)).toHaveLength(1);
+
+    await act(async () => {
+      submitted.resolve(jsonResponse({ id: 'new-reading', status: 'pending' }, 201));
+      await submitted.promise;
+    });
+  });
+
+  it('ignores in-flight submit responses after the token is cleared', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const submitted = deferred<Response>();
+    let listLoads = 0;
+    const fetchImpl = fetchRoutes((_url, init) => {
+      if (init?.method === 'POST') {
+        return submitted.promise;
+      }
+      listLoads += 1;
+      if (listLoads === 1) {
+        return readingsResponse([reading({ id: 'old-reading', title: 'Existing article' })], { total: 1 });
+      }
+      return readingsResponse([reading({ id: 'new-reading', title: 'Stale submitted article' })], { total: 1 });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('Existing article')).toBeInTheDocument();
+    await user.type(screen.getByLabelText('URL'), 'https://example.com/post');
+    await user.click(screen.getByRole('button', { name: 'Add reading' }));
+    await user.click(screen.getByRole('button', { name: 'Clear token' }));
+
+    expect(screen.queryByText('Existing article')).not.toBeInTheDocument();
+    expect(screen.getByText('Save a bearer token to load your reading list.')).toBeInTheDocument();
+
+    await act(async () => {
+      submitted.resolve(jsonResponse({ id: 'new-reading', status: 'pending' }, 201));
+      await submitted.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText('Stale submitted article')).not.toBeInTheDocument();
+    expect(screen.getByText('Save a bearer token to load your reading list.')).toBeInTheDocument();
+  });
+
   it('prevents duplicate load-more requests while a page is loading', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();
@@ -379,15 +580,125 @@ describe('App', () => {
 
     render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
 
-    const button = await screen.findByRole('button', { name: 'Load more' });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const button = screen.getByRole('button', { name: 'Load more' });
     await user.click(button);
     expect(button).toBeDisabled();
     expect(readingCalls(fetchImpl)).toHaveLength(2);
 
     await act(async () => {
-      nextPage.resolve(readingsResponse([reading({ id: 'second', title: 'Second article' })], { total: 2 }));
+      nextPage.resolve(
+        readingsResponse([reading({ id: 'second', title: 'Second article' })], {
+          total: 3,
+          nextCursor: 'cursor-2',
+        }),
+      );
       await nextPage.promise;
     });
+  });
+
+  it('does not strand the load-more button when polling is due while the next page is in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const nextPage = deferred<Response>();
+    let firstPageLoads = 0;
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=cursor-1')) {
+        return nextPage.promise;
+      }
+      firstPageLoads += 1;
+      return readingsResponse(
+        [reading({ id: 'pending', status: 'pending', title: `Pending article ${firstPageLoads}` })],
+        { total: 2, nextCursor: 'cursor-1' },
+      );
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const button = screen.getByRole('button', { name: 'Load more' });
+    act(() => {
+      fireEvent.click(button);
+    });
+    expect(button).toBeDisabled();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+
+    await act(async () => {
+      nextPage.resolve(
+        readingsResponse([reading({ id: 'second', title: 'Second article' })], {
+          total: 3,
+          nextCursor: 'cursor-2',
+        }),
+      );
+      await nextPage.promise;
+    });
+
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
+  });
+
+  it('ignores load-more clicks while a background poll refresh is in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let firstPageLoads = 0;
+    const pollPage = deferred<Response>();
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=cursor-1')) {
+        return readingsResponse([reading({ id: 'second', title: 'Second article' })], {
+          total: 2,
+          nextCursor: 'cursor-2',
+        });
+      }
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Pending article' })], {
+          total: 2,
+          nextCursor: 'cursor-1',
+        });
+      }
+      return pollPage.promise;
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(1);
+
+    // The background poll fires and its first-page refresh is in flight. Non-force refreshes leave
+    // the visible loading flags false, so the Load more button stays enabled and clickable.
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    // Clicking Load more mid-poll must be ignored; otherwise it bumps the request ID and the
+    // fresher poll response is discarded in favor of a stale next-cursor page.
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    });
+    expect(readingCalls(fetchImpl).some(([url]) => String(url).endsWith('?cursor=cursor-1'))).toBe(false);
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    // The poll resolves and its fresh response wins.
+    await act(async () => {
+      pollPage.resolve(
+        readingsResponse([reading({ id: 'pending', status: 'ready', title: 'Ready article' })], {
+          total: 2,
+          nextCursor: 'cursor-1',
+        }),
+      );
+      await pollPage.promise;
+    });
+    expect(screen.getByText('Ready article')).toBeInTheDocument();
   });
 
   it('keeps current readings and cursor usable when loading more fails', async () => {
@@ -429,5 +740,467 @@ describe('App', () => {
     expect(screen.getByLabelText('Status: Ready')).toHaveClass('reading-status-ready');
     expect(screen.getByLabelText('Status: Failed')).toHaveClass('reading-status-failed');
     expect(screen.getByText('extraction failed')).toBeInTheDocument();
+  });
+
+  it('polls the visible reading list while a reading is pending', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let listLoads = 0;
+    const fetchImpl = fetchRoutes(() => {
+      listLoads += 1;
+      if (listLoads === 1) {
+        return readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Pending article' })]);
+      }
+      return readingsResponse([reading({ id: 'pending', status: 'ready', title: 'Ready article' })]);
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Ready article')).toBeInTheDocument();
+    expect(screen.queryByText('Pending article')).not.toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+  });
+
+  it('polls loaded pages by following fresh cursors so shifted readings stay visible', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let firstPageLoads = 0;
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=old-page-2')) {
+        return readingsResponse([reading({ id: 'third', title: 'Third article' })], {
+          total: 3,
+        });
+      }
+      if (url.endsWith('?cursor=fresh-page-2')) {
+        return readingsResponse(
+          [
+            reading({ id: 'second', title: 'Second article' }),
+            reading({ id: 'third', title: 'Third article' }),
+          ],
+          { total: 4 },
+        );
+      }
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse(
+          [
+            reading({ id: 'pending', status: 'pending', title: 'Pending article' }),
+            reading({ id: 'second', title: 'Second article' }),
+          ],
+          { total: 3, nextCursor: 'old-page-2' },
+        );
+      }
+      return readingsResponse(
+        [
+          reading({ id: 'newest', title: 'Newest article' }),
+          reading({ id: 'pending', status: 'running', title: 'Running article' }),
+        ],
+        { total: 4, nextCursor: 'fresh-page-2' },
+      );
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Third article')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Newest article')).toBeInTheDocument();
+    expect(screen.getByText('Running article')).toBeInTheDocument();
+    expect(screen.getByText('Second article')).toBeInTheDocument();
+    expect(screen.getByText('Third article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl).map(([url]) => url)).toEqual([
+      'https://api.example.com/api/readings',
+      'https://api.example.com/api/readings?cursor=old-page-2',
+      'https://api.example.com/api/readings',
+      'https://api.example.com/api/readings?cursor=fresh-page-2',
+    ]);
+  });
+
+  it('continues polling running readings and stops after terminal readings are visible', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let listLoads = 0;
+    const fetchImpl = fetchRoutes(() => {
+      listLoads += 1;
+      if (listLoads === 1) {
+        return readingsResponse([reading({ id: 'processing', status: 'pending', title: 'Pending article' })]);
+      }
+      if (listLoads === 2) {
+        return readingsResponse([reading({ id: 'processing', status: 'running', title: 'Running article' })]);
+      }
+      return readingsResponse([reading({ id: 'processing', status: 'ready', title: 'Ready article' })]);
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Running article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Ready article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(3);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(3);
+  });
+
+  it('does not restart a paginated poll while a later page is still in flight', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const slowPoll = deferred<Response>();
+    let firstPageLoads = 0;
+    let secondPageLoads = 0;
+    const fetchImpl = fetchRoutes((url) => {
+      if (url.endsWith('?cursor=cursor-1')) {
+        secondPageLoads += 1;
+        if (secondPageLoads === 1) {
+          return readingsResponse([reading({ id: 'second', title: 'Second article' })], { total: 2 });
+        }
+        return slowPoll.promise;
+      }
+
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'processing', status: 'pending', title: 'Pending article' })], {
+          nextCursor: 'cursor-1',
+          total: 2,
+        });
+      }
+      return readingsResponse([reading({ id: 'processing', status: 'running', title: 'Running article' })], {
+        nextCursor: 'cursor-1',
+        total: 2,
+      });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Second article')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(4);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(4);
+
+    await act(async () => {
+      slowPoll.resolve(readingsResponse([reading({ id: 'second', title: 'Fresh second article' })], { total: 2 }));
+      await slowPoll.promise;
+    });
+    expect(screen.getByText('Running article')).toBeInTheDocument();
+    expect(screen.getByText('Fresh second article')).toBeInTheDocument();
+  });
+
+  it('ignores in-flight polling responses after the token is cleared', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const pollingResponse = deferred<Response>();
+    let listLoads = 0;
+    const fetchImpl = fetchRoutes(() => {
+      listLoads += 1;
+      if (listLoads === 1) {
+        return readingsResponse([reading({ id: 'processing', status: 'pending', title: 'Pending article' })]);
+      }
+      return pollingResponse.promise;
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Clear token' }));
+    });
+    expect(screen.queryByText('Pending article')).not.toBeInTheDocument();
+    expect(screen.getByText('Save a bearer token to load your reading list.')).toBeInTheDocument();
+
+    await act(async () => {
+      pollingResponse.resolve(readingsResponse([reading({ id: 'processing', status: 'ready', title: 'Stale ready article' })]));
+      await pollingResponse.promise;
+    });
+
+    expect(screen.queryByText('Stale ready article')).not.toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+  });
+
+  it('does not satisfy a post-submit refresh from a pre-submit in-flight polling response', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const stalePoll = deferred<Response>();
+    let firstPageLoads = 0;
+    let submitted = false;
+    const fetchImpl = fetchRoutes((_url, init) => {
+      if (init?.method === 'POST') {
+        submitted = true;
+        return jsonResponse({ id: 'new-reading', status: 'pending' }, 201);
+      }
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Pending article' })], {
+          total: 1,
+        });
+      }
+      if (!submitted) {
+        return stalePoll.promise;
+      }
+      return readingsResponse(
+        [
+          reading({ id: 'new-reading', status: 'pending', title: 'Freshly submitted article' }),
+          reading({ id: 'pending', status: 'running', title: 'Running article' }),
+        ],
+        { total: 2 },
+      );
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    act(() => {
+      fireEvent.change(screen.getByLabelText('URL'), { target: { value: 'https://example.com/post' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add reading' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(readingCalls(fetchImpl).map(([, init]) => init?.method ?? 'GET')).toEqual(['GET', 'GET', 'POST', 'GET']);
+    expect(screen.getByText('Freshly submitted article')).toBeInTheDocument();
+
+    await act(async () => {
+      stalePoll.resolve(readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Stale pending article' })]));
+      await stalePoll.promise;
+    });
+
+    expect(screen.getByText('Freshly submitted article')).toBeInTheDocument();
+    expect(screen.queryByText('Stale pending article')).not.toBeInTheDocument();
+  });
+
+  it('keeps a delayed post-submit refresh active so polling cannot replace it with a stale response', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const stalePoll = deferred<Response>();
+    const submitRefresh = deferred<Response>();
+    let firstPageLoads = 0;
+    let submitted = false;
+    let submitRefreshResolved = false;
+    const fetchImpl = fetchRoutes((_url, init) => {
+      if (init?.method === 'POST') {
+        submitted = true;
+        return jsonResponse({ id: 'new-reading', status: 'pending' }, 201);
+      }
+      firstPageLoads += 1;
+      if (firstPageLoads === 1) {
+        return readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Pending article' })], {
+          total: 1,
+        });
+      }
+      if (!submitted) {
+        return stalePoll.promise;
+      }
+      if (submitRefreshResolved) {
+        return readingsResponse(
+          [reading({ id: 'new-reading', status: 'running', title: 'Freshly submitted article' })],
+          { total: 2 },
+        );
+      }
+      return submitRefresh.promise;
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Pending article')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    expect(readingCalls(fetchImpl)).toHaveLength(2);
+
+    act(() => {
+      fireEvent.change(screen.getByLabelText('URL'), { target: { value: 'https://example.com/post' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add reading' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl).map(([, init]) => init?.method ?? 'GET')).toEqual(['GET', 'GET', 'POST', 'GET']);
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    expect(readingCalls(fetchImpl).map(([, init]) => init?.method ?? 'GET')).toEqual(['GET', 'GET', 'POST', 'GET']);
+
+    await act(async () => {
+      submitRefreshResolved = true;
+      submitRefresh.resolve(
+        readingsResponse([reading({ id: 'new-reading', status: 'pending', title: 'Freshly submitted article' })], {
+          total: 2,
+        }),
+      );
+      await submitRefresh.promise;
+    });
+    expect(screen.getByText('Freshly submitted article')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(readingCalls(fetchImpl).map(([, init]) => init?.method ?? 'GET')).toEqual([
+      'GET',
+      'GET',
+      'POST',
+      'GET',
+      'GET',
+    ]);
+
+    await act(async () => {
+      stalePoll.resolve(readingsResponse([reading({ id: 'pending', status: 'pending', title: 'Stale pending article' })]));
+      await stalePoll.promise;
+    });
+    expect(screen.queryByText('Stale pending article')).not.toBeInTheDocument();
+  });
+
+  it('keeps load more disabled while a post-submit refresh is in flight', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const submitRefresh = deferred<Response>();
+    let submitted = false;
+    const fetchImpl = fetchRoutes((url, init) => {
+      if (init?.method === 'POST') {
+        submitted = true;
+        return jsonResponse({ id: 'new-reading', status: 'pending' }, 201);
+      }
+      if (url.endsWith('?cursor=old-page-2')) {
+        return readingsResponse([reading({ id: 'second', title: 'Second article' })], {
+          total: 2,
+          nextCursor: 'old-page-3',
+        });
+      }
+      if (url.endsWith('?cursor=fresh-page-2')) {
+        return readingsResponse([reading({ id: 'first', title: 'First article' })], {
+          total: 3,
+          nextCursor: 'fresh-page-3',
+        });
+      }
+      if (submitted) {
+        return submitRefresh.promise;
+      }
+      return readingsResponse([reading({ id: 'first', title: 'First article' })], {
+        total: 2,
+        nextCursor: 'old-page-2',
+      });
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    expect(await screen.findByText('First article')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(await screen.findByText('Second article')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('URL'), 'https://example.com/post');
+    await user.click(screen.getByRole('button', { name: 'Add reading' }));
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(readingCalls(fetchImpl).map(([url]) => url)).toEqual([
+      'https://api.example.com/api/readings',
+      'https://api.example.com/api/readings?cursor=old-page-2',
+      'https://api.example.com/api/readings',
+      'https://api.example.com/api/readings',
+    ]);
+
+    await act(async () => {
+      submitRefresh.resolve(
+        readingsResponse([reading({ id: 'new-reading', status: 'pending', title: 'Freshly submitted article' })], {
+          total: 3,
+          nextCursor: 'fresh-page-2',
+        }),
+      );
+      await submitRefresh.promise;
+    });
+    expect(screen.getByText('Freshly submitted article')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
   });
 });
