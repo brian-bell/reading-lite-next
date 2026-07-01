@@ -506,8 +506,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       // The 202 body is authoritative: the backend cleared the checkpoint and
       // re-enqueued synchronously. Apply its status, clear any prior failure/stale
       // overlay so the processing view is clean, and flip the matching list item.
-      setDetail((current) => (current && current.id === id ? { ...current, status: result.status, error: '', stale_reason: '' } : current));
-      setReadings((list) => list.map((item) => (item.id === id ? { ...item, status: result.status } : item)));
+      setDetail((current) => (current && current.id === id ? resetDetailForReprocess(current, result.status) : current));
+      setReadings((list) => list.map((item) => (item.id === id ? resetListItemForReprocess(item, result.status) : item)));
       // The re-enqueued reading no longer has current content; drop any stale
       // markdown so a later render can't surface it. Mirrors fetchDetail's
       // non-ready reset (the processing view short-circuits on status anyway).
@@ -764,6 +764,27 @@ function canReprocess(reading: ReadingDetail): boolean {
   // forced. Fresh pending/running readings are already queued, so the backend
   // would no-op — hide the control for them.
   return reading.status === 'ready' || reading.status === 'failed' || Boolean(reading.stale_reason);
+}
+
+function resetListItemForReprocess(reading: ReadingListItem, status: ReadingStatus): ReadingListItem {
+  return {
+    ...reading,
+    status,
+    site: undefined,
+    summary: undefined,
+    error: '',
+    word_count: undefined,
+  };
+}
+
+function resetDetailForReprocess(reading: ReadingDetail, status: ReadingStatus): ReadingDetail {
+  return {
+    ...resetListItemForReprocess(reading, status),
+    summary_json: undefined,
+    similar_json: [],
+    diagnostics_json: undefined,
+    stale_reason: '',
+  };
 }
 
 function isUnauthorizedError(err: unknown): boolean {

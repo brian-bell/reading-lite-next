@@ -806,6 +806,9 @@ describe('Reprocess', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Example article' }));
     expect(await screen.findByText('Body text.')).toBeInTheDocument();
+    expect(screen.getAllByText('A concise summary.')).toHaveLength(2);
+    expect(screen.getByRole('link', { name: 'Related reading' })).toBeInTheDocument();
+    expect(screen.getByRole('table', { name: 'Timings' })).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: /reprocess/i }));
 
@@ -813,6 +816,9 @@ describe('Reprocess', () => {
     expect(reprocessCalls).toBe(1);
     expect(screen.queryByRole('button', { name: /reprocess/i })).not.toBeInTheDocument();
     expect(screen.queryByText('Body text.')).not.toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Related reading' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('table', { name: 'Timings' })).not.toBeInTheDocument();
 
     const list = screen.getByRole('list', { name: 'Readings' });
     expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
