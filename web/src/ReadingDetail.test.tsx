@@ -283,6 +283,51 @@ describe('ReadingDetail', () => {
     expect(await screen.findByText('Recovered content')).toBeInTheDocument();
   });
 
+  it('discards a stale retry response when a second, faster retry has already superseded it', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    let contentCalls = 0;
+    const firstRetry = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => {
+        contentCalls += 1;
+        if (contentCalls === 1) {
+          return jsonResponse({ error: { code: 'internal', message: 'upstream exploded' } }, 500);
+        }
+        if (contentCalls === 2) {
+          return firstRetry.promise;
+        }
+        return new Response('Second retry content', { status: 200 });
+      },
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Example article' }));
+    expect(await screen.findByText('upstream exploded')).toBeInTheDocument();
+
+    // Fire two retries back to back, before React re-renders in response to the first,
+    // so each click hits the still-mounted button. This is what previously made both
+    // retries share the same stale-response guard value.
+    const retryButton = screen.getByRole('button', { name: 'Retry' });
+    act(() => {
+      fireEvent.click(retryButton);
+      fireEvent.click(retryButton);
+    });
+
+    expect(await screen.findByText('Second retry content')).toBeInTheDocument();
+
+    await act(async () => {
+      firstRetry.resolve(new Response('First retry content', { status: 200 }));
+      await firstRetry.promise;
+    });
+
+    expect(screen.getByText('Second retry content')).toBeInTheDocument();
+    expect(screen.queryByText('First retry content')).not.toBeInTheDocument();
+  });
+
   it('downloads raw source via an object URL and revokes it afterward', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();
@@ -315,6 +360,46 @@ describe('ReadingDetail', () => {
       await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
+    } finally {
+      clickSpy.mockRestore();
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+    }
+  });
+
+  it('revokes the object URL even when the download click throws', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([reading()]),
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: () =>
+        new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Disposition': 'attachment; filename="raw-content"' },
+        }),
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {
+      throw new Error('blocked by browser policy');
+    });
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Example article' }));
+      await user.click(await screen.findByRole('button', { name: 'Download raw source' }));
+
+      await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url'));
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
     } finally {
       clickSpy.mockRestore();
       URL.createObjectURL = originalCreateObjectURL;

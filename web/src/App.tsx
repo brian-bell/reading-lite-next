@@ -335,7 +335,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           setContentState('missing');
         } else {
           setContentState('error');
-          setContentError(readingsErrorMessage(err));
+          setContentError(messageFromError(err, 'Unable to load content'));
         }
       }
     },
@@ -367,7 +367,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         if (detailRequestID.current !== requestID) {
           return;
         }
-        setDetailError(readingsErrorMessage(err));
+        setDetailError(messageFromError(err, 'Unable to load reading detail'));
         setDetailLoading(false);
       }
     },
@@ -404,7 +404,9 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     if (selectedReadingID === undefined) {
       return;
     }
-    void fetchContent(selectedReadingID, detailRequestID.current);
+    const requestID = detailRequestID.current + 1;
+    detailRequestID.current = requestID;
+    void fetchContent(selectedReadingID, requestID);
   }, [fetchContent, selectedReadingID]);
 
   const handleDownloadRaw = useCallback(async () => {
@@ -417,13 +419,16 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
       const { blob, filename } = await client.getRawBlob({ token: loadToken().trim(), id: selectedReadingID });
       const objectURL = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = objectURL;
-      anchor.download = filename;
-      anchor.click();
-      URL.revokeObjectURL(objectURL);
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = objectURL;
+        anchor.download = filename;
+        anchor.click();
+      } finally {
+        URL.revokeObjectURL(objectURL);
+      }
     } catch (err) {
-      setRawError(readingsErrorMessage(err));
+      setRawError(messageFromError(err, 'Unable to download raw source'));
     } finally {
       setRawDownloading(false);
     }
@@ -895,22 +900,20 @@ function ReadingDetailContent({
   );
 }
 
-function errorMessage(err: unknown): string {
+function messageFromError(err: unknown, fallback: string): string {
   if (err instanceof APIError) {
     return err.message;
   }
   if (err instanceof Error) {
     return err.message;
   }
-  return 'Unable to load API health';
+  return fallback;
+}
+
+function errorMessage(err: unknown): string {
+  return messageFromError(err, 'Unable to load API health');
 }
 
 function readingsErrorMessage(err: unknown): string {
-  if (err instanceof APIError) {
-    return err.message;
-  }
-  if (err instanceof Error) {
-    return err.message;
-  }
-  return 'Unable to load reading list';
+  return messageFromError(err, 'Unable to load reading list');
 }
