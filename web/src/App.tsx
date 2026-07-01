@@ -413,6 +413,10 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     }
     const requestID = detailRequestID.current + 1;
     detailRequestID.current = requestID;
+    // Retry only re-fetches content, so no detail request is now outstanding
+    // for this requestID. Clear the flag so a superseded in-flight detail
+    // fetch cannot leave it stuck true and block future polls.
+    detailFetchInFlight.current = false;
     void fetchContent(selectedReadingID, requestID);
   }, [fetchContent, selectedReadingID]);
 
