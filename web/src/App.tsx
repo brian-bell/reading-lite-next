@@ -64,6 +64,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const readingsLoadingRef = useRef({ firstPage: false, nextPage: false });
   const detailRequestID = useRef(0);
   const detailFetchInFlight = useRef(false);
+  const rawRequestID = useRef(0);
 
   const refreshHealth = useCallback(async () => {
     setLoading(true);
@@ -382,12 +383,14 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
 
   const handleSelectReading = useCallback(
     (id: string) => {
+      rawRequestID.current += 1;
       setSelectedReadingID(id);
       setDetail(null);
       setDetailError('');
       setContent('');
       setContentState('idle');
       setContentError('');
+      setRawDownloading(false);
       setRawError('');
       void fetchDetail(id);
     },
@@ -397,6 +400,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const handleBackToList = useCallback(() => {
     detailRequestID.current += 1;
     detailFetchInFlight.current = false;
+    rawRequestID.current += 1;
     setSelectedReadingID(undefined);
     setDetail(null);
     setDetailLoading(false);
@@ -404,6 +408,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     setContent('');
     setContentState('idle');
     setContentError('');
+    setRawDownloading(false);
     setRawError('');
   }, []);
 
@@ -424,18 +429,21 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     if (selectedReadingID === undefined || rawDownloading) {
       return;
     }
-    // Snapshot the current detail request so a response that arrives after the
-    // user backs out, clears the token, or selects another reading (all of
-    // which bump detailRequestID) cannot trigger a download or write an error
-    // into the now-current detail.
-    const requestID = detailRequestID.current;
+    // Snapshot a dedicated raw-request token. Selecting another reading or
+    // backing out bumps rawRequestID (and clears the busy state), so a response
+    // that arrives afterwards cannot trigger a download, write a stale error, or
+    // leave a later reading's download button disabled. Keeping this separate
+    // from detailRequestID means a content retry on the same reading does not
+    // cancel an in-flight raw download.
+    const requestID = rawRequestID.current + 1;
+    rawRequestID.current = requestID;
     const id = selectedReadingID;
     setRawDownloading(true);
     setRawError('');
     try {
       const client = createAPIClient({ baseURL: resolveAPIBaseURL(runtimeEnv), fetchImpl });
       const { blob, filename } = await client.getRawBlob({ token: loadToken().trim(), id });
-      if (detailRequestID.current !== requestID) {
+      if (rawRequestID.current !== requestID) {
         return;
       }
       const objectURL = URL.createObjectURL(blob);
@@ -448,12 +456,14 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         URL.revokeObjectURL(objectURL);
       }
     } catch (err) {
-      if (detailRequestID.current !== requestID) {
+      if (rawRequestID.current !== requestID) {
         return;
       }
       setRawError(messageFromError(err, 'Unable to download raw source'));
     } finally {
-      setRawDownloading(false);
+      if (rawRequestID.current === requestID) {
+        setRawDownloading(false);
+      }
     }
   }, [fetchImpl, rawDownloading, runtimeEnv, selectedReadingID]);
 

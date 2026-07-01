@@ -462,6 +462,69 @@ describe('ReadingDetail', () => {
     }
   });
 
+  it('re-enables and runs raw download for a newly selected reading while a prior download is still in flight', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const user = userEvent.setup();
+    const readingA = reading({ id: 'reading-a', title: 'Reading A' });
+    const readingB = reading({ id: 'reading-b', title: 'Reading B' });
+    const rawA = deferred<Response>();
+    const rawCalls: string[] = [];
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchRoutes({
+      readings: () => readingsResponse([readingA, readingB]),
+      detail: (id) => jsonResponse(detailReading({ id, title: id === 'reading-a' ? 'Reading A' : 'Reading B' })),
+      content: () => new Response('Body text.', { status: 200 }),
+      raw: (id) => {
+        rawCalls.push(id);
+        if (id === 'reading-a') {
+          return rawA.promise;
+        }
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Disposition': 'attachment; filename="b-raw"' },
+        });
+      },
+    });
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => 'blob:mock-url');
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    try {
+      render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+      await user.click(await screen.findByRole('button', { name: 'Reading A' }));
+      await user.click(await screen.findByRole('button', { name: 'Download raw source' }));
+
+      // Switch to reading B while A's raw download is still in flight (never resolves here).
+      await user.click(screen.getByRole('button', { name: 'Reading B' }));
+      expect(await screen.findByRole('heading', { name: 'Reading B', level: 3 })).toBeInTheDocument();
+
+      // B's download must be enabled and functional despite A's request still hanging.
+      const downloadB = screen.getByRole('button', { name: 'Download raw source' });
+      expect(downloadB).toBeEnabled();
+      await user.click(downloadB);
+
+      await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect(rawCalls).toContain('reading-b');
+    } finally {
+      clickSpy.mockRestore();
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+      rawA.resolve(
+        new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Disposition': 'attachment; filename="a-raw"' },
+        }),
+      );
+    }
+  });
+
   it('shows a friendly empty state when extracted content is missing', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();
