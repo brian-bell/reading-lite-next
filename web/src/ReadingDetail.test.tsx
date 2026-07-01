@@ -1093,6 +1093,90 @@ describe('Reprocess', () => {
     expect(screen.queryByText('Ready content')).not.toBeInTheDocument();
   });
 
+  it('keeps the authoritative reprocess status when a list poll resolves stale', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    let readingsCalls = 0;
+    const staleListPoll = deferred<Response>();
+    const fetchImpl = fetchRoutes({
+      readings: () => {
+        readingsCalls += 1;
+        if (readingsCalls === 1) {
+          return readingsResponse([
+            reading(),
+            reading({
+              id: 'reading-2',
+              url: 'https://example.com/other',
+              status: 'running',
+              title: 'Other processing article',
+              summary: undefined,
+            }),
+          ]);
+        }
+        return staleListPoll.promise;
+      },
+      detail: () => jsonResponse(detailReading()),
+      content: () => new Response('Body text.', { status: 200 }),
+      reprocess: (id) => jsonResponse({ id, status: 'pending' }, 202),
+    });
+
+    render(<App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com' }} fetchImpl={fetchImpl} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Other processing article')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(PROCESSING_POLL_INTERVAL_MS);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(readingsCalls).toBe(2);
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Example article' }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Body text.')).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: /reprocess/i }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+
+    await act(async () => {
+      staleListPoll.resolve(
+        readingsResponse([
+          reading(),
+          reading({
+            id: 'reading-2',
+            url: 'https://example.com/other',
+            status: 'ready',
+            title: 'Other ready article',
+            summary: undefined,
+          }),
+        ]),
+      );
+      await staleListPoll.promise;
+      await Promise.resolve();
+    });
+
+    const list = screen.getByRole('list', { name: 'Readings' });
+    expect(within(list).getByLabelText('Status: Pending')).toBeInTheDocument();
+    expect(screen.getByText('Processing...')).toBeInTheDocument();
+    expect(screen.queryByText('A concise summary.')).not.toBeInTheDocument();
+  });
+
   it('discards a superseded reprocess response after navigating back to the list', async () => {
     localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
     const user = userEvent.setup();

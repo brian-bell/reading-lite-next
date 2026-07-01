@@ -506,6 +506,11 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       // The 202 body is authoritative: the backend cleared the checkpoint and
       // re-enqueued synchronously. Apply its status, clear any prior failure/stale
       // overlay so the processing view is clean, and flip the matching list item.
+      clearInFlightReadings(fetchImpl);
+      readingsRequestID.current += 1;
+      readingsLoadingRef.current = { firstPage: false, nextPage: false };
+      setReadingsLoading(false);
+      setReadingsLoadingMore(false);
       setDetail((current) => (current && current.id === id ? resetDetailForReprocess(current, result.status) : current));
       setReadings((list) => list.map((item) => (item.id === id ? resetListItemForReprocess(item, result.status) : item)));
       // The re-enqueued reading no longer has current content; drop any stale
