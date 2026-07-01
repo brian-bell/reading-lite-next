@@ -2,6 +2,7 @@
 
 import '@testing-library/jest-dom/vitest';
 
+import { StrictMode } from 'react';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -141,6 +142,20 @@ describe('App', () => {
     expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings', {
       headers: { Accept: 'application/json', Authorization: 'Bearer stored-token' },
     });
+  });
+
+  it('deduplicates the initial authenticated readings request under StrictMode', async () => {
+    localStorage.setItem(TOKEN_STORAGE_KEY, 'stored-token');
+    const fetchImpl = fetchRoutes(() => readingsResponse([reading({ title: 'Strict mode article' })]));
+
+    render(
+      <StrictMode>
+        <App env={{ VITE_READER_API_BASE_URL: 'https://api.example.com/' }} fetchImpl={fetchImpl} />
+      </StrictMode>,
+    );
+
+    expect(await screen.findByText('Strict mode article')).toBeInTheDocument();
+    expect(readingCalls(fetchImpl)).toHaveLength(1);
   });
 
   it('loads health on mount and refreshes without sending Authorization', async () => {

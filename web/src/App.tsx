@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import './App.css';
-import { APIError, createAPIClient, resolveAPIBaseURL, type HealthDocument, type ReadingListItem, type ReadingStatus } from './api';
+import {
+  APIError,
+  createAPIClient,
+  resolveAPIBaseURL,
+  type HealthDocument,
+  type ReadingListItem,
+  type ReadingsListDocument,
+  type ReadingStatus,
+} from './api';
 import { clearToken, loadToken, saveToken } from './tokenStorage';
 
 type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>;
@@ -17,6 +25,7 @@ type AppProps = {
 
 const defaultFetch: FetchImpl = (input, init) => globalThis.fetch(input, init);
 const readingsAuthMessage = 'Save a bearer token to load your reading list.';
+const inFlightReadingsByFetch = new WeakMap<FetchImpl, Map<string, Promise<ReadingsListDocument>>>();
 
 export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const runtimeEnv = env ?? (import.meta.env as AppEnv);
@@ -85,11 +94,12 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       }
 
       try {
-        const client = createAPIClient({
+        const document = await listReadingsOnce({
           baseURL: resolveAPIBaseURL(runtimeEnv),
           fetchImpl,
+          token: normalizedToken,
+          cursor,
         });
-        const document = await client.listReadings({ token: normalizedToken, cursor });
         if (readingsRequestID.current !== requestID) {
           return;
         }
@@ -213,6 +223,36 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       </section>
     </main>
   );
+}
+
+function listReadingsOnce({
+  baseURL,
+  fetchImpl,
+  token,
+  cursor,
+}: {
+  baseURL: string;
+  fetchImpl: FetchImpl;
+  token: string;
+  cursor?: string;
+}): Promise<ReadingsListDocument> {
+  const requestKey = JSON.stringify([baseURL, token, cursor ?? null]);
+  let requests = inFlightReadingsByFetch.get(fetchImpl);
+  if (requests === undefined) {
+    requests = new Map();
+    inFlightReadingsByFetch.set(fetchImpl, requests);
+  }
+
+  const existingRequest = requests.get(requestKey);
+  if (existingRequest !== undefined) {
+    return existingRequest;
+  }
+
+  const request = createAPIClient({ baseURL, fetchImpl })
+    .listReadings({ token, cursor })
+    .finally(() => requests.delete(requestKey));
+  requests.set(requestKey, request);
+  return request;
 }
 
 function HealthSummary({ health }: { health: HealthDocument }) {

@@ -170,6 +170,17 @@ describe('createAPIClient', () => {
     });
   });
 
+  it('rejects non-OK readings responses even when the body looks like a list document', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ readings: [], total: 0 }), { status: 500 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.listReadings({ token: 'stored-token' })).rejects.toMatchObject({
+      code: 'http_error',
+      message: 'Request failed with status 500',
+      status: 500,
+    });
+  });
+
   it('rejects successful readings responses that are not list documents', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ readings: [{ id: 'missing-fields' }] }), { status: 200 }));
     const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });

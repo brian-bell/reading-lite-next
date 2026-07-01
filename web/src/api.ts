@@ -96,11 +96,11 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
         headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
       });
       const body = await responseBody(response);
-      if (isReadingsListDocument(body)) {
-        return body;
-      }
       if (!response.ok) {
         throw errorFromBody(response, body);
+      }
+      if (isReadingsListDocument(body)) {
+        return body;
       }
       throw new APIError('invalid_response', 'API response was not a readings list document', response.status);
     },
