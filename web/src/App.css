@@ -111,6 +111,22 @@ input {
   gap: 1rem;
 }
 
+.submission-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.submission-form label {
+  margin-top: 0;
+}
+
+.submission-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: start;
+}
+
 .health-summary {
   display: grid;
   gap: 0.65rem;
@@ -275,5 +291,9 @@ button:disabled {
 
   .reading-status {
     width: fit-content;
+  }
+
+  .submission-row {
+    grid-template-columns: 1fr;
   }
 }

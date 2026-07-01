@@ -130,6 +130,53 @@ describe('createAPIClient', () => {
     });
   });
 
+  it('submits a URL with bearer auth to the configured base URL', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 'reading-1', status: 'pending' }), { status: 201 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com/', fetchImpl });
+
+    await expect(client.submitURL({ token: ' secret ', url: 'https://example.com/post' })).resolves.toEqual({
+      id: 'reading-1',
+      status: 'pending',
+    });
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/api/readings', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer secret',
+      },
+      body: JSON.stringify({ url: 'https://example.com/post' }),
+    });
+  });
+
+  it('turns submit URL Go error envelopes into APIError values', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: { code: 'invalid_url', message: 'invalid reading url' } }), {
+          status: 400,
+        }),
+    );
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.submitURL({ token: 'stored-token', url: 'not-a-url' })).rejects.toBeInstanceOf(APIError);
+    await expect(client.submitURL({ token: 'stored-token', url: 'not-a-url' })).rejects.toMatchObject({
+      code: 'invalid_url',
+      message: 'invalid reading url',
+      status: 400,
+    });
+  });
+
+  it('rejects malformed submit URL success responses', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 42, status: 'queued' }), { status: 201 }));
+    const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
+
+    await expect(client.submitURL({ token: 'stored-token', url: 'https://example.com/post' })).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'API response was not a submit URL document',
+      status: 201,
+    });
+  });
+
   it('normalizes null reading tags from the Go API to an empty list', async () => {
     const readings = {
       readings: [

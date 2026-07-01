@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 
 import './App.css';
 import {
@@ -25,6 +25,7 @@ type AppProps = {
 
 const defaultFetch: FetchImpl = (input, init) => globalThis.fetch(input, init);
 const readingsAuthMessage = 'Save a bearer token to load your reading list.';
+export const PROCESSING_POLL_INTERVAL_MS = 4000;
 const inFlightReadingsByFetch = new WeakMap<FetchImpl, Map<string, Promise<ReadingsListDocument>>>();
 
 export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
@@ -35,10 +36,15 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const [loading, setLoading] = useState(false);
   const [readings, setReadings] = useState<ReadingListItem[]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>();
+  const [loadedCursors, setLoadedCursors] = useState<string[]>([]);
   const [total, setTotal] = useState<number | null>(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
   const [readingsLoadingMore, setReadingsLoadingMore] = useState(false);
   const [readingsError, setReadingsError] = useState('');
+  const [submitURL, setSubmitURL] = useState('');
+  const [submitLoading, setSubmitLoading] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const [submitMessage, setSubmitMessage] = useState('');
   const readingsRequestID = useRef(0);
 
   const refreshHealth = useCallback(async () => {
@@ -65,6 +71,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     readingsRequestID.current += 1;
     setReadings([]);
     setNextCursor(undefined);
+    setLoadedCursors([]);
     setTotal(null);
     setReadingsLoading(false);
     setReadingsLoadingMore(false);
@@ -103,8 +110,17 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         if (readingsRequestID.current !== requestID) {
           return;
         }
-        setReadings((current) => (firstPage ? document.readings : [...current, ...document.readings]));
+        setReadings((current) => (firstPage ? document.readings : appendUniqueReadings(current, document.readings)));
         setNextCursor(document.next_cursor);
+        setLoadedCursors((current) => {
+          if (firstPage) {
+            return [];
+          }
+          if (cursor === undefined || current.includes(cursor)) {
+            return current;
+          }
+          return [...current, cursor];
+        });
         setTotal(document.total);
       } catch (err) {
         if (readingsRequestID.current !== requestID) {
@@ -114,6 +130,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         if (firstPage) {
           setReadings([]);
           setNextCursor(undefined);
+          setLoadedCursors([]);
           setTotal(null);
         }
       } finally {
@@ -126,9 +143,80 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     [fetchImpl, resetReadingsForMissingToken, runtimeEnv],
   );
 
+  const refreshVisibleReadings = useCallback(
+    async ({ tokenOverride }: { tokenOverride?: string } = {}) => {
+      const normalizedToken = (tokenOverride ?? loadToken()).trim();
+      if (normalizedToken === '') {
+        resetReadingsForMissingToken();
+        return;
+      }
+
+      const requestID = readingsRequestID.current + 1;
+      readingsRequestID.current = requestID;
+      setReadingsError('');
+
+      try {
+        const baseURL = resolveAPIBaseURL(runtimeEnv);
+        const documents = [
+          await listReadingsOnce({
+            baseURL,
+            fetchImpl,
+            token: normalizedToken,
+          }),
+        ];
+        for (const cursor of loadedCursors) {
+          if (readingsRequestID.current !== requestID) {
+            return;
+          }
+          documents.push(
+            await listReadingsOnce({
+              baseURL,
+              fetchImpl,
+              token: normalizedToken,
+              cursor,
+            }),
+          );
+        }
+        if (readingsRequestID.current !== requestID) {
+          return;
+        }
+        const refreshed = mergeReadingsDocuments(documents);
+        setReadings(refreshed.readings);
+        setNextCursor(refreshed.next_cursor);
+        setTotal(refreshed.total);
+      } catch (err) {
+        if (readingsRequestID.current !== requestID) {
+          return;
+        }
+        setReadingsError(readingsErrorMessage(err));
+        if (isUnauthorizedError(err)) {
+          setReadings([]);
+          setNextCursor(undefined);
+          setLoadedCursors([]);
+          setTotal(null);
+        }
+      }
+    },
+    [fetchImpl, loadedCursors, resetReadingsForMissingToken, runtimeEnv],
+  );
+
   useEffect(() => {
     void loadReadings({ tokenOverride: loadToken() });
   }, [loadReadings]);
+
+  const hasActiveVisibleReading = hasProcessingReadings(readings);
+
+  useEffect(() => {
+    const normalizedToken = loadToken().trim();
+    if (!hasActiveVisibleReading || normalizedToken === '') {
+      return;
+    }
+
+    const intervalID = window.setInterval(() => {
+      void refreshVisibleReadings({ tokenOverride: normalizedToken });
+    }, PROCESSING_POLL_INTERVAL_MS);
+    return () => window.clearInterval(intervalID);
+  }, [hasActiveVisibleReading, refreshVisibleReadings, token]);
 
   const handleLoadMore = useCallback(() => {
     if (nextCursor === undefined || readingsLoading || readingsLoadingMore) {
@@ -136,6 +224,43 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
     }
     void loadReadings({ cursor: nextCursor, tokenOverride: loadToken() });
   }, [loadReadings, nextCursor, readingsLoading, readingsLoadingMore]);
+
+  const handleSubmitURL = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const normalizedToken = loadToken().trim();
+      const normalizedURL = submitURL.trim();
+      if (normalizedToken === '' || normalizedURL === '' || submitLoading) {
+        return;
+      }
+
+      setSubmitLoading(true);
+      setSubmitError('');
+      setSubmitMessage('');
+      try {
+        const client = createAPIClient({
+          baseURL: resolveAPIBaseURL(runtimeEnv),
+          fetchImpl,
+        });
+        const submitted = await client.submitURL({ token: normalizedToken, url: normalizedURL });
+        if (loadToken().trim() !== normalizedToken) {
+          return;
+        }
+        setSubmitURL('');
+        setSubmitMessage(`Submitted URL. Status: ${submitted.status}.`);
+        await loadReadings({ tokenOverride: normalizedToken });
+      } catch (err) {
+        if (loadToken().trim() === normalizedToken) {
+          setSubmitError(readingsErrorMessage(err));
+        }
+      } finally {
+        setSubmitLoading(false);
+      }
+    },
+    [fetchImpl, loadReadings, runtimeEnv, submitLoading, submitURL],
+  );
+
+  const canSubmitURL = loadToken().trim() !== '' && submitURL.trim() !== '' && !submitLoading;
 
   return (
     <main className="app-shell">
@@ -169,6 +294,8 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
             onClick={() => {
               clearToken();
               setToken('');
+              setSubmitError('');
+              setSubmitMessage('');
               resetReadingsForMissingToken();
             }}
           >
@@ -199,6 +326,27 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           <h2 id="readings-heading">Reading list</h2>
           {total !== null ? <p className="muted">Total readings: {total}</p> : null}
         </div>
+
+        <form className="submission-form" onSubmit={handleSubmitURL}>
+          <label htmlFor="reading-url">URL</label>
+          <div className="submission-row">
+            <input
+              id="reading-url"
+              type="url"
+              value={submitURL}
+              onChange={(event) => setSubmitURL(event.target.value)}
+            />
+            <button type="submit" disabled={!canSubmitURL}>
+              Add reading
+            </button>
+          </div>
+          {submitError ? (
+            <p role="alert" className="error-message">
+              {submitError}
+            </p>
+          ) : null}
+          {submitMessage ? <p className="muted">{submitMessage}</p> : null}
+        </form>
 
         {readingsLoading ? <p className="muted">Loading readings...</p> : null}
         {readingsError ? (
@@ -253,6 +401,37 @@ function listReadingsOnce({
     .finally(() => requests.delete(requestKey));
   requests.set(requestKey, request);
   return request;
+}
+
+function appendUniqueReadings(current: ReadingListItem[], next: ReadingListItem[]): ReadingListItem[] {
+  const byID = new Map(current.map((reading) => [reading.id, reading]));
+  for (const reading of next) {
+    byID.set(reading.id, reading);
+  }
+  return Array.from(byID.values());
+}
+
+function mergeReadingsDocuments(documents: ReadingsListDocument[]): ReadingsListDocument {
+  const byID = new Map<string, ReadingListItem>();
+  for (const document of documents) {
+    for (const reading of document.readings) {
+      byID.set(reading.id, reading);
+    }
+  }
+  const lastDocument = documents.at(-1);
+  return {
+    readings: Array.from(byID.values()),
+    total: documents[0]?.total ?? 0,
+    next_cursor: lastDocument?.next_cursor,
+  };
+}
+
+function hasProcessingReadings(readings: ReadingListItem[]): boolean {
+  return readings.some((reading) => reading.status === 'pending' || reading.status === 'running');
+}
+
+function isUnauthorizedError(err: unknown): boolean {
+  return err instanceof APIError && (err.status === 401 || err.code === 'unauthorized');
 }
 
 function HealthSummary({ health }: { health: HealthDocument }) {
