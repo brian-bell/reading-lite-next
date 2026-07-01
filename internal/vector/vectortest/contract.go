@@ -250,6 +250,25 @@ func RunContract(t *testing.T, newIndex Factory) {
 		if !equalStrings(matchIDs(got), []string{"b"}) || math.Abs(got[0].Score-1) > 1e-6 {
 			t.Fatalf("first fenced write on a never-fenced row was rejected: %v, want [b] at score ~1.0", got)
 		}
+
+		// A nil-generation write is unconditional in both directions (per the
+		// Index.Upsert doc comment): it doesn't just skip being fenced by an
+		// established entry, it also clears that entry's own generation, so a
+		// stale write that later reuses the same older generation would no
+		// longer be rejected — until a fresh non-nil write re-establishes the
+		// fence.
+		mustUpsertAt(t, idx, "a", vec(1, 0), &newer)
+		mustUpsertAt(t, idx, "a", vec(0, 1), nil) // un-fences "a"
+		if err := idx.Upsert(ctx, "a", vec(1, 0), &older); err != nil {
+			t.Fatalf("Upsert with stale generation against an un-fenced row = %v, want nil", err)
+		}
+		got, err = idx.Query(ctx, vec(1, 0), 1, "")
+		if err != nil {
+			t.Fatalf("Query after write against un-fenced row: %v", err)
+		}
+		if !equalStrings(matchIDs(got), []string{"a"}) || math.Abs(got[0].Score-1) > 1e-6 {
+			t.Fatalf("stale write against an un-fenced row was rejected: %v, want [a] at score ~1.0 (nil-generation writes clear the fence)", got)
+		}
 	})
 }
 
