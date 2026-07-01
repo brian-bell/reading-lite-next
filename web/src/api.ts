@@ -30,6 +30,14 @@ export type ReadingsListDocument = {
   next_cursor?: string;
 };
 
+type ReadingListItemWire = Omit<ReadingListItem, 'tags'> & {
+  tags?: string[] | null;
+};
+
+type ReadingsListDocumentWire = Omit<ReadingsListDocument, 'readings'> & {
+  readings: ReadingListItemWire[];
+};
+
 type ViteEnv = {
   VITE_READER_API_BASE_URL?: string;
 };
@@ -100,7 +108,7 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
         throw errorFromBody(response, body);
       }
       if (isReadingsListDocument(body)) {
-        return body;
+        return normalizeReadingsListDocument(body);
       }
       throw new APIError('invalid_response', 'API response was not a readings list document', response.status);
     },
@@ -140,7 +148,7 @@ function isHealthDocument(body: unknown): body is HealthDocument {
   );
 }
 
-function isReadingsListDocument(body: unknown): body is ReadingsListDocument {
+function isReadingsListDocument(body: unknown): body is ReadingsListDocumentWire {
   return (
     isRecord(body) &&
     Array.isArray(body.readings) &&
@@ -151,7 +159,7 @@ function isReadingsListDocument(body: unknown): body is ReadingsListDocument {
   );
 }
 
-function isReadingListItem(value: unknown): value is ReadingListItem {
+function isReadingListItem(value: unknown): value is ReadingListItemWire {
   if (!isRecord(value)) {
     return false;
   }
@@ -166,7 +174,7 @@ function isReadingListItem(value: unknown): value is ReadingListItem {
     optionalString(value.summary) &&
     optionalString(value.error) &&
     optionalNumber(value.word_count) &&
-    optionalStringArray(value.tags)
+    optionalNullableStringArray(value.tags)
   );
 }
 
@@ -197,8 +205,28 @@ function optionalNumber(value: unknown): boolean {
   return value === undefined || (typeof value === 'number' && Number.isFinite(value));
 }
 
-function optionalStringArray(value: unknown): boolean {
-  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+function optionalNullableStringArray(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.every((item) => typeof item === 'string'))
+  );
+}
+
+function normalizeReadingsListDocument(body: ReadingsListDocumentWire): ReadingsListDocument {
+  return {
+    ...body,
+    readings: body.readings.map((reading) => {
+      const { tags, ...rest } = reading;
+      if (tags === null) {
+        return { ...rest, tags: [] };
+      }
+      if (tags === undefined) {
+        return rest;
+      }
+      return { ...rest, tags };
+    }),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
