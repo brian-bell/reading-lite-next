@@ -8,6 +8,28 @@ export type HealthDocument = {
   checks: Record<string, { status: string; error?: string }>;
 };
 
+export type ReadingStatus = 'pending' | 'running' | 'ready' | 'failed';
+
+export type ReadingListItem = {
+  id: string;
+  url: string;
+  status: ReadingStatus;
+  title?: string;
+  site?: string;
+  summary?: string;
+  error?: string;
+  tags?: string[];
+  word_count?: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ReadingsListDocument = {
+  readings: ReadingListItem[];
+  total: number;
+  next_cursor?: string;
+};
+
 type ViteEnv = {
   VITE_READER_API_BASE_URL?: string;
 };
@@ -21,6 +43,7 @@ type APIClientOptions = {
 
 export type APIClient = {
   health(): Promise<HealthDocument>;
+  listReadings(options: { token: string; cursor?: string }): Promise<ReadingsListDocument>;
 };
 
 export class APIError extends Error {
@@ -50,15 +73,7 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
       const response = await fetchImpl(`${normalizedBaseURL}/api/healthz`, {
         headers: { Accept: 'application/json' },
       });
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch {
-        if (!response.ok) {
-          throw new APIError('http_error', `Request failed with status ${response.status}`, response.status);
-        }
-        throw new APIError('invalid_response', 'API response was not valid JSON', response.status);
-      }
+      const body = await responseBody(response);
       if (isHealthDocument(body)) {
         return body;
       }
@@ -67,7 +82,40 @@ export function createAPIClient({ baseURL, fetchImpl }: APIClientOptions): APICl
       }
       throw new APIError('invalid_response', 'API response was not a health document', response.status);
     },
+
+    async listReadings({ token, cursor }: { token: string; cursor?: string }): Promise<ReadingsListDocument> {
+      if (normalizedBaseURL === '') {
+        throw new APIError('missing_config', 'VITE_READER_API_BASE_URL is required');
+      }
+      const query = new URLSearchParams();
+      if (cursor !== undefined) {
+        query.set('cursor', cursor);
+      }
+      const url = `${normalizedBaseURL}/api/readings${query.size > 0 ? `?${query.toString()}` : ''}`;
+      const response = await fetchImpl(url, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+      const body = await responseBody(response);
+      if (isReadingsListDocument(body)) {
+        return body;
+      }
+      if (!response.ok) {
+        throw errorFromBody(response, body);
+      }
+      throw new APIError('invalid_response', 'API response was not a readings list document', response.status);
+    },
   };
+}
+
+async function responseBody(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    if (!response.ok) {
+      throw new APIError('http_error', `Request failed with status ${response.status}`, response.status);
+    }
+    throw new APIError('invalid_response', 'API response was not valid JSON', response.status);
+  }
 }
 
 function errorFromBody(response: Response, body: unknown): APIError {
@@ -92,6 +140,40 @@ function isHealthDocument(body: unknown): body is HealthDocument {
   );
 }
 
+function isReadingsListDocument(body: unknown): body is ReadingsListDocument {
+  return (
+    isRecord(body) &&
+    Array.isArray(body.readings) &&
+    body.readings.every(isReadingListItem) &&
+    typeof body.total === 'number' &&
+    Number.isFinite(body.total) &&
+    (!('next_cursor' in body) || typeof body.next_cursor === 'string')
+  );
+}
+
+function isReadingListItem(value: unknown): value is ReadingListItem {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.id === 'string' &&
+    typeof value.url === 'string' &&
+    isReadingStatus(value.status) &&
+    typeof value.created_at === 'string' &&
+    typeof value.updated_at === 'string' &&
+    optionalString(value.title) &&
+    optionalString(value.site) &&
+    optionalString(value.summary) &&
+    optionalString(value.error) &&
+    optionalNumber(value.word_count) &&
+    optionalStringArray(value.tags)
+  );
+}
+
+function isReadingStatus(value: unknown): value is ReadingStatus {
+  return value === 'pending' || value === 'running' || value === 'ready' || value === 'failed';
+}
+
 function isHealthChecks(value: unknown): value is HealthDocument['checks'] {
   if (!isRecord(value)) {
     return false;
@@ -105,6 +187,18 @@ function isHealthChecks(value: unknown): value is HealthDocument['checks'] {
     }
   }
   return true;
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
+function optionalNumber(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function optionalStringArray(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
