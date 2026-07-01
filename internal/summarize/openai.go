@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bbell/reading-lite/internal/dispatch"
 	"github.com/bbell/reading-lite/internal/httpx"
 )
 
@@ -204,7 +205,9 @@ func parseOpenAIResponse(resp openAIResponse) (Summary, error) {
 		}
 		for _, content := range item.Content {
 			if content.Type == "refusal" {
-				return Summary{}, fmt.Errorf("summarize: response refusal: %s", content.Refusal)
+				// Structured Outputs refusals are deterministic safety refusals,
+				// so retrying the same content would only repeat billable calls.
+				return Summary{}, fmt.Errorf("%w: summarize: response refusal: %s", dispatch.ErrPermanent, content.Refusal)
 			}
 			if content.Type != "output_text" {
 				continue

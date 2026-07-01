@@ -120,54 +120,64 @@ func TestOpenAI_ResponseValidation(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name     string
-		body     string
-		wantText string
+		name        string
+		body        string
+		wantText    string
+		wantOutcome dispatch.Outcome
 	}{
 		{
-			name:     "refusal content",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"no"}]}]}`,
-			wantText: "refusal",
+			name:        "refusal content fails permanently",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"no"}]}]}`,
+			wantText:    "refusal",
+			wantOutcome: dispatch.Fail,
 		},
 		{
-			name:     "missing output text",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[]}]}`,
-			wantText: "one output_text",
+			name:        "missing output text",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[]}]}`,
+			wantText:    "one output_text",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "missing message status",
-			body:     `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"}]}]}`,
-			wantText: "message status",
+			name:        "missing message status",
+			body:        `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"}]}]}`,
+			wantText:    "message status",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "multiple output text items",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"},{"type":"output_text","text":"{\"title\":\"T2\",\"summary\":\"S2\",\"tags\":[]}"}]}]}`,
-			wantText: "one output_text",
+			name:        "multiple output text items",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"},{"type":"output_text","text":"{\"title\":\"T2\",\"summary\":\"S2\",\"tags\":[]}"}]}]}`,
+			wantText:    "one output_text",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "incomplete status with reason",
-			body:     `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`,
-			wantText: "max_output_tokens",
+			name:        "incomplete status with reason",
+			body:        `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`,
+			wantText:    "max_output_tokens",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "non completed status",
-			body:     `{"status":"failed","output":[]}`,
-			wantText: "status",
+			name:        "non completed status",
+			body:        `{"status":"failed","output":[]}`,
+			wantText:    "status",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "invalid summary json",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"not json"}]}]}`,
-			wantText: "decode",
+			name:        "invalid summary json",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"not json"}]}]}`,
+			wantText:    "decode",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "blank title",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\" \",\"summary\":\"S\",\"tags\":[]}"}]}]}`,
-			wantText: "title or summary",
+			name:        "blank title",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\" \",\"summary\":\"S\",\"tags\":[]}"}]}]}`,
+			wantText:    "title or summary",
+			wantOutcome: dispatch.Retry,
 		},
 		{
-			name:     "blank summary",
-			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\" \",\"tags\":[]}"}]}]}`,
-			wantText: "title or summary",
+			name:        "blank summary",
+			body:        `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\" \",\"tags\":[]}"}]}]}`,
+			wantText:    "title or summary",
+			wantOutcome: dispatch.Retry,
 		},
 	}
 	for _, tc := range cases {
@@ -185,8 +195,8 @@ func TestOpenAI_ResponseValidation(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantText) {
 				t.Fatalf("error = %q, want it to contain %q", err, tc.wantText)
 			}
-			if got := dispatch.Classify(err); got.Outcome != dispatch.Retry {
-				t.Fatalf("Classify(validation error) = %v, want Retry", got.Outcome)
+			if got := dispatch.Classify(err); got.Outcome != tc.wantOutcome {
+				t.Fatalf("Classify(validation error) = %v, want %v", got.Outcome, tc.wantOutcome)
 			}
 		})
 	}
