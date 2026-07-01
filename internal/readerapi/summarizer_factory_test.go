@@ -1,7 +1,10 @@
 package readerapi_test
 
 import (
-	"reflect"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/bbell/reading-lite/internal/config"
@@ -43,22 +46,35 @@ func TestBuildSummarizer_SelectsConfiguredProvider(t *testing.T) {
 			},
 		}
 
-		got := readerapi.BuildSummarizer(cfg)
+		var gotAuth string
+		var gotReq struct {
+			Model           string `json:"model"`
+			MaxOutputTokens int    `json:"max_output_tokens"`
+			Reasoning       struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"}]}]}`))
+		}))
+		defer srv.Close()
+
+		got := readerapi.BuildSummarizer(cfg, summarize.WithOpenAIBaseURL(srv.URL))
 		if _, ok := got.(*summarize.OpenAI); !ok {
 			t.Fatalf("buildSummarizer = %T, want *summarize.OpenAI", got)
 		}
-		v := reflect.ValueOf(got).Elem()
-		if model := v.FieldByName("model").String(); model != "gpt-5.5-mini" {
-			t.Fatalf("model = %q, want configured model", model)
+		if _, err := got.Summarize(context.Background(), summarize.SummaryInput{Markdown: "body"}); err != nil {
+			t.Fatalf("Summarize: %v", err)
 		}
-		if effort := v.FieldByName("reasoningEffort").String(); effort != "high" {
-			t.Fatalf("reasoningEffort = %q, want configured effort", effort)
+		if gotAuth != "Bearer openai-key" {
+			t.Fatalf("Authorization = %q, want existing OpenAI key", gotAuth)
 		}
-		if tokenLimit := int(v.FieldByName("maxOutputTokens").Int()); tokenLimit != 32000 {
-			t.Fatalf("maxOutputTokens = %d, want configured tokens", tokenLimit)
-		}
-		if apiKey := v.FieldByName("apiKey").String(); apiKey != "openai-key" {
-			t.Fatalf("apiKey = %q, want existing OpenAI key", apiKey)
+		if gotReq.Model != "gpt-5.5-mini" || gotReq.Reasoning.Effort != "high" || gotReq.MaxOutputTokens != 32000 {
+			t.Fatalf("request config = model %q effort %q max %d, want configured OpenAI knobs", gotReq.Model, gotReq.Reasoning.Effort, gotReq.MaxOutputTokens)
 		}
 	})
 }

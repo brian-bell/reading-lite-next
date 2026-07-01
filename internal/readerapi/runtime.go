@@ -363,14 +363,18 @@ func BuildProductionComponents(_ context.Context, cfg config.Config, pool Pool) 
 }
 
 // BuildSummarizer constructs the configured production summarizer adapter.
-func BuildSummarizer(cfg config.Config) summarize.Summarizer {
+func BuildSummarizer(cfg config.Config, openAIOptions ...summarize.OpenAIOption) summarize.Summarizer {
 	switch cfg.Summary.Provider {
 	case config.SummaryProviderOpenAI:
-		return summarize.NewOpenAI(
-			cfg.OpenAIAPIKey,
+		opts := []summarize.OpenAIOption{
 			summarize.WithOpenAIModel(cfg.Summary.OpenAI.Model),
 			summarize.WithOpenAIReasoningEffort(cfg.Summary.OpenAI.ReasoningEffort),
 			summarize.WithOpenAIMaxOutputTokens(cfg.Summary.OpenAI.MaxOutputTokens),
+		}
+		opts = append(opts, openAIOptions...)
+		return summarize.NewOpenAI(
+			cfg.OpenAIAPIKey,
+			opts...,
 		)
 	default:
 		return summarize.NewAnthropic(cfg.AnthropicAPIKey)

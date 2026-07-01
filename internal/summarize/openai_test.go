@@ -135,6 +135,11 @@ func TestOpenAI_ResponseValidation(t *testing.T) {
 			wantText: "one output_text",
 		},
 		{
+			name:     "missing message status",
+			body:     `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"}]}]}`,
+			wantText: "message status",
+		},
+		{
 			name:     "multiple output text items",
 			body:     `{"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"title\":\"T\",\"summary\":\"S\",\"tags\":[]}"},{"type":"output_text","text":"{\"title\":\"T2\",\"summary\":\"S2\",\"tags\":[]}"}]}]}`,
 			wantText: "one output_text",

@@ -199,7 +199,7 @@ func parseOpenAIResponse(resp openAIResponse) (Summary, error) {
 		if item.Type != "message" {
 			continue
 		}
-		if item.Status != "" && item.Status != "completed" {
+		if item.Status != "completed" {
 			return Summary{}, fmt.Errorf("summarize: output message status %q is not completed", item.Status)
 		}
 		for _, content := range item.Content {
