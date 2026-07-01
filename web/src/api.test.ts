@@ -158,12 +158,14 @@ describe('createAPIClient', () => {
     );
     const client = createAPIClient({ baseURL: 'https://api.example.com', fetchImpl });
 
-    await expect(client.submitURL({ token: 'stored-token', url: 'not-a-url' })).rejects.toBeInstanceOf(APIError);
-    await expect(client.submitURL({ token: 'stored-token', url: 'not-a-url' })).rejects.toMatchObject({
+    const request = client.submitURL({ token: 'stored-token', url: 'not-a-url' });
+    await expect(request).rejects.toBeInstanceOf(APIError);
+    await expect(request).rejects.toMatchObject({
       code: 'invalid_url',
       message: 'invalid reading url',
       status: 400,
     });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('rejects malformed submit URL success responses', async () => {

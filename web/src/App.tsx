@@ -46,6 +46,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   const [submitError, setSubmitError] = useState('');
   const [submitMessage, setSubmitMessage] = useState('');
   const readingsRequestID = useRef(0);
+  const readingsLoadingRef = useRef({ firstPage: false, nextPage: false });
 
   const refreshHealth = useCallback(async () => {
     setLoading(true);
@@ -69,6 +70,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
 
   const resetReadingsForMissingToken = useCallback(() => {
     readingsRequestID.current += 1;
+    readingsLoadingRef.current = { firstPage: false, nextPage: false };
     setReadings([]);
     setNextCursor(undefined);
     setLoadedCursors([]);
@@ -92,11 +94,13 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
 
       setReadingsError('');
       if (firstPage) {
+        readingsLoadingRef.current = { firstPage: true, nextPage: false };
         setReadings([]);
         setNextCursor(undefined);
         setTotal(null);
         setReadingsLoading(true);
       } else {
+        readingsLoadingRef.current = { ...readingsLoadingRef.current, nextPage: true };
         setReadingsLoadingMore(true);
       }
 
@@ -135,6 +139,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         }
       } finally {
         if (readingsRequestID.current === requestID) {
+          readingsLoadingRef.current = { firstPage: false, nextPage: false };
           setReadingsLoading(false);
           setReadingsLoadingMore(false);
         }
@@ -144,27 +149,42 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
   );
 
   const refreshVisibleReadings = useCallback(
-    async ({ tokenOverride }: { tokenOverride?: string } = {}) => {
+    async ({
+      tokenOverride,
+      bypassCache = false,
+      force = false,
+    }: { tokenOverride?: string; bypassCache?: boolean; force?: boolean } = {}) => {
       const normalizedToken = (tokenOverride ?? loadToken()).trim();
       if (normalizedToken === '') {
         resetReadingsForMissingToken();
         return;
       }
+      if (!force && (readingsLoadingRef.current.firstPage || readingsLoadingRef.current.nextPage)) {
+        return;
+      }
 
       const requestID = readingsRequestID.current + 1;
       readingsRequestID.current = requestID;
+      if (force) {
+        readingsLoadingRef.current = { firstPage: true, nextPage: false };
+        setReadingsLoading(true);
+        setReadingsLoadingMore(false);
+      }
       setReadingsError('');
 
       try {
         const baseURL = resolveAPIBaseURL(runtimeEnv);
-        const documents = [
-          await listReadingsOnce({
-            baseURL,
-            fetchImpl,
-            token: normalizedToken,
-          }),
-        ];
-        for (const cursor of loadedCursors) {
+        const targetPageCount = loadedCursors.length + 1;
+        const documents: ReadingsListDocument[] = [];
+        const refreshedCursors: string[] = [];
+        let cursor: string | undefined;
+        for (let page = 0; page < targetPageCount; page += 1) {
+          if (page > 0) {
+            if (cursor === undefined) {
+              break;
+            }
+            refreshedCursors.push(cursor);
+          }
           if (readingsRequestID.current !== requestID) {
             return;
           }
@@ -174,8 +194,10 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
               fetchImpl,
               token: normalizedToken,
               cursor,
+              bypassCache,
             }),
           );
+          cursor = documents.at(-1)?.next_cursor;
         }
         if (readingsRequestID.current !== requestID) {
           return;
@@ -183,6 +205,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         const refreshed = mergeReadingsDocuments(documents);
         setReadings(refreshed.readings);
         setNextCursor(refreshed.next_cursor);
+        setLoadedCursors((current) => (sameStrings(current, refreshedCursors) ? current : refreshedCursors));
         setTotal(refreshed.total);
       } catch (err) {
         if (readingsRequestID.current !== requestID) {
@@ -194,6 +217,12 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
           setNextCursor(undefined);
           setLoadedCursors([]);
           setTotal(null);
+        }
+      } finally {
+        if (force && readingsRequestID.current === requestID) {
+          readingsLoadingRef.current = { firstPage: false, nextPage: false };
+          setReadingsLoading(false);
+          setReadingsLoadingMore(false);
         }
       }
     },
@@ -238,17 +267,19 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
       setSubmitError('');
       setSubmitMessage('');
       try {
+        const baseURL = resolveAPIBaseURL(runtimeEnv);
         const client = createAPIClient({
-          baseURL: resolveAPIBaseURL(runtimeEnv),
+          baseURL,
           fetchImpl,
         });
         const submitted = await client.submitURL({ token: normalizedToken, url: normalizedURL });
         if (loadToken().trim() !== normalizedToken) {
           return;
         }
+        clearInFlightReadings(fetchImpl);
         setSubmitURL('');
         setSubmitMessage(`Submitted URL. Status: ${submitted.status}.`);
-        await loadReadings({ tokenOverride: normalizedToken });
+        await refreshVisibleReadings({ tokenOverride: normalizedToken, bypassCache: true, force: true });
       } catch (err) {
         if (loadToken().trim() === normalizedToken) {
           setSubmitError(readingsErrorMessage(err));
@@ -257,7 +288,7 @@ export default function App({ env, fetchImpl = defaultFetch }: AppProps) {
         setSubmitLoading(false);
       }
     },
-    [fetchImpl, loadReadings, runtimeEnv, submitLoading, submitURL],
+    [fetchImpl, refreshVisibleReadings, runtimeEnv, submitLoading, submitURL],
   );
 
   const canSubmitURL = loadToken().trim() !== '' && submitURL.trim() !== '' && !submitLoading;
@@ -378,12 +409,18 @@ function listReadingsOnce({
   fetchImpl,
   token,
   cursor,
+  bypassCache = false,
 }: {
   baseURL: string;
   fetchImpl: FetchImpl;
   token: string;
   cursor?: string;
+  bypassCache?: boolean;
 }): Promise<ReadingsListDocument> {
+  if (bypassCache) {
+    return createAPIClient({ baseURL, fetchImpl }).listReadings({ token, cursor });
+  }
+
   const requestKey = JSON.stringify([baseURL, token, cursor ?? null]);
   let requests = inFlightReadingsByFetch.get(fetchImpl);
   if (requests === undefined) {
@@ -398,9 +435,17 @@ function listReadingsOnce({
 
   const request = createAPIClient({ baseURL, fetchImpl })
     .listReadings({ token, cursor })
-    .finally(() => requests.delete(requestKey));
+    .finally(() => {
+      if (requests.get(requestKey) === request) {
+        requests.delete(requestKey);
+      }
+    });
   requests.set(requestKey, request);
   return request;
+}
+
+function clearInFlightReadings(fetchImpl: FetchImpl) {
+  inFlightReadingsByFetch.get(fetchImpl)?.clear();
 }
 
 function appendUniqueReadings(current: ReadingListItem[], next: ReadingListItem[]): ReadingListItem[] {
@@ -424,6 +469,10 @@ function mergeReadingsDocuments(documents: ReadingsListDocument[]): ReadingsList
     total: documents[0]?.total ?? 0,
     next_cursor: lastDocument?.next_cursor,
   };
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function hasProcessingReadings(readings: ReadingListItem[]): boolean {
